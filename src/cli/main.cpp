@@ -1,44 +1,67 @@
+#include "v8inject/client.h"
 #include "v8inject/injector.h"
 #include "v8inject/pe_utils.h"
+#include "v8inject/protocol.h"
 
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 namespace {
 
-struct SharedIo {
-    volatile LONG ready;
-    volatile LONG requestLen;
-    volatile LONG responseLen;
-    wchar_t       request[4096];
-    char          response[1024 * 512];
-};
-
 void PrintUsage() {
-    wprintf(L"v8inject — inject a payload DLL into a running process\n\n");
+    wprintf(L"v8inject - interact with a running process\n\n");
     wprintf(L"usage:\n");
     wprintf(L"  v8inject --help\n");
-    wprintf(L"  v8inject inject <exe> [--dll <path>]\n");
-    wprintf(L"  v8inject modules <exe>\n\n");
+    wprintf(L"  v8inject modules <exe>\n");
+    wprintf(L"  v8inject inject  <exe> [--dll <path>]\n");
+    wprintf(L"  v8inject probe   <exe> [--dll <path>] [--timeout <ms>]\n");
+    wprintf(L"  v8inject scan    <exe> <iunknown-addr-hex> [--module <name>] [--dll <path>]\n\n");
     wprintf(L"examples:\n");
-    wprintf(L"  v8inject modules 1cv8.exe\n");
-    wprintf(L"  v8inject inject 1cv8.exe --dll bin\\x64\\v8i_payload.dll\n");
+    wprintf(L"  v8inject probe 1cv8.exe\n");
+    wprintf(L"  v8inject scan  1cv8.exe 0x1A2B3C4D --module 1cv8.exe\n");
 }
 
-std::wstring DefaultPayloadPath() {
+std::wstring ExeDir() {
     wchar_t self[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     std::wstring p(self);
     size_t pos = p.find_last_of(L'\\');
-    if (pos != std::wstring::npos) p.resize(pos + 1);
-#if defined(_WIN64)
-    p += L"v8i_payload.dll";
-#else
-    p += L"v8i_payload.dll";
-#endif
-    return p;
+    return pos == std::wstring::npos ? std::wstring() : p.substr(0, pos + 1);
+}
+
+std::wstring DefaultPayloadPath() {
+    return ExeDir() + L"v8i_payload.dll";
+}
+
+bool ParseHex(const wchar_t* s, uint64_t& out) {
+    if (!s) return false;
+    wchar_t* end = nullptr;
+    unsigned long long v = wcstoull(s, &end, 0);
+    if (end == s) return false;
+    out = v;
+    return true;
+}
+
+// Shared option parsing for inject/probe/scan.
+struct Options {
+    std::wstring dll;
+    std::wstring module;
+    int timeoutMs = 15000;
+};
+
+Options ParseOptions(int argc, wchar_t** argv, int first) {
+    Options o;
+    o.dll = DefaultPayloadPath();
+    for (int i = first; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--dll" && i + 1 < argc)              o.dll = argv[++i];
+        else if (a == L"--module" && i + 1 < argc)      o.module = argv[++i];
+        else if (a == L"--timeout" && i + 1 < argc)     o.timeoutMs = _wtoi(argv[++i]);
+    }
+    return o;
 }
 
 }  // namespace
@@ -53,9 +76,9 @@ int wmain(int argc, wchar_t** argv) {
         if (argc < 3) { PrintUsage(); return 1; }
         DWORD pid = v8i::FindProcessByName(argv[2]);
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
-        wprintf(L"pid          : %lu\n", pid);
-        wprintf(L"is64         : %s\n", v8i::IsProcess64(pid) ? L"yes" : L"no");
-        wprintf(L"host arch    : %s\n", sizeof(void*) == 8 ? L"x64" : L"x86");
+        wprintf(L"pid        : %lu\n", pid);
+        wprintf(L"target x64 : %s\n", v8i::IsProcess64(pid) ? L"yes" : L"no");
+        wprintf(L"host arch  : %s\n", sizeof(void*) == 8 ? L"x64" : L"x86");
         return 0;
     }
 
@@ -63,18 +86,68 @@ int wmain(int argc, wchar_t** argv) {
         if (argc < 3) { PrintUsage(); return 1; }
         DWORD pid = v8i::FindProcessByName(argv[2]);
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
-        wprintf(L"pid=%lu\n", pid);
 
-        std::wstring dll = DefaultPayloadPath();
-        for (int i = 3; i + 1 < argc; ++i)
-            if (std::wstring(argv[i]) == L"--dll") dll = argv[i + 1];
-
-        wprintf(L"payload: %s\n", dll.c_str());
-        if (!v8i::InjectLibrary(pid, dll)) {
-            wprintf(L"inject failed (check arch match and privileges)\n");
+        Options o = ParseOptions(argc, argv, 3);
+        wprintf(L"pid=%lu payload=%s\n", pid, o.dll.c_str());
+        if (!v8i::InjectLibrary(pid, o.dll)) {
+            wprintf(L"inject failed (arch mismatch or insufficient rights)\n");
             return 3;
         }
         wprintf(L"injected ok\n");
+        return 0;
+    }
+
+    if (cmd == L"probe") {
+        if (argc < 3) { PrintUsage(); return 1; }
+        DWORD pid = v8i::FindProcessByName(argv[2]);
+        if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
+
+        Options o = ParseOptions(argc, argv, 3);
+
+        v8i::Client client;
+        if (!client.Open(pid, o.dll, o.timeoutMs)) {
+            wprintf(L"handshake failed: payload did not report ready\n");
+            return 4;
+        }
+        std::string resp;
+        bool ok = client.Call(L"version", resp, o.timeoutMs);
+        wprintf(L"session    : %s\n", client.SharedName());
+        wprintf(L"reply      : %hs\n", ok ? resp.c_str() : "<no reply>");
+        client.Close();
+        return ok ? 0 : 5;
+    }
+
+    if (cmd == L"scan") {
+        if (argc < 4) { PrintUsage(); return 1; }
+        DWORD pid = v8i::FindProcessByName(argv[2]);
+        if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
+
+        uint64_t addr = 0;
+        if (!ParseHex(argv[3], addr)) {
+            wprintf(L"bad address: %s\n", argv[3]);
+            return 1;
+        }
+
+        Options o = ParseOptions(argc, argv, 4);
+        if (o.module.empty()) o.module = argv[2];
+
+        v8i::Client client;
+        if (!client.Open(pid, o.dll, o.timeoutMs)) {
+            wprintf(L"handshake failed: payload did not report ready\n");
+            return 4;
+        }
+
+        wchar_t request[256] = {};
+        _snwprintf_s(request, _countof(request), _TRUNCATE,
+                     L"scan %s %llx", o.module.c_str(), (unsigned long long)addr);
+
+        std::string resp;
+        bool ok = client.Call(request, resp, o.timeoutMs);
+        client.Close();
+
+        if (!ok) { wprintf(L"no reply from payload\n"); return 5; }
+        fwrite(resp.data(), 1, resp.size(), stdout);
+        if (resp.empty() || resp.back() != '\n') fputc('\n', stdout);
         return 0;
     }
 

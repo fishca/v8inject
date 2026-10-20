@@ -58,6 +58,7 @@ target_link_options(v8i_payload PRIVATE
 add_executable(v8inject
     src/cli/main.cpp
     src/host/injector.cpp
+    src/host/client.cpp
 )
 target_link_libraries(v8inject PRIVATE v8i_common)
 v8i_set_output(v8inject)

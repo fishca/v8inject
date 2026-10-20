@@ -1,5 +1,6 @@
 #include "v8inject/v8i_export.h"
 #include "v8inject/pe_utils.h"
+#include "v8inject/protocol.h"
 #include "v8inject/typeinfo_utils.h"
 #include "v8inject/report.h"
 
@@ -12,25 +13,16 @@ using namespace v8i;
 
 namespace {
 
-// Shared block layout between host and payload. Must stay plain-old-data.
-struct SharedIo {
-    volatile LONG ready;        // 0 = idle, 1 = request, 2 = response
-    volatile LONG requestLen;
-    volatile LONG responseLen;
-    wchar_t       request[4096];
-    char          response[1024 * 512];
-};
-
 SharedIo* g_io = nullptr;
 
 void PutResponse(const std::string& json) {
     if (!g_io) return;
     size_t n = json.size();
-    if (n > sizeof(g_io->response) - 1) n = sizeof(g_io->response) - 1;
+    if (n > kResponseBytes - 1) n = kResponseBytes - 1;
     memcpy(g_io->response, json.data(), n);
     g_io->response[n] = 0;
     InterlockedExchange(&g_io->responseLen, (LONG)n);
-    InterlockedExchange(&g_io->ready, 2);
+    InterlockedExchange(&g_io->ready, kStateResponse);
 }
 
 // SEH helper: __try cannot live in a function that needs C++ unwinding,
@@ -89,11 +81,24 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
     PutResponse("{\"status\":\"loaded\"}");
 
     for (;;) {
-        if (InterlockedCompareExchange(&g_io->ready, 1, 1) != 1) {
-            Sleep(20);
+        LONG state = g_io->ready;
+        if (state == kStateExit) break;
+        if (state != kStateRequest) {
+            Sleep(15);
             continue;
         }
         if (wcscmp(g_io->request, L"exit") == 0) break;
+
+        if (wcscmp(g_io->request, L"version") == 0) {
+            char buf[128] = {};
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "{\"status\":\"ok\",\"api\":%d,\"arch\":\"%s\","
+                        "\"pointerSize\":%d,\"process\":\"%s\"}",
+                        v8i_version(), sizeof(void*) == 8 ? "x64" : "x86",
+                        (int)sizeof(void*), "");
+            PutResponse(buf);
+            continue;
+        }
 
         TypeInfoReport rep;
         if (!RunScan(g_io->request, rep)) {
@@ -103,6 +108,7 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
         PutResponse(ToJson(rep));
     }
 
+    InterlockedExchange(&g_io->ready, kStateExit);
     UnmapViewOfFile(g_io);
     CloseHandle(hMap);
     g_io = nullptr;
