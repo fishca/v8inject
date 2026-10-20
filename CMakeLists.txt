@@ -16,6 +16,17 @@ else()
 endif()
 message(STATUS "v8inject: building for ${V8I_ARCH}")
 
+# Placement that works for both single-config and multi-config generators.
+function(v8i_set_output target)
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}"
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}"
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}"
+    )
+endfunction()
+
 add_library(v8i_common STATIC
     src/common/pe_utils.cpp
     src/common/typeinfo_utils.cpp
@@ -38,8 +49,8 @@ target_link_libraries(v8i_payload PRIVATE v8i_common)
 set_target_properties(v8i_payload PROPERTIES
     OUTPUT_NAME "v8i_payload"
     PREFIX ""
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}"
 )
+v8i_set_output(v8i_payload)
 target_link_options(v8i_payload PRIVATE
     "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/payload/v8i_payload.def")
 
@@ -49,9 +60,7 @@ add_executable(v8inject
     src/host/injector.cpp
 )
 target_link_libraries(v8inject PRIVATE v8i_common)
-set_target_properties(v8inject PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}"
-)
+v8i_set_output(v8inject)
 
 # ---- smoke test ----
 enable_testing()
