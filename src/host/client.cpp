@@ -98,7 +98,7 @@ bool Client::Call(const std::wstring& command, std::string& response, int timeou
 
     // Idle -> Request. If the payload is still busy we treat it as an error
     // rather than racing on a half-written buffer.
-    if (InterlockedCompareExchange(&io_->ready, kStateRequest, kStateIdle) != kStateIdle)
+    if (InterlockedCompareExchange((volatile LONG*)&io_->ready, kStateRequest, kStateIdle) != kStateIdle)
         return false;
 
     if (!WaitForState(kStateResponse, timeoutMs)) return false;
@@ -107,7 +107,7 @@ bool Client::Call(const std::wstring& command, std::string& response, int timeou
     if (len < 0 || (size_t)len >= kResponseBytes) len = (LONG)(kResponseBytes - 1);
     response.assign(io_->response, (size_t)len);
 
-    InterlockedExchange(&io_->ready, kStateIdle);
+    InterlockedExchange((volatile LONG*)&io_->ready, kStateIdle);
     return true;
 }
 
@@ -115,7 +115,7 @@ void Client::Close(int timeoutMs) {
     if (io_) {
         wcscpy_s(io_->request, kRequestChars, L"exit");
         io_->requestLen = 5;
-        if (InterlockedCompareExchange(&io_->ready, kStateExit, kStateIdle) == kStateIdle) {
+        if (InterlockedCompareExchange((volatile LONG*)&io_->ready, kStateExit, kStateIdle) == kStateIdle) {
             auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
             while (Clock::now() < deadline) {
                 if (!hThread_) break;

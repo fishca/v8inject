@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <cstddef>
 #include <cstdint>
+#include <cwchar>
+#include <cstdio>
 
 namespace v8i {
 
@@ -23,12 +25,12 @@ constexpr size_t kResponseBytes = 1024 * 512;
 
 #pragma pack(push, 4)
 struct SharedIo {
-    volatile LONG32 ready;
-    LONG32         requestLen;
-    LONG32         responseLen;
-    LONG32         seq;              // host increments per request
-    wchar_t        request[kRequestChars];
-    char           response[kResponseBytes];
+    volatile LONG ready;
+    LONG          requestLen;
+    LONG          responseLen;
+    LONG          seq;              // host increments per request
+    wchar_t       request[kRequestChars];
+    char          response[kResponseBytes];
 };
 #pragma pack(pop)
 

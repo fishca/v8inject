@@ -21,8 +21,8 @@ void PutResponse(const std::string& json) {
     if (n > kResponseBytes - 1) n = kResponseBytes - 1;
     memcpy(g_io->response, json.data(), n);
     g_io->response[n] = 0;
-    InterlockedExchange(&g_io->responseLen, (LONG)n);
-    InterlockedExchange(&g_io->ready, kStateResponse);
+    InterlockedExchange((volatile LONG*)&g_io->responseLen, (LONG)n);
+    InterlockedExchange((volatile LONG*)&g_io->ready, kStateResponse);
 }
 
 // SEH helper: __try cannot live in a function that needs C++ unwinding,
@@ -108,7 +108,7 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
         PutResponse(ToJson(rep));
     }
 
-    InterlockedExchange(&g_io->ready, kStateExit);
+    InterlockedExchange((volatile LONG*)&g_io->ready, kStateExit);
     UnmapViewOfFile(g_io);
     CloseHandle(hMap);
     g_io = nullptr;

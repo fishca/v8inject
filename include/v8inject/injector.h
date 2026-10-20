@@ -19,3 +19,5 @@ bool StartPayloadThread(DWORD pid,
                         HANDLE& hThreadOut,
                         void*& remoteNameOut,
                         void*& remoteArgsOut);
+
+}  // namespace v8i
