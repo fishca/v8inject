@@ -33,12 +33,25 @@ void PutResponse(const std::string& json) {
     InterlockedExchange(&g_io->ready, 2);
 }
 
+// SEH helper: __try cannot live in a function that needs C++ unwinding,
+// so the guarded call is isolated in a POD-only function.
+HRESULT ScanGuarded(ITypeInfo* ti, TypeInfoReport* rep) {
+    HRESULT hr = E_UNEXPECTED;
+    __try {
+        hr = ScanTypeInfo(ti, *rep);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hr = E_UNEXPECTED;
+    }
+    return hr;
+}
+
 // "scan <moduleName> <addrHex>"
 bool RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
     wchar_t moduleName[64] = {};
     unsigned long long addr = 0;
-    if (swscanf_s(cmd, L"scan %63s %llx", moduleName, _countof(moduleName), &addr) != 2)
-        return false;
+    int matched = swscanf_s(cmd, L"scan %63s %llx", moduleName,
+                            (unsigned)_countof(moduleName), &addr);
+    if (matched != 2) return false;
 
     ModuleRange mr;
     if (!FindModule(moduleName, mr)) return false;
@@ -53,12 +66,7 @@ bool RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
     ITypeInfo* ti = nullptr;
     if (FAILED(GetTypeInfoFromUnknown(unk, &ti)) || !ti) return false;
 
-    HRESULT hr = E_UNEXPECTED;
-    __try {
-        hr = ScanTypeInfo(ti, rep);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hr = E_UNEXPECTED;
-    }
+    HRESULT hr = ScanGuarded(ti, &rep);
     ti->Release();
     return SUCCEEDED(hr);
 }
