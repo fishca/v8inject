@@ -1,0 +1,24 @@
+# build output
+build/
+out/
+bin/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.aps
+
+# IDE
+.vs/
+.vscode/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+
+# os
+Thumbs.db
+desktop.ini
