@@ -81,9 +81,9 @@ HRESULT ScanTypeInfo(ITypeInfo* ti, TypeInfoReport& out) {
         NamesOfMemid(ti, fd->memid, method, pnames);
         fi.name = method.empty() ? L"<noname>" : method;
 
-        if (fd->lprgElemDescParam) {
+        if (fd->lprgelemdescParam) {
             for (short p = 0; p < fd->cParams; ++p)
-                fi.paramVt.push_back((uint32_t)fd->lprgElemDescParam[p].tdesc.vt);
+                fi.paramVt.push_back((uint32_t)fd->lprgelemdescParam[p].tdesc.vt);
         }
 
         out.funcs.push_back(std::move(fi));
