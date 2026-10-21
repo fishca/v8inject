@@ -66,46 +66,67 @@ std::string EscapeW(const std::wstring& w) {
 std::string PeekToJson(const std::wstring& args) {
     uintptr_t addr = 0;
     int count = 64;
-    const wchar_t* p = args.c_str();
-    if (swscanf_s(p, L"%llx %d", (unsigned long long*)&addr, &count) < 1) {
-        return "{\"status\":\"error\",\"message\":\"usage: peek <hex-addr> [len]\"}";
+    {
+        // Base-0 parse: addresses pasted from the UI are plain hex without 0x.
+        wchar_t token[64] = {};
+        int want = 64;
+        if (swscanf_s(args.c_str(), L"%63ls %d", token, (unsigned)_countof(token), &want) < 1) {
+            return "{\"status\":\"error\",\"message\":\"usage: peek <hex-addr> [len]\"}";
+        }
+        addr = (uintptr_t)_wcstoui64(token, nullptr, 16);
+        count = want;
     }
     if (count <= 0) count = 64;
     if (count > 4096) count = 4096;
 
-    char head[128];
+    char head[160];
     _snprintf_s(head, sizeof(head), _TRUNCATE,
                 "{\"status\":\"ok\",\"address\":\"0x%llX\",\"bytes\":%d,\"data\":\"",
                 (unsigned long long)addr, count);
     std::string j = head;
 
+    // One byte at a time: a partially readable block is more informative than a
+    // flat "unreadable", and a failed chunk must not hide the rest.
     unsigned char buf[64] = {};
-    bool anyRead = false;
+    int got = 0;
     for (int off = 0; off < count; off += (int)sizeof(buf)) {
         int chunk = count - off;
         if (chunk > (int)sizeof(buf)) chunk = (int)sizeof(buf);
         if (!IsReadable((const void*)(addr + off), (size_t)chunk)) break;
         memcpy(buf, (const void*)(addr + off), (size_t)chunk);
-        anyRead = true;
+        got += chunk;
         for (int i = 0; i < chunk; ++i) {
             char h[4];
             _snprintf_s(h, sizeof(h), _TRUNCATE, "%02X", buf[i]);
             j += h;
         }
     }
-    if (!anyRead) return "{\"status\":\"error\",\"message\":\"unreadable address\"}";
-    j += "\"";
+    if (got == 0) {
+        char why[256];
+        _snprintf_s(why, sizeof(why), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"unreadable address\","
+                    "\"address\":\"0x%llX\",\"hint\":%s}",
+                    (unsigned long long)addr,
+                    IsReadable((const void*)addr, 1)
+                        ? "\"region readable but shorter than requested\""
+                        : "\"region not committed or not readable\"");
+        return why;
+    }
+    {
+        char tail[64];
+        _snprintf_s(tail, sizeof(tail), _TRUNCATE, "\",\"readableBytes\":%d", got);
+        j += tail;
+    }
 
-    // If the first qword looks like a vtable pointer, say which module owns it.
     if (IsReadable((const void*)addr, sizeof(uintptr_t))) {
         uintptr_t first = *(const uintptr_t*)addr;
-        char vb[96];
+        char vb[128];
         _snprintf_s(vb, sizeof(vb), _TRUNCATE, ",\"firstQword\":\"0x%llX\"",
                     (unsigned long long)first);
         j += vb;
         for (const ModuleRange& m : EnumModules()) {
             if (first >= m.base && first < m.base + m.size) {
-                const wchar_t* f = wcsrchr(m.path.c_str(), L'\\\\');
+                const wchar_t* f = wcsrchr(m.path.c_str(), L'\\');
                 j += ",\"inModule\":\"" + EscapeW(f ? f + 1 : m.path) + "\"";
                 _snprintf_s(vb, sizeof(vb), _TRUNCATE, ",\"moduleRva\":\"0x%llX\"",
                             (unsigned long long)(first - m.base));
@@ -113,8 +134,6 @@ std::string PeekToJson(const std::wstring& args) {
                 break;
             }
         }
-        // A vtable pointer inside an image base is a strong hint that the value
-        // is a C++ object; PE headers at that address confirm it.
         PeImage probe = ParsePe(first);
         if (probe.valid) j += ",\"firstQwordIsPeImage\":true";
     }
