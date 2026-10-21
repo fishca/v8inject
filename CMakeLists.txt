@@ -28,6 +28,7 @@ function(v8i_set_output target)
 endfunction()
 
 add_library(v8i_common STATIC
+    src/common/diag.cpp
     src/common/pe_utils.cpp
     src/common/typeinfo_utils.cpp
     src/common/report.cpp

@@ -1,3 +1,4 @@
+#include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/protocol.h"
@@ -10,33 +11,30 @@
 #include <cstring>
 #include <string>
 
-// Uncomment to write a trace to %TEMP%\v8i_payload.log when debugging.
-#define V8I_DEBUG_LOG 1
-
 using namespace v8i;
 
 namespace {
 
 SharedIo* g_io = nullptr;
 
-#ifdef V8I_DEBUG_LOG
-void DbgLog(const char* fmt, ...) {
-    char path[MAX_PATH] = {};
-    GetTempPathA(MAX_PATH, path);
-    strcat_s(path, "v8i_payload.log");
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "a") == 0 && f) {
-        va_list ap;
-        va_start(ap, fmt);
-        vfprintf(f, fmt, ap);
-        va_end(ap);
-        fputc('\n', f);
-        fclose(f);
+// Log folder comes from the shared block, so host and payload always agree.
+void InitPayloadLog(const wchar_t* dirFromBlock) {
+    if (dirFromBlock && dirFromBlock[0]) {
+        SetLogDirectory(dirFromBlock);
+        return;
+    }
+    // Fallback: next to the payload DLL itself.
+    HMODULE me = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&InitPayloadLog, &me) && me) {
+        wchar_t self[MAX_PATH] = {};
+        GetModuleFileNameW(me, self, MAX_PATH);
+        wchar_t* slash = wcsrchr(self, L'\\');
+        if (slash) *slash = 0;
+        SetLogDirectory(self);
     }
 }
-#else
-inline void DbgLog(const char*, ...) {}
-#endif
 
 void PutResponse(const std::string& json) {
     if (!g_io) return;
@@ -93,17 +91,22 @@ V8I_API int V8I_CALL v8i_version() {
 }
 
 static int RunPayload(const wchar_t* sharedName) {
-    DbgLog("RunPayload entered, pid=%lu sharedName=%ls", GetCurrentProcessId(),
-           sharedName ? sharedName : L"(null)");
     if (!sharedName) return -1;
 
     HANDLE hMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, sharedName);
-    DbgLog("OpenFileMapping -> %p err=%lu", (void*)hMap, GetLastError());
-    if (!hMap) return -2;
+    if (!hMap) {
+        InitPayloadLog(nullptr);
+        LogLine("OpenFileMapping(%ls) failed, win32=%lu", sharedName, GetLastError());
+        return -2;
+    }
 
     g_io = (SharedIo*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedIo));
-    DbgLog("MapViewOfFile -> %p err=%lu", (void*)g_io, GetLastError());
     if (!g_io) { CloseHandle(hMap); return -3; }
+
+    InitPayloadLog(g_io->logDir);
+    LogLine("RunPayload started, pid=%lu arch=%s", GetCurrentProcessId(),
+            sizeof(void*) == 8 ? "x64" : "x86");
+    LogLine("MapViewOfFile -> %p", (void*)g_io);
 
     // Report readiness before anything that can fail.
     PutResponse("{\"status\":\"loaded\"}");
@@ -155,7 +158,9 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
 // own thread and keep the caller blocked, so the payload keeps running even
 // though the host opened that thread with default settings.
 V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
-    DbgLog("v8i_probe entered, pid=%lu", GetCurrentProcessId());
+    InitPayloadLog(nullptr);          // provisional, refined after mapping
+    LogLine("v8i_probe entered, pid=%lu shared=%ls", GetCurrentProcessId(),
+            sharedName ? sharedName : L"(null)");
 
     WorkerArgs args{};
     if (sharedName) {
@@ -164,12 +169,12 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
 
     HANDLE hWorker = CreateThread(nullptr, 0, WorkerProc, &args, 0, nullptr);
     if (hWorker) {
-        DbgLog("worker thread created %p", (void*)hWorker);
+        LogLine("worker thread created %p", (void*)hWorker);
         // Block the remote thread forever; the worker owns the session.
         WaitForSingleObject(hWorker, INFINITE);
         CloseHandle(hWorker);
     } else {
-        DbgLog("CreateThread failed err=%lu", GetLastError());
+        LogLine("CreateThread failed err=%lu", GetLastError());
         RunPayload(args.name);   // fall back to running inline
     }
     return 0;

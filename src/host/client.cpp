@@ -50,7 +50,8 @@ bool Client::WaitForState(LONG expected, int timeoutMs) {
     }
 }
 
-bool Client::Open(uint32_t pid, const std::wstring& payloadDll, int timeoutMs) {
+bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
+                  const std::wstring& logDir, int timeoutMs) {
     if (hMap_) return false;
 
     MakeSharedName(sharedName_, _countof(sharedName_), pid);
@@ -68,6 +69,7 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll, int timeoutMs) {
     io_->responseLen = 0;
     io_->seq = 0;
     io_->diag = 0;
+    wcsncpy_s(io_->logDir, MAX_PATH, logDir.c_str(), _TRUNCATE);
     io_->request[0] = 0;
     io_->response[0] = 0;
 

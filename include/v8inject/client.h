@@ -15,7 +15,10 @@ public:
 
     // Creates the shared block and starts the payload thread in the target
     // process. Path to the payload DLL must match the target bitness.
-    bool Open(uint32_t pid, const std::wstring& payloadDll, int timeoutMs = 15000);
+    // logDir is written into the shared block before the payload starts, so the
+    // payload can log next to the host binary instead of %TEMP%.
+    bool Open(uint32_t pid, const std::wstring& payloadDll,
+              const std::wstring& logDir, int timeoutMs = 15000);
 
     // Sends one command and returns the raw JSON reply.
     // Returns false on timeout or protocol error.

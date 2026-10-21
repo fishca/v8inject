@@ -30,6 +30,7 @@ struct SharedIo {
     LONG          responseLen;
     LONG          seq;              // host increments per request
     LONG          diag;             // payload diagnostics: why it failed
+    wchar_t       logDir[MAX_PATH]; // where the payload should write its log
     wchar_t       request[kRequestChars];
     char          response[kResponseBytes];
 };

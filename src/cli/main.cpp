@@ -1,4 +1,5 @@
 #include "v8inject/client.h"
+#include "v8inject/diag.h"
 #include "v8inject/injector.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/protocol.h"
@@ -36,6 +37,17 @@ std::wstring DefaultPayloadPath() {
     return ExeDir() + L"v8i_payload.dll";
 }
 
+// Directory of the running executable: logs go next to v8inject.exe.
+void InitHostLog() {
+    wchar_t self[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    wchar_t* slash = wcsrchr(self, L'\\');
+    if (slash) *slash = 0;
+    v8i::SetLogDirectory(self);
+    v8i::LogLine("---- v8inject started, pid=%lu arch=%s ----",
+                 GetCurrentProcessId(), sizeof(void*) == 8 ? "x64" : "x86");
+}
+
 bool ParseHex(const wchar_t* s, uint64_t& out) {
     if (!s) return false;
     wchar_t* end = nullptr;
@@ -67,6 +79,7 @@ Options ParseOptions(int argc, wchar_t** argv, int first) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    InitHostLog();
     if (argc < 2) { PrintUsage(); return 1; }
 
     std::wstring cmd = argv[1];
@@ -105,19 +118,21 @@ int wmain(int argc, wchar_t** argv) {
         Options o = ParseOptions(argc, argv, 3);
 
         v8i::Client client;
-        if (!client.Open(pid, o.dll, o.timeoutMs)) {
+        if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
             wprintf(L"handshake failed\n  reason : %s\n  diag   : %ld\n"
                     L"  stage  : %d  win32: %lu\n"
                     L"  shared : %s\n  payload: %s\n",
                     client.LastError(), client.LastDiag(),
                     client.LastStage(), client.LastWin32Error(),
                     client.SharedName(), o.dll.c_str());
+            wprintf(L"log        : %ls\n", v8i::GetLogPath());
             return 4;
         }
         std::string resp;
         bool ok = client.Call(L"version", resp, o.timeoutMs);
         wprintf(L"session    : %s\n", client.SharedName());
         wprintf(L"reply      : %hs\n", ok ? resp.c_str() : "<no reply>");
+        wprintf(L"log        : %ls\n", v8i::GetLogPath());
         client.Close();
         return ok ? 0 : 5;
     }
@@ -137,7 +152,7 @@ int wmain(int argc, wchar_t** argv) {
         if (o.module.empty()) o.module = argv[2];
 
         v8i::Client client;
-        if (!client.Open(pid, o.dll, o.timeoutMs)) {
+        if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
             wprintf(L"handshake failed\n  reason : %s\n  diag   : %ld\n"
                     L"  stage  : %d  win32: %lu\n"
                     L"  shared : %s\n  payload: %s\n",
