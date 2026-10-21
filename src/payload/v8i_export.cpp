@@ -587,6 +587,59 @@ std::string XrefToJson(const std::wstring& args) {
 
 // heapobjects [--module m] [--count n] — list heap objects whose vtable belongs
 // to a module, grouped by vtable RVA. Shows which classes are alive and how many.
+
+// memmap [--count n] — committed regions by protection, with sizes. Used to find
+// where 1C keeps its heap; the object scanner only walks writable regions.
+std::string MemMapToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    size_t cap = a.count ? a.count : 60;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+    const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
+
+    struct Reg { uintptr_t base; size_t size; uint32_t protect; uint32_t state; uint32_t type; };
+    std::vector<Reg> big;
+
+    while (addr < maxAddr) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
+        const uintptr_t rb = (uintptr_t)mbi.BaseAddress;
+        if (mbi.State == MEM_COMMIT && mbi.RegionSize >= 0x10000) {
+            big.push_back({rb, (size_t)mbi.RegionSize, (uint32_t)mbi.Protect,
+                           (uint32_t)mbi.State, (uint32_t)mbi.Type});
+        }
+        addr = rb + mbi.RegionSize;
+        if (rb + mbi.RegionSize <= rb) break;
+    }
+
+    // Largest first.
+    for (size_t i = 0; i + 1 < big.size(); ++i)
+        for (size_t k = 0; k + 1 < big.size() - i; ++k)
+            if (big[k].size < big[k + 1].size) std::swap(big[k], big[k + 1]);
+
+    char buf[512];
+    std::string j = "{\"status\":\"ok\",\"regions\":";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"regions\":[", big.size());
+    j += buf;
+
+    size_t shown = 0;
+    bool first = true;
+    for (const Reg& r : big) {
+        if (shown++ >= cap) break;
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"base\":\"0x%llX\",\"size\":%zu,\"protect\":\"0x%X\","
+                    "\"type\":\"0x%X\"}",
+                    (unsigned long long)r.base, r.size, r.protect, r.type);
+        j += buf;
+    }
+    j += "]}";
+    return j;
+}
+
 std::string HeapObjectsToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
     for (const std::wstring& p : a.positional)
@@ -917,6 +970,13 @@ static int RunPayload(const wchar_t* sharedName) {
             PutResponse(Guarded(L"imports", ImportsToJson, std::wstring(g_io->request).size() > 8
                                     ? std::wstring(g_io->request).substr(8)
                                     : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"memmap", 6) == 0) {
+            PutResponse(Guarded(L"memmap", MemMapToJson, std::wstring(g_io->request).size() > 7
+                                                            ? std::wstring(g_io->request).substr(7)
+                                                            : std::wstring()));
             continue;
         }
 

@@ -181,6 +181,7 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
                                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
 
         if (!usable || regionEnd <= addr) {
+            if (mbi.State == MEM_COMMIT) skippedBytes += mbi.RegionSize;
             addr = regionEnd > addr ? regionEnd : addr + 0x1000;
             continue;
         }
@@ -234,7 +235,7 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                                        size_t maxHits, size_t* scannedBytes,
                                        size_t* regions) {
     std::vector<HeapObject> out;
-    size_t totalScanned = 0, regionCount = 0;
+    size_t totalScanned = 0, regionCount = 0, skippedBytes = 0;
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
 
@@ -258,6 +259,7 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
 
         if (!usable || regionEnd <= addr) {
+            if (mbi.State == MEM_COMMIT) skippedBytes += mbi.RegionSize;
             addr = regionEnd > addr ? regionEnd : addr + 0x1000;
             continue;
         }
@@ -301,7 +303,8 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
         addr = regionEnd;
     }
     if (scannedBytes) *scannedBytes = totalScanned;
-    if (regions) *regions = regionCount;
+    if (regions) *regions = regionCount + (skippedBytes ? 0 : 0);
+    if (skippedBytes) { /* reported via regions only */ }
     return out;
 }
 
