@@ -1,0 +1,6 @@
+; x86 exports are stdcall-decorated (_v8i_probe@4); aliasing them here keeps a
+; single undecorated name for GetProcAddress on both architectures.
+LIBRARY
+EXPORTS
+    v8i_probe=_v8i_probe@4
+    v8i_version=_v8i_version@0

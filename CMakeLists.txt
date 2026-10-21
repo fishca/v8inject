@@ -52,6 +52,10 @@ set_target_properties(v8i_payload PROPERTIES
     OUTPUT_NAME "v8i_payload"
     PREFIX ""
 )
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # x86 stdcall decoration would hide the export from GetProcAddress.
+    target_sources(v8i_payload PRIVATE src/payload/v8i_payload32.def)
+endif()
 v8i_set_output(v8i_payload)
 # no .def file: exports are declared with __declspec(dllexport) in v8i_export.h
 

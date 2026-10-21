@@ -162,6 +162,13 @@ bool StartPayloadThread(DWORD pid,
     stageOut = kStageGetProcAddress;
     FARPROC localProbe = GetProcAddress(localBase, "v8i_probe");
     if (!localProbe) {
+        // x86 builds without the alias export: try the decorated form.
+        const char* alias = sizeof(void*) == 4 ? "_v8i_probe@4" : "v8i_probe";
+        localProbe = GetProcAddress(localBase, alias);
+        LogLine("GetProcAddress(v8i_probe) failed, tried '%s' -> %p",
+                alias, (void*)localProbe);
+    }
+    if (!localProbe) {
         win32ErrorOut = GetLastError();
         FreeLibrary(localBase);
         CloseHandle(hProc);
