@@ -10,7 +10,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # reason to treat the resulting bytes as UTF-8.
 if(MSVC)
     add_compile_options(/utf-8)
-    add_link_options(/utf-8)
 endif()
 
 include(cmake/capstone.cmake)
