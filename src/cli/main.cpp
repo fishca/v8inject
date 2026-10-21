@@ -166,7 +166,7 @@ int wmain(int argc, wchar_t** argv) {
             if (!mod.empty()) request += L" " + mod;
         }
         (void)next;
-        v8i::LogLine(L"request: %ls", request.c_str());
+        v8i::LogLine("request: %ls", request.c_str());
 
         v8i::Client client;
         if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
