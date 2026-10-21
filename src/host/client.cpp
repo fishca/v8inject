@@ -89,6 +89,8 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     }
 
     // Payload reports readiness by writing a "loaded" reply.
+    LONG st = io_->ready;
+    LogLine("handshake wait: ready=%ld", (long)st);
     if (!WaitForState(kStateResponse, timeoutMs)) {
         lastDiag_ = io_->diag;
         if (lastDiag_ != 0) {
@@ -105,6 +107,11 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
         ReleaseHandles();
         return false;
     }
+
+    // Consume the readiness reply: without this the very next Call sees a
+    // kStateResponse block and refuses with "busy".
+    LogLine("handshake ok, ready=%ld resuming idle", (long)io_->ready);
+    io_->ready = kStateIdle;
     return true;
 }
 
@@ -121,15 +128,23 @@ bool Client::Call(const std::wstring& command, std::string& response, int timeou
 
     // Idle -> Request. If the payload is still busy we treat it as an error
     // rather than racing on a half-written buffer.
-    if (InterlockedCompareExchange((volatile LONG*)&io_->ready, kStateRequest, kStateIdle) != kStateIdle)
-        return false;
+    LONG prev = InterlockedCompareExchange((volatile LONG*)&io_->ready, kStateRequest, kStateIdle);
+    LogLine("Call(%ls): ready was %ld -> %s", command.c_str(), (long)prev,
+            prev == kStateIdle ? "request posted" : "BUSY");
+    if (prev != kStateIdle) return false;
 
-    if (!WaitForState(kStateResponse, timeoutMs)) return false;
+    if (!WaitForState(kStateResponse, timeoutMs)) {
+        LogLine("Call(%ls): timeout, ready=%ld diag=%ld", command.c_str(),
+                (long)io_->ready, (long)io_->diag);
+        return false;
+    }
 
     lastDiag_ = io_->diag;
     LONG len = io_->responseLen;
     if (len < 0 || (size_t)len >= kResponseBytes) len = (LONG)(kResponseBytes - 1);
     response.assign(io_->response, (size_t)len);
+    LogLine("Call(%ls): got %ld bytes: %.120s", command.c_str(), (long)len,
+            response.c_str());
 
     InterlockedExchange((volatile LONG*)&io_->ready, kStateIdle);
     return true;

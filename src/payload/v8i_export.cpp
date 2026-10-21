@@ -111,6 +111,7 @@ static int RunPayload(const wchar_t* sharedName) {
     // Report readiness before anything that can fail.
     PutResponse("{\"status\":\"loaded\"}");
 
+    LogLine("waiting for commands, ready=%ld", (long)g_io->ready);
     for (;;) {
         LONG state = g_io->ready;
         if (state == kStateExit) break;
@@ -118,6 +119,7 @@ static int RunPayload(const wchar_t* sharedName) {
             Sleep(15);
             continue;
         }
+        LogLine("command received: %ls (ready=%ld)", g_io->request, (long)state);
         if (wcscmp(g_io->request, L"exit") == 0) break;
 
         if (wcscmp(g_io->request, L"version") == 0) {
@@ -135,6 +137,7 @@ static int RunPayload(const wchar_t* sharedName) {
             continue;
         }
         PutResponse(ToJson(rep));
+        LogLine("response sent, %zu bytes", rep.funcs.size());
     }
 
     InterlockedExchange((volatile LONG*)&g_io->ready, kStateExit);
