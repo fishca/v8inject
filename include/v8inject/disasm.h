@@ -52,6 +52,7 @@ struct XrefResult {
     size_t    bytesSeen = 0;
     size_t    badBytes = 0;
     bool      hitLimit = false;
+    const char* stopReason = "";
 };
 XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
                             bool is64, size_t maxHits);

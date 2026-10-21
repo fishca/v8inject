@@ -541,11 +541,14 @@ std::string XrefToJson(const std::wstring& args) {
     std::string j = "{\"status\":\"ok\",\"target\":\"" + targetKind + "\"";
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"module\":\"%ls\",\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu"
-                ",\"scannedTo\":\"0x%llX\",\"bytesSeen\":%zu,\"badBytes\":%zu%s",
+                ",\"scannedTo\":\"0x%llX\",\"bytesSeen\":%zu,\"badBytes\":%zu%s"
+                ",\"from\":\"0x%llX\",\"to\":\"0x%llX\",\"stop\":\"%s\"",
                 leaf ? leaf + 1 : m.path.c_str(),
                 (unsigned long long)img.base, (size_t)m.size,
                 (unsigned long long)xr.scannedTo, xr.bytesSeen, xr.badBytes,
-                xr.hitLimit ? ",\"hitLimit\":true" : "");
+                xr.hitLimit ? ",\"hitLimit\":true" : "",
+                (unsigned long long)from, (unsigned long long)to,
+                xr.stopReason ? xr.stopReason : "");
     j += buf;
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"targetAddr\":\"0x%llX\",\"scanned\":\"0x%llX-0x%llX\",\"hitCount\":%zu,\"xrefs\":[",

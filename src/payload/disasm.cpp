@@ -137,11 +137,14 @@ XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
             // to be readable rejects the tail of every region, which is most of
             // the last page — that stalled the sweep at its very first step.
             MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi))) break;
+            if (!VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi))) {
+                r.stopReason = "VirtualQuery failed";
+                break;
+            }
             if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) ||
                 (mbi.Protect & PAGE_GUARD)) {
                 uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-                if (next <= cur) break;
+                if (next <= cur) { r.stopReason = "bad region, cannot advance"; break; }
                 cur = next;
                 continue;
             }
@@ -149,8 +152,9 @@ XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
             // Stay inside this region and inside the requested range.
             uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
             uintptr_t limit = regionEnd < end ? regionEnd : end;
+            if (limit <= cur) { r.stopReason = "region end <= cur"; break; }
             size_t want = (size_t)std::min<uintptr_t>(kChunk, limit - cur);
-            if (want == 0) break;
+            if (want == 0) { r.stopReason = "want == 0"; break; }
             memcpy(buf.data(), (const void*)cur, want);
             chunkHave = want;
         }
@@ -198,6 +202,7 @@ XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
         r.scannedTo = cur;
     }
     if (r.scannedTo < start) r.scannedTo = start;
+    if (!r.stopReason[0]) r.stopReason = r.hitLimit ? "hit limit" : "range exhausted";
     return r;
 }
 
