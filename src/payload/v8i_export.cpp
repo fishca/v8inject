@@ -381,7 +381,7 @@ std::string DisasmToJson(const std::wstring& args) {
     std::vector<Insn> insns = Disassemble(start, a.count * 8, a.count, &stopped, sizeof(void*) == 8);
 
     char buf[256];
-    std::string j = "{\"status\":\"ok\",\"module\":\"" + EscapeW(img.MachineName()) + "\"";
+    std::string j = "{\"status\":\"ok\",\"arch\":\"" + img.MachineName() + "\"";
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"start\":\"0x%llX\",\"count\":%zu,\"stoppedAt\":\"0x%llX\",\"insns\":[",
                 (unsigned long long)start, insns.size(), (unsigned long long)stopped);
@@ -421,9 +421,13 @@ std::string ImportsToJson(const std::wstring& args) {
     size_t shown = 0;
     for (const PeImport& im : img.imports) {
         if (!want.empty()) {
-            std::wstring hay = std::wstring(im.name.begin(), im.name.end());
-            for (auto& c : hay) c = (wchar_t)towlower(c);
-            if (_wcsicmp(im.dll.c_str(), want.c_str()) != 0 && hay.find(want) == std::wstring::npos)
+            std::string hayA = im.name;
+            for (auto& c : hayA) c = (char)tolower((unsigned char)c);
+            std::string dllA = im.dll;
+            for (auto& c : dllA) c = (char)tolower((unsigned char)c);
+            std::wstring wantA(want.begin(), want.end());   // already lowercased
+            bool byDll = dllA.find(std::string(wantA.begin(), wantA.end())) != std::string::npos;
+            if (!byDll && hayA.find(std::string(wantA.begin(), wantA.end())) == std::string::npos)
                 continue;
         }
         if (shown++ >= a.count) break;

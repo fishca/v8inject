@@ -3,6 +3,7 @@
 
 #include <capstone/capstone.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace v8i {
@@ -22,7 +23,7 @@ struct Handles {
         bool& ok = is64 ? ok64 : ok32;
         if (h) return ok ? h : 0;
         cs_mode mode = is64 ? CS_MODE_64 : CS_MODE_32;
-        if (cs_open(CS_ARCH_X86, mode, &h) != CS_OK) {
+        if (cs_open(CS_ARCH_X86, mode, &h) != CS_ERR_OK) {
             h = 0;
             ok = false;
             return 0;
@@ -86,7 +87,7 @@ std::vector<Insn> Disassemble(uintptr_t start, size_t size, size_t maxInsns,
         // Capstone is fine, but guarding the page first avoids a fault on the
         // last page of a section.
         uint8_t scratch[16] = {};
-        size_t want = (size_t)min<uintptr_t>(sizeof(scratch), end - cur);
+        size_t want = (size_t)std::min<uintptr_t>(sizeof(scratch), end - cur);
         if (!IsReadable((const void*)cur, 1)) break;
         memcpy(scratch, (const void*)cur, want);
 
@@ -127,7 +128,7 @@ std::vector<Xref> FindXrefs(uintptr_t start, uintptr_t end, uintptr_t target,
         }
 
         uint8_t scratch[16] = {};
-        size_t want = (size_t)min<uintptr_t>(sizeof(scratch), end - cur);
+        size_t want = (size_t)std::min<uintptr_t>(sizeof(scratch), end - cur);
         memcpy(scratch, (const void*)cur, want);
 
         cs_insn* insn = nullptr;
