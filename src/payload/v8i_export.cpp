@@ -412,9 +412,22 @@ std::string ImportsToJson(const std::wstring& args) {
     std::wstring want = a.pattern;
     for (auto& c : want) c = (wchar_t)towlower(c);
 
+    size_t matched = 0;
+    for (const PeImport& im : img.imports) {
+        if (want.empty()) { ++matched; continue; }
+        std::string hayA = im.name;
+        for (auto& c : hayA) c = (char)tolower((unsigned char)c);
+        std::string dllA = im.dll;
+        for (auto& c : dllA) c = (char)tolower((unsigned char)c);
+        std::string wantA(want.begin(), want.end());
+        if (dllA.find(wantA) != std::string::npos || hayA.find(wantA) != std::string::npos)
+            ++matched;
+    }
+
     std::string j = "{\"status\":\"ok\",\"total\":" ;
     char buf[512];
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"imports\":[", img.imports.size());
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"matched\":%zu,\"imports\":[",
+                img.imports.size(), matched);
     j += buf;
 
     bool first = true;
@@ -430,8 +443,9 @@ std::string ImportsToJson(const std::wstring& args) {
             if (!byDll && hayA.find(std::string(wantA.begin(), wantA.end())) == std::string::npos)
                 continue;
         }
-        if (shown++ >= a.count) break;
+        if (shown >= a.count) break;
         if (!first) j += ",";
+        ++shown;
         first = false;
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "{\"dll\":\"%s\",\"name\":\"%s\",\"ordinal\":%u,\"iat\":\"0x%llX\"}",
@@ -572,11 +586,45 @@ bool RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
     return SUCCEEDED(hr);
 }
 
+// POD-only arguments so __try can coexist with C++ objects in the caller.
+static int GuardCall(std::string (*fn)(const std::wstring&), const std::wstring* args,
+                     std::string* out, unsigned* code) {
+    int ok = 0;
+    __try {
+        *out = fn(*args);
+        ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *code = GetExceptionCode();
+        ok = 0;
+    }
+    return ok;
+}
+
+std::string Guarded(const wchar_t* what, std::string (*fn)(const std::wstring&),
+                    const std::wstring& args) {
+    std::string out;
+    unsigned code = 0;
+    if (GuardCall(fn, &args, &out, &code)) return out;
+
+    char buf[256];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "{\"status\":\"error\",\"message\":\"command crashed\","
+                "\"command\":\"%ls\",\"exception\":\"0x%08X\"}",
+                what, code);
+    LogLine("command %ls raised 0x%08X", what, code);
+    return buf;
+}
+
 }  // namespace
 
 V8I_API int V8I_CALL v8i_version() {
     return 1;
 }
+
+// Every command runs behind a guard: a bad pointer in a foreign image must
+// produce an error reply, never take the host process down.
+static std::string Guarded(const wchar_t* what, std::string (*fn)(const std::wstring&),
+                           const std::wstring& args);
 
 static int RunPayload(const wchar_t* sharedName) {
     if (!sharedName) return -1;
@@ -621,50 +669,50 @@ static int RunPayload(const wchar_t* sharedName) {
 
         if (wcsncmp(g_io->request, L"disasm", 6) == 0) {
             LogLine("disasm: decoding");
-            PutResponse(DisasmToJson(std::wstring(g_io->request).size() > 7
-                                         ? std::wstring(g_io->request).substr(7)
-                                         : std::wstring()));
+            PutResponse(Guarded(L"disasm", DisasmToJson, std::wstring(g_io->request).size() > 7
+                                   ? std::wstring(g_io->request).substr(7)
+                                   : std::wstring()));
             continue;
         }
 
         if (wcsncmp(g_io->request, L"imports", 7) == 0) {
-            PutResponse(ImportsToJson(std::wstring(g_io->request).size() > 8
-                                          ? std::wstring(g_io->request).substr(8)
-                                          : std::wstring()));
+            PutResponse(Guarded(L"imports", ImportsToJson, std::wstring(g_io->request).size() > 8
+                                    ? std::wstring(g_io->request).substr(8)
+                                    : std::wstring()));
             continue;
         }
 
         if (wcsncmp(g_io->request, L"xref", 4) == 0) {
             LogLine("xref: scanning code");
-            PutResponse(XrefToJson(std::wstring(g_io->request).size() > 5
-                                       ? std::wstring(g_io->request).substr(5)
-                                       : std::wstring()));
+            PutResponse(Guarded(L"xref", XrefToJson, std::wstring(g_io->request).size() > 5
+                                 ? std::wstring(g_io->request).substr(5)
+                                 : std::wstring()));
             LogLine("xref: done");
             continue;
         }
 
         if (wcsncmp(g_io->request, L"find ", 5) == 0) {
             LogLine("find: starting scan");
-            PutResponse(FindToJson(std::wstring(g_io->request + 5)));
+            PutResponse(Guarded(L"find", FindToJson, std::wstring(g_io->request + 5)));
             LogLine("find: done");
             continue;
         }
 
         if (wcsncmp(g_io->request, L"peek ", 5) == 0) {
-            PutResponse(PeekToJson(std::wstring(g_io->request + 5)));
+            PutResponse(Guarded(L"peek", PeekToJson, std::wstring(g_io->request + 5)));
             continue;
         }
 
         if (wcsncmp(g_io->request, L"pe", 2) == 0) {
             const wchar_t* arg = g_io->request + 2;
             while (*arg == L' ') ++arg;
-            PutResponse(PeToJson(std::wstring(arg)));
+            PutResponse(Guarded(L"pe", PeToJson, std::wstring(arg)));
             continue;
         }
 
         if (wcscmp(g_io->request, L"objects") == 0) {
             LogLine("objects: enumerating windows");
-            PutResponse(ObjectsToJson());
+            PutResponse(Guarded(L"objects", ObjectsToJson, std::wstring()));
             continue;
         }
 
