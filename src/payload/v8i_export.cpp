@@ -313,6 +313,14 @@ uintptr_t ParseHexToken(const std::wstring& t) {
     return (uintptr_t)_wcstoui64(s.c_str(), nullptr, 16);
 }
 
+// Numbers on the command line may be written in hex (0x38) or decimal (56).
+size_t ParseNum(const std::wstring& t) {
+    if (t.empty()) return 0;
+    if (t.size() > 2 && t[0] == L'0' && (t[1] == L'x' || t[1] == L'X'))
+        return (size_t)ParseHexToken(t);
+    return (size_t)_wtoi(t.c_str());
+}
+
 ReArgs ParseReArgs(const std::wstring& args) {
     ReArgs a;
     std::wstring rest = args;
@@ -323,8 +331,8 @@ ReArgs ParseReArgs(const std::wstring& args) {
         else if (tok == L"--addr")   { a.addr = ParseHexToken(NextToken(rest)); a.haveAddr = true; }
         else if (tok == L"--from")   { a.from = ParseHexToken(NextToken(rest)); a.haveFrom = true; }
         else if (tok == L"--to")     { a.to = ParseHexToken(NextToken(rest)); a.haveTo = true; }
-        else if (tok == L"--count")  a.count = (size_t)_wtoi(NextToken(rest).c_str());
-        else if (tok == L"--offset") { a.offset = (size_t)_wtoi(NextToken(rest).c_str()); a.haveOffset = true; }
+        else if (tok == L"--count")  a.count = ParseNum(NextToken(rest));
+        else if (tok == L"--offset") { a.offset = ParseNum(NextToken(rest)); a.haveOffset = true; }
         else if (tok == L"--pattern") a.pattern = NextToken(rest);
         else if (tok[0] != L'-')     a.positional.push_back(tok);
     }

@@ -194,7 +194,9 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
             SIZE_T got = 0;
             if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want2, &got) ||
                 got < 4) {
-                break;
+                // Skip only this chunk: one unreadable page must not abandon the
+                // whole region, which is what hid the heap from the scan.
+                continue;
             }
 
             totalScanned += got;
@@ -267,12 +269,27 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
             buf.resize(want2);
             SIZE_T got = 0;
             if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want2, &got) ||
-                got < 4) break;
+                got < 4) continue;
             totalScanned += got;
 
             for (size_t off = 0; off + 4 <= got; off += 4) {
                 const uintptr_t vt = *(const uint32_t*)(buf.data() + off);
                 if (vt <= lo || vt >= hi) continue;
+
+                // A real vtable holds pointers into the same module; demand at
+                // least three of the first four entries, otherwise the "vtable"
+                // is just text or numeric data that happens to look like a code
+                // address.
+                uint32_t slots[4] = {};
+                if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)vt, slots, sizeof(slots),
+                                       nullptr)) {
+                    continue;
+                }
+                int inside = 0;
+                for (uint32_t v : slots) {
+                    if ((uintptr_t)v > lo && (uintptr_t)v < hi) ++inside;
+                }
+                if (inside < 3) continue;
 
                 HeapObject o;
                 o.address = cur + off;
