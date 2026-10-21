@@ -353,6 +353,16 @@ const PeSection* CodeSection(const PeImage& img) {
     return nullptr;
 }
 
+// End of the region to scan: the section may claim a virtual size that runs past
+// the image, which silently moves the scan into unrelated memory.
+uintptr_t SectionEnd(const PeImage& img, const PeSection* sec) {
+    if (!sec) return img.base;
+    uintptr_t begin = img.base + sec->va;
+    uintptr_t bySize = img.base + img.sizeOfImage;
+    uintptr_t bySec = begin + (sec->virtualSize ? sec->virtualSize : sec->rawSize);
+    return bySec < bySize ? bySec : bySize;
+}
+
 }  // namespace
 
 std::string DisasmToJson(const std::wstring& args) {
@@ -519,12 +529,20 @@ std::string XrefToJson(const std::wstring& args) {
         if (!c) return "{\"status\":\"error\",\"message\":\"no executable section\"}";
         from = img.base + c->va;
     }
-    if (!to) to = from + (CodeSection(img) ? CodeSection(img)->virtualSize : 0x100000);
+    if (!to) to = SectionEnd(img, CodeSection(img));
 
     std::vector<Xref> hits = FindXrefs(from, to, target, sizeof(void*) == 8, a.count);
 
+    // Report what was actually scanned: a wrong module here silently produces
+    // an empty result that looks like "no references".
+    const wchar_t* leaf = wcsrchr(m.path.c_str(), L'\\');
     char buf[320];
     std::string j = "{\"status\":\"ok\",\"target\":\"" + targetKind + "\"";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                ",\"module\":\"%ls\",\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu",
+                leaf ? leaf + 1 : m.path.c_str(),
+                (unsigned long long)img.base, (size_t)m.size);
+    j += buf;
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"targetAddr\":\"0x%llX\",\"scanned\":\"0x%llX-0x%llX\",\"hitCount\":%zu,\"xrefs\":[",
                 (unsigned long long)target, (unsigned long long)from,
