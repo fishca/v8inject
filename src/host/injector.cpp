@@ -175,30 +175,15 @@ bool StartPayloadThread(DWORD pid,
             (void*)localProbe, (void*)remoteProbeAddr);
     FreeLibrary(localBase);   // target keeps its own reference
 
-    stageOut = kStageAllocName;
-    const size_t nameBytes = (wcslen(sharedName) + 1) * sizeof(wchar_t);
-    void* rn = AllocRemote(hProc, sharedName, nameBytes);
-    if (!rn) { win32ErrorOut = GetLastError(); CloseHandle(hProc); return false; }
-
-    stageOut = kStageAllocArgs;
-    const uintptr_t nameArg = (uintptr_t)rn;
-    void* ra = AllocRemote(hProc, &nameArg, sizeof(nameArg));
-    if (!ra) {
-        win32ErrorOut = GetLastError();
-        VirtualFreeEx(hProc, rn, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        return false;
-    }
-
+    // Nothing is passed to the payload: it derives the block name from its own
+    // PID, so there is no cross-process string to marshal.
     stageOut = kStageCreateThread;
     HANDLE th = CreateRemoteThread(hProc, nullptr, 0,
                                    (LPTHREAD_START_ROUTINE)remoteProbeAddr,
-                                   ra, 0, nullptr);
+                                   nullptr, 0, nullptr);
     LogLine("CreateRemoteThread -> %p err=%lu", (void*)th, GetLastError());
     if (!th) {
         win32ErrorOut = GetLastError();
-        VirtualFreeEx(hProc, rn, 0, MEM_RELEASE);
-        VirtualFreeEx(hProc, ra, 0, MEM_RELEASE);
         CloseHandle(hProc);
         return false;
     }
@@ -206,8 +191,8 @@ bool StartPayloadThread(DWORD pid,
     stageOut = kStageOk;
     hProcessOut = hProc;
     hThreadOut = th;
-    remoteNameOut = rn;
-    remoteArgsOut = ra;
+    remoteNameOut = nullptr;
+    remoteArgsOut = nullptr;
 
     // Ask the thread what happened: exit code 259 means it is still running,
     // anything else is the value v8i_probe returned (or a crash code).

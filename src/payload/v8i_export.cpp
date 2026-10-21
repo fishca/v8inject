@@ -144,39 +144,24 @@ static int RunPayload(const wchar_t* sharedName) {
     return 0;
 }
 
-struct WorkerArgs {
-    wchar_t name[64];
-};
-
-static DWORD WINAPI WorkerProc(LPVOID param) {
-    auto* args = (WorkerArgs*)param;
-    RunPayload(args->name);
-    return 0;
-}
-
-// The host starts this on a remote thread. We immediately hand the work to our
-// own thread and keep the caller blocked, so the payload keeps running even
-// though the host opened that thread with default settings.
-V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
+// The host starts this on a remote thread. The shared-memory name is derived
+// from our own PID, so nothing has to be marshalled across the process
+// boundary: a bad pointer in a remote thread is the classic way to lose the
+// argument, and we do not need one at all.
+V8I_API int V8I_CALL v8i_probe(const wchar_t* /*ignored*/) {
     InitPayloadLog(nullptr);          // provisional, refined after mapping
-    LogLine("v8i_probe entered, pid=%lu shared=%ls", GetCurrentProcessId(),
-            sharedName ? sharedName : L"(null)");
 
-    WorkerArgs args{};
-    args = WorkerArgs();          // no CRT init paths in a remote thread
-    if (sharedName) {
-        wcsncpy_s(args.name, _countof(args.name), sharedName, _TRUNCATE);
-    }
+    wchar_t name[64] = {};
+    _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\v8inject.%lu",
+                 GetCurrentProcessId());
+    LogLine("v8i_probe entered, pid=%lu block=%ls",
+            GetCurrentProcessId(), name);
 
-    HANDLE hWorker = CreateThread(nullptr, 0, WorkerProc, &args, 0, nullptr);
-    if (hWorker) {
-        LogLine("worker thread created %p", (void*)hWorker);
-        // Block the remote thread forever; the worker owns the session.
-        WaitForSingleObject(hWorker, INFINITE);
-        CloseHandle(hWorker);
-    } else {
-        LogLine("CreateThread failed err=%lu", GetLastError());
-        RunPayload(args.name);   // fall back to running inline
-    }
-    return 0;
+    // Run the session inline on this thread. The host owns and closes the
+    // remote thread, and keeping the work here means no second thread has to
+    // be created inside a process we do not control.
+    int rc = RunPayload(name);
+    LogLine("v8i_probe leaving, rc=%d", rc);
+    return rc;
 }
+
