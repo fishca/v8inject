@@ -21,6 +21,8 @@ void PrintUsage() {
     wprintf(L"  v8inject probe   <exe> [--dll <path>] [--timeout <ms>]\n");
     wprintf(L"  v8inject scan    <exe> <iunknown-addr-hex> [--module <name>] [--dll <path>]\n");
     wprintf(L"  v8inject objects <exe> [--dll <path>] [--timeout <ms>]\n");
+    wprintf(L"  v8inject peek    <exe> <hex-addr> [len] [--dll <path>]\n");
+    wprintf(L"  v8inject pe      <exe> [module] [--dll <path>]\n");
     wprintf(L"  v8inject log     [--clear]\n\n");
     wprintf(L"examples:\n");
     wprintf(L"  v8inject probe 1cv8.exe\n");
@@ -134,6 +136,46 @@ int wmain(int argc, wchar_t** argv) {
         bool ok = client.Call(L"objects", resp, o.timeoutMs);
         wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         wprintf(L"log   : %ls\n", v8i::GetLogPath());
+        client.Close();
+        return ok ? 0 : 5;
+    }
+
+    if (cmd == L"peek" || cmd == L"pe") {
+        if (argc < 3) { PrintUsage(); return 1; }
+        DWORD pid = v8i::FindProcessByName(argv[2]);
+        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+
+        Options o = ParseOptions(argc, argv, 3);
+        std::wstring request;
+        int next = 3;
+
+        if (cmd == L"peek") {
+            if (argc < 4) { PrintUsage(); return 1; }
+            uint64_t addr = 0;
+            if (!ParseHex(argv[3], addr)) { wprintf(L"bad address: %ls\n", argv[3]); return 1; }
+            int len = 64;
+            if (argc > 4 && argv[4][0] != L'-') { len = _wtoi(argv[4]); next = 5; }
+            wchar_t buf[128] = {};
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"peek %llx %d",
+                         (unsigned long long)addr, len);
+            request = buf;
+        } else {
+            std::wstring mod;
+            if (argc > 3 && argv[3][0] != L'-') { mod = argv[3]; next = 4; }
+            request = L"pe";
+            if (!mod.empty()) request += L" " + mod;
+        }
+        (void)next;
+        v8i::LogLine(L"request: %ls", request.c_str());
+
+        v8i::Client client;
+        if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
+            PrintOpenFailure(client, o);
+            return 4;
+        }
+        std::string resp;
+        bool ok = client.Call(request, resp, o.timeoutMs);
+        wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         client.Close();
         return ok ? 0 : 5;
     }

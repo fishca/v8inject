@@ -1,6 +1,7 @@
 #include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
 #include "v8inject/objects.h"
+#include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/protocol.h"
 #include "v8inject/typeinfo_utils.h"
@@ -57,6 +58,131 @@ std::string EscapeW(const std::wstring& w) {
         }
     }
     return out;
+}
+
+// Reads raw bytes at an address inside this process. Read-only: nothing is
+// executed and no pointers are followed beyond classifying the first qword.
+std::string PeekToJson(const std::wstring& args) {
+    uintptr_t addr = 0;
+    int count = 64;
+    const wchar_t* p = args.c_str();
+    if (swscanf_s(p, L"%llx %d", (unsigned long long*)&addr, &count) < 1) {
+        return "{\"status\":\"error\",\"message\":\"usage: peek <hex-addr> [len]\"}";
+    }
+    if (count <= 0) count = 64;
+    if (count > 4096) count = 4096;
+
+    char head[128];
+    _snprintf_s(head, sizeof(head), _TRUNCATE,
+                "{\"status\":\"ok\",\"address\":\"0x%llX\",\"bytes\":%d,\"data\":\"",
+                (unsigned long long)addr, count);
+    std::string j = head;
+
+    unsigned char buf[64] = {};
+    bool anyRead = false;
+    for (int off = 0; off < count; off += (int)sizeof(buf)) {
+        int chunk = count - off;
+        if (chunk > (int)sizeof(buf)) chunk = (int)sizeof(buf);
+        if (!IsReadable((const void*)(addr + off), (size_t)chunk)) break;
+        memcpy(buf, (const void*)(addr + off), (size_t)chunk);
+        anyRead = true;
+        for (int i = 0; i < chunk; ++i) {
+            char h[4];
+            _snprintf_s(h, sizeof(h), _TRUNCATE, "%02X", buf[i]);
+            j += h;
+        }
+    }
+    if (!anyRead) return "{\"status\":\"error\",\"message\":\"unreadable address\"}";
+    j += "\"";
+
+    // If the first qword looks like a vtable pointer, say which module owns it.
+    if (IsReadable((const void*)addr, sizeof(uintptr_t))) {
+        uintptr_t first = *(const uintptr_t*)addr;
+        char vb[96];
+        _snprintf_s(vb, sizeof(vb), _TRUNCATE, ",\"firstQword\":\"0x%llX\"",
+                    (unsigned long long)first);
+        j += vb;
+        for (const ModuleRange& m : EnumModules()) {
+            if (first >= m.base && first < m.base + m.size) {
+                const wchar_t* f = wcsrchr(m.path.c_str(), L'\\\\');
+                j += ",\"inModule\":\"" + EscapeW(f ? f + 1 : m.path) + "\"";
+                _snprintf_s(vb, sizeof(vb), _TRUNCATE, ",\"moduleRva\":\"0x%llX\"",
+                            (unsigned long long)(first - m.base));
+                j += vb;
+                break;
+            }
+        }
+        // A vtable pointer inside an image base is a strong hint that the value
+        // is a C++ object; PE headers at that address confirm it.
+        PeImage probe = ParsePe(first);
+        if (probe.valid) j += ",\"firstQwordIsPeImage\":true";
+    }
+    j += "}";
+    return j;
+}
+
+std::string PeToJson(const std::wstring& args) {
+    std::wstring name = args;
+    while (!name.empty() && (name.back() == L' ' || name.back() == L'\t')) name.pop_back();
+    size_t start = 0;
+    while (start < name.size() && (name[start] == L' ' || name[start] == L'\t')) ++start;
+    name = name.substr(start);
+
+    ModuleRange m;
+    if (!name.empty() && !FindModule(name.c_str(), m)) {
+        // Fall back to the main executable when the name does not resolve.
+        for (const ModuleRange& cand : EnumModules()) {
+            const wchar_t* f = wcsrchr(cand.path.c_str(), L'\\\\');
+            f = f ? f + 1 : cand.path.c_str();
+            if (_wcsicmp(f, L"1cv8.exe") == 0 || _wcsicmp(f, L"1cv8с.exe") == 0) { m = cand; break; }
+        }
+    }
+    if (!m.base) return "{\"status\":\"error\",\"message\":\"module not found\"}";
+
+    PeImage img = ParsePe(m.base);
+    if (!img.valid) return "{\"status\":\"error\",\"message\":\"" + img.error + "\"}";
+
+    const wchar_t* fname = wcsrchr(m.path.c_str(), L'\\\\');
+    char buf[256];
+
+    std::string j = "{\"status\":\"ok\",\"module\":\"" + EscapeW(fname ? fname + 1 : m.path) + "\"";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                ",\"base\":\"0x%llX\",\"sizeOfImage\":%u,\"machine\":\"%s\",\"entryPoint\":\"0x%llX\"",
+                (unsigned long long)img.base, img.sizeOfImage, img.MachineName().c_str(),
+                (unsigned long long)(img.base + img.entryPointRva));
+    j += buf;
+
+    j += ",\"sections\":[";
+    for (size_t i = 0; i < img.sections.size(); ++i) {
+        const PeSection& s = img.sections[i];
+        if (i) j += ",";
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"name\":\"%s\",\"rva\":\"0x%X\",\"va\":\"0x%llX\",\"vsize\":%u,\"raw\":%u,"
+                    "\"flags\":\"%s%s%s\"}",
+                    s.name.c_str(), s.va, (unsigned long long)(img.base + s.va),
+                    s.virtualSize, s.rawSize,
+                    s.Readable() ? "R" : "-", s.Writable() ? "W" : "-",
+                    s.Executable() ? "X" : "-");
+        j += buf;
+    }
+    j += "]";
+
+    j += ",\"exportCount\":" + std::to_string(img.exports.size());
+    j += ",\"exports\":[";
+    size_t shown = 0;
+    for (const PeExport& e : img.exports) {
+        if (shown++) j += ",";
+        if (shown > 200) break;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"name\":\"%s\",\"rva\":\"0x%X\",\"va\":\"0x%llX\",\"ordinal\":%u%s%s%s}",
+                    e.name.c_str(), e.rva, (unsigned long long)(img.base + e.rva), e.ordinal,
+                    e.forwarded ? ",\"forwarded\":true,\"to\":\"" : "",
+                    e.forwarded ? e.forwarder.c_str() : "",
+                    e.forwarded ? "\"" : "");
+        j += buf;
+    }
+    j += "]}";
+    return j;
 }
 
 std::string ObjectsToJson() {
@@ -172,6 +298,18 @@ static int RunPayload(const wchar_t* sharedName) {
                         "{\"status\":\"ok\",\"api\":%d,\"pointerSize\":%d}",
                         v8i_version(), (int)sizeof(void*));
             PutResponse(buf);
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"peek ", 5) == 0) {
+            PutResponse(PeekToJson(std::wstring(g_io->request + 5)));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"pe", 2) == 0) {
+            const wchar_t* arg = g_io->request + 2;
+            while (*arg == L' ') ++arg;
+            PutResponse(PeToJson(std::wstring(arg)));
             continue;
         }
 
