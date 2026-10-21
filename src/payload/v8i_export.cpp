@@ -576,6 +576,62 @@ std::string XrefToJson(const std::wstring& args) {
 // Shows the instructions around an address, with a marker on the exact one.
 
 // byhwnd <hwnd> [--module m] [--offset 0x34] — find the object that owns a window.
+
+// heapobjects [--module m] [--count n] — list heap objects whose vtable belongs
+// to a module, grouped by vtable RVA. Shows which classes are alive and how many.
+std::string HeapObjectsToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    for (const std::wstring& p : a.positional)
+        if (p.find(L'.') != std::wstring::npos && a.module.empty()) a.module = p;
+
+    ModuleRange m;
+    PeImage img;
+    if (!ResolveModule(a.module, m, img))
+        return "{\"status\":\"error\",\"message\":\"module not found\"}";
+
+    size_t scanned = 0, regions = 0;
+    size_t cap = a.count ? a.count : 20000;
+    std::vector<HeapObject> objs = FindHeapObjects(m.base, m.size, cap, &scanned, &regions);
+
+    // Group by vtable RVA.
+    std::vector<std::pair<uint32_t, size_t>> groups;
+    for (const HeapObject& o : objs) {
+        bool seen = false;
+        for (auto& g : groups) {
+            if (g.first == o.vtableRva) { g.second++; seen = true; break; }
+        }
+        if (!seen) groups.push_back({o.vtableRva, 1});
+    }
+    // Most frequent first.
+    for (size_t i = 0; i + 1 < groups.size(); ++i)
+        for (size_t k = 0; k + 1 < groups.size() - i; ++k)
+            if (groups[k].second < groups[k + 1].second)
+                std::swap(groups[k], groups[k + 1]);
+
+    char buf[512];
+    std::string j = "{\"status\":\"ok\",\"module\":\"";
+    j += img.MachineName();
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "\",\"moduleBase\":\"0x%llX\",\"objects\":%zu,\"classes\":%zu,"
+                "\"scannedBytes\":%zu,\"regions\":%zu,\"vtables\":[",
+                (unsigned long long)m.base, objs.size(), groups.size(), scanned, regions);
+    j += buf;
+
+    size_t shown = 0;
+    bool first = true;
+    for (const auto& g : groups) {
+        if (shown++ >= 40) break;
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"rva\":\"0x%X\",\"addr\":\"0x%llX\",\"count\":%zu}",
+                    g.first, (unsigned long long)(m.base + g.first), g.second);
+        j += buf;
+    }
+    j += "]}";
+    return j;
+}
+
 std::string ByHwndToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
 
@@ -852,6 +908,14 @@ static int RunPayload(const wchar_t* sharedName) {
         if (wcsncmp(g_io->request, L"imports", 7) == 0) {
             PutResponse(Guarded(L"imports", ImportsToJson, std::wstring(g_io->request).size() > 8
                                     ? std::wstring(g_io->request).substr(8)
+                                    : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"heapobjects", 10) == 0) {
+            PutResponse(Guarded(L"heapobjects", HeapObjectsToJson,
+                                std::wstring(g_io->request).size() > 11
+                                    ? std::wstring(g_io->request).substr(11)
                                     : std::wstring()));
             continue;
         }

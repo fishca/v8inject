@@ -47,4 +47,17 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
                                         size_t* scannedBytes = nullptr,
                                         size_t* regions = nullptr);
 
+// Every heap object whose first dword points inside a module — i.e. a C++
+// object with a vtable from that module. Grouped by vtable RVA so the classes
+// can be counted.
+struct HeapObject {
+    uintptr_t address = 0;
+    uintptr_t vtable = 0;
+    uint32_t  vtableRva = 0;
+};
+
+std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
+                                       size_t maxHits, size_t* scannedBytes = nullptr,
+                                       size_t* regions = nullptr);
+
 }  // namespace v8i

@@ -228,4 +228,64 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
     return out;
 }
 
+std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
+                                       size_t maxHits, size_t* scannedBytes,
+                                       size_t* regions) {
+    std::vector<HeapObject> out;
+    size_t totalScanned = 0, regionCount = 0;
+    const uintptr_t lo = moduleBase;
+    const uintptr_t hi = moduleBase + moduleSize;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+    const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
+
+    while (addr < maxAddr && out.size() < maxHits) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
+
+        const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
+        const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT) ++regionCount;
+
+        const bool usable = mbi.State == MEM_COMMIT &&
+                            !(mbi.Protect & PAGE_GUARD) &&
+                            !(mbi.Protect & PAGE_NOACCESS) &&
+                            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+
+        if (!usable || regionEnd <= addr) {
+            addr = regionEnd > addr ? regionEnd : addr + 0x1000;
+            continue;
+        }
+
+        const size_t kChunk = 0x10000;
+        for (uintptr_t cur = regionBase; cur < regionEnd && out.size() < maxHits; cur += kChunk) {
+            size_t want2 = (size_t)std::min<uintptr_t>(kChunk, regionEnd - cur);
+            static std::vector<unsigned char> buf;
+            buf.resize(want2);
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want2, &got) ||
+                got < 4) break;
+            totalScanned += got;
+
+            for (size_t off = 0; off + 4 <= got; off += 4) {
+                const uintptr_t vt = *(const uint32_t*)(buf.data() + off);
+                if (vt <= lo || vt >= hi) continue;
+
+                HeapObject o;
+                o.address = cur + off;
+                o.vtable = vt;
+                o.vtableRva = (uint32_t)(vt - lo);
+                out.push_back(o);
+            }
+        }
+        addr = regionEnd;
+    }
+    if (scannedBytes) *scannedBytes = totalScanned;
+    if (regions) *regions = regionCount;
+    return out;
+}
+
 }  // namespace v8i
