@@ -78,6 +78,17 @@ Options ParseOptions(int argc, wchar_t** argv, int first) {
     return o;
 }
 
+// Console output must be wide: the payload speaks UTF-8, and %hs would try to
+// interpret that as the active ANSI code page (866/1251), producing mojibake.
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+    return out;
+}
+
 void PrintOpenFailure(v8i::Client& client, const Options& o) {
     wprintf(L"handshake failed\n  reason : %s\n  diag   : %ld\n"
             L"  stage  : %d  win32: %lu\n"
@@ -101,6 +112,10 @@ int wmain(int argc, wchar_t** argv) {
     // Everything below this point is a real session and gets logged.
     InitHostLog();
 
+    // Windows console defaults to the OEM code page; switching to UTF-8 lets
+    // Cyrillic window titles survive the trip from the payload.
+    SetConsoleOutputCP(CP_UTF8);
+
     if (cmd == L"objects") {
         if (argc < 3) { PrintUsage(); return 1; }
         DWORD pid = v8i::FindProcessByName(argv[2]);
@@ -117,7 +132,7 @@ int wmain(int argc, wchar_t** argv) {
 
         std::string resp;
         bool ok = client.Call(L"objects", resp, o.timeoutMs);
-        wprintf(L"reply : %hs\n", ok ? resp.c_str() : "<no reply>");
+        wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         wprintf(L"log   : %ls\n", v8i::GetLogPath());
         client.Close();
         return ok ? 0 : 5;
@@ -189,7 +204,7 @@ int wmain(int argc, wchar_t** argv) {
         bool ok = client.Call(L"version", resp, o.timeoutMs);
         v8i::LogLine("probe: version reply ok=%d", (int)ok);
         wprintf(L"session    : %s\n", client.SharedName());
-        wprintf(L"reply      : %hs\n", ok ? resp.c_str() : "<no reply>");
+        wprintf(L"reply      : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         wprintf(L"log        : %ls\n", v8i::GetLogPath());
         client.Close();
         return ok ? 0 : 5;
