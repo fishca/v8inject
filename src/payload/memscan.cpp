@@ -151,4 +151,75 @@ std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes
     return hits;
 }
 
+std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t moduleSize,
+                                        size_t hwndOffset, size_t maxHits) {
+    std::vector<HwndOwner> out;
+    const uintptr_t want = (uintptr_t)hwnd;
+    const uintptr_t lo = moduleBase;
+    const uintptr_t hi = moduleBase + moduleSize;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+    const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
+
+    // Walk committed private/writable memory: 1C allocates its objects on the heap.
+    while (addr < maxAddr && out.size() < maxHits) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
+
+        const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
+        const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+
+        const bool usable = mbi.State == MEM_COMMIT &&
+                            !(mbi.Protect & PAGE_GUARD) &&
+                            !(mbi.Protect & PAGE_NOACCESS) &&
+                            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+
+        if (!usable || regionEnd <= addr) {
+            addr = regionEnd > addr ? regionEnd : addr + 0x1000;
+            continue;
+        }
+
+        // Copy in chunks so a page fault mid-region cannot kill the scan.
+        const size_t kChunk = 0x10000;
+        for (uintptr_t cur = regionBase; cur < regionEnd && out.size() < maxHits; cur += kChunk) {
+            size_t want2 = (size_t)std::min<uintptr_t>(kChunk, regionEnd - cur);
+            static std::vector<unsigned char> buf;
+            buf.resize(want2);
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want2, &got) ||
+                got < 4) {
+                break;
+            }
+
+            const size_t limit = got >= 4 ? got - 4 : 0;
+            for (size_t off = 0; off <= limit; off += 4) {
+                const uintptr_t val = *(const uint32_t*)(buf.data() + off);
+                if (val <= lo || val >= hi) continue;      // must point inside the module
+
+                // `val` is a candidate object address; the field at +hwndOffset
+                // must hold the handle we are looking for.
+                const uintptr_t objField = val + hwndOffset;
+                uint32_t cand = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)objField, &cand, 4, nullptr))
+                    continue;
+                if (cand != (uint32_t)want) continue;
+
+                HwndOwner o;
+                o.address = val;
+                ReadProcessMemory(GetCurrentProcess(), (LPCVOID)val, &o.vtable, 4, nullptr);
+                if (o.vtable >= lo && o.vtable < hi) {
+                    o.vtableInModule = true;
+                    o.moduleRva = (uint32_t)(o.vtable - lo);
+                }
+                out.push_back(o);
+            }
+        }
+        addr = regionEnd;
+    }
+    return out;
+}
+
 }  // namespace v8i

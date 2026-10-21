@@ -571,6 +571,49 @@ std::string XrefToJson(const std::wstring& args) {
 }
 
 // Shows the instructions around an address, with a marker on the exact one.
+
+// byhwnd <hwnd> [--module m] [--offset 0x34] — find the object that owns a window.
+std::string ByHwndToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+
+    uintptr_t hwndVal = 0;
+    for (const std::wstring& p : a.positional) {
+        if (p.find(L'.') != std::wstring::npos) { if (a.module.empty()) a.module = p; }
+        else if (!hwndVal) hwndVal = ParseHexToken(p);
+    }
+    if (!hwndVal) return "{\"status\":\"error\",\"message\":\"hwnd required\"}";
+
+    size_t off = a.haveAddr ? a.addr : 0x34;
+
+    ModuleRange m;
+    PeImage img;
+    if (!ResolveModule(a.module, m, img))
+        return "{\"status\":\"error\",\"message\":\"module not found\"}";
+
+    std::vector<HwndOwner> found =
+        FindObjectsByHwnd((HWND)hwndVal, m.base, m.size, off, a.count ? a.count : 16);
+
+    char buf[512];
+    std::string j = "{\"status\":\"ok\",\"hwnd\":\"0x";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%llX\",\"offset\":%zu,\"count\":%zu,\"objects\":[",
+                (unsigned long long)hwndVal, off, found.size());
+    j += buf;
+
+    bool first = true;
+    for (const HwndOwner& o : found) {
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"addr\":\"0x%llX\",\"vtable\":\"0x%llX\",\"vtableInModule\":%s%s}",
+                    (unsigned long long)o.address, (unsigned long long)o.vtable,
+                    o.vtableInModule ? "true" : "false",
+                    o.vtableInModule ? "" : "");
+        j += buf;
+    }
+    j += "]}";
+    return j;
+}
+
 std::string AroundToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
     // around <hex-addr> [--count n] — the address is positional, as in xref.
@@ -802,6 +845,13 @@ static int RunPayload(const wchar_t* sharedName) {
             PutResponse(Guarded(L"imports", ImportsToJson, std::wstring(g_io->request).size() > 8
                                     ? std::wstring(g_io->request).substr(8)
                                     : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"byhwnd", 6) == 0) {
+            PutResponse(Guarded(L"byhwnd", ByHwndToJson, std::wstring(g_io->request).size() > 7
+                                                             ? std::wstring(g_io->request).substr(7)
+                                                             : std::wstring()));
             continue;
         }
 

@@ -29,4 +29,20 @@ std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes
 // Describes the module that owns `addr`, if any.
 bool ModuleOfAddress(uintptr_t addr, std::wstring* name, uintptr_t* moduleRva);
 
+// Finds a heap object that owns the given HWND.
+//
+// 1C stores the window handle inside its frame object at +0x34 but keeps no
+// back-pointer in the HWND itself (GWLP_USERDATA is null), so the only reliable
+// way back is to scan committed memory for a pointer into `moduleBase` .. +`moduleSize`
+// and check the field at `hwndOffset` for a match.
+struct HwndOwner {
+    uintptr_t address = 0;      // object address
+    uintptr_t vtable = 0;       // first dword of the object
+    uint32_t  moduleRva = 0;    // rva of the vtable inside the module, if any
+    bool      vtableInModule = false;
+};
+
+std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t moduleSize,
+                                        size_t hwndOffset, size_t maxHits);
+
 }  // namespace v8i
