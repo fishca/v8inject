@@ -30,6 +30,9 @@ target_include_directories(capstone PUBLIC
 target_compile_definitions(capstone PUBLIC
     CAPSTONE_HAS_X86=1
     CAPSTONE_X86_SUPPORT=1
+    # Without this the allocator function pointers stay NULL and every cs_open()
+    # fails with CS_ERR_MEMSETUP — the disassembler never comes up at all.
+    CAPSTONE_USE_SYS_DYN_MEM=1
 )
 
 # Capstone is C89-era code and spews warnings under /W4; keep them quiet but
