@@ -474,8 +474,20 @@ std::string ImportsToJson(const std::wstring& args) {
 // Resolves the target through the IAT when it looks like an import slot.
 std::string XrefToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
-    // xref <import-name> [--module m] — first positional is the import to follow.
-    if (a.pattern.empty() && !a.positional.empty()) a.pattern = a.positional[0];
+    // A positional token is an address when it starts with 0x or looks hex,
+    // otherwise it is an import name to resolve through the IAT.
+    if (!a.haveAddr) {
+        for (const std::wstring& p : a.positional) {
+            bool hexLike = (p.size() > 2 && p[0] == L'0' && (p[1] == L'x' || p[1] == L'X')) ||
+                           (p.find(L'.') == std::wstring::npos && p.size() >= 5);
+            if (hexLike) {
+                uintptr_t v = ParseHexToken(p);
+                if (v) { a.addr = v; a.haveAddr = true; }
+            } else if (a.pattern.empty()) {
+                a.pattern = p;
+            }
+        }
+    }
     ModuleRange m;
     PeImage img;
     if (!ResolveModule(a.module, m, img)) {
@@ -526,6 +538,38 @@ std::string XrefToJson(const std::wstring& args) {
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "{\"from\":\"0x%llX\",\"how\":\"%s\"}",
                     (unsigned long long)x.from, x.how.c_str());
+        j += buf;
+    }
+    j += "]}";
+    (void)first;
+    return j;
+}
+
+// Shows the instructions around an address, with a marker on the exact one.
+std::string AroundToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    if (!a.haveAddr) return "{\"status\":\"error\",\"message\":\"--addr required\"}";
+
+    // Walk back a little so the caller sees the setup before the call.
+    uintptr_t start = a.addr >= 48 ? a.addr - 48 : a.addr;
+    uintptr_t stopped = start;
+    std::vector<Insn> insns = Disassemble(start, 256, a.count ? a.count : 16, &stopped,
+                                          sizeof(void*) == 8);
+
+    char buf[320];
+    std::string j = "{\"status\":\"ok\",\"around\":\"0x";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%llX\",\"insns\":[",
+                (unsigned long long)a.addr);
+    j += buf;
+
+    bool first = true;
+    for (const Insn& i : insns) {
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"addr\":\"0x%llX\",\"text\":\"%s %s\"%s}",
+                    (unsigned long long)i.address, i.mnemonic.c_str(), i.opStr.c_str(),
+                    i.address == a.addr ? ",\"here\":true" : "");
         j += buf;
     }
     j += "]}";
@@ -727,6 +771,13 @@ static int RunPayload(const wchar_t* sharedName) {
             PutResponse(Guarded(L"imports", ImportsToJson, std::wstring(g_io->request).size() > 8
                                     ? std::wstring(g_io->request).substr(8)
                                     : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"around", 6) == 0) {
+            PutResponse(Guarded(L"around", AroundToJson, std::wstring(g_io->request).size() > 7
+                                                              ? std::wstring(g_io->request).substr(7)
+                                                              : std::wstring()));
             continue;
         }
 
