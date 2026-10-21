@@ -67,6 +67,7 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll, int timeoutMs) {
     io_->requestLen = 0;
     io_->responseLen = 0;
     io_->seq = 0;
+    io_->diag = 0;
     io_->request[0] = 0;
     io_->response[0] = 0;
 
@@ -79,6 +80,18 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll, int timeoutMs) {
 
     // Payload reports readiness by writing a "loaded" reply.
     if (!WaitForState(kStateResponse, timeoutMs)) {
+        lastDiag_ = io_->diag;
+        if (lastDiag_ != 0) {
+            _snwprintf_s(lastError_, _countof(lastError_), _TRUNCATE,
+                         L"payload thread exited with diagnostic %ld "
+                         L"(check: is the payload DLL on the target's disk? "
+                         L"does its bitness match? did LoadLibrary fail?)",
+                         lastDiag_);
+        } else {
+            wcscpy_s(lastError_, L"no reply from payload: the remote thread "
+                                 L"never reported in (DLL not executed, "
+                                 L"wrong bitness, or target still loading)");
+        }
         ReleaseHandles();
         return false;
     }
@@ -103,6 +116,7 @@ bool Client::Call(const std::wstring& command, std::string& response, int timeou
 
     if (!WaitForState(kStateResponse, timeoutMs)) return false;
 
+    lastDiag_ = io_->diag;
     LONG len = io_->responseLen;
     if (len < 0 || (size_t)len >= kResponseBytes) len = (LONG)(kResponseBytes - 1);
     response.assign(io_->response, (size_t)len);

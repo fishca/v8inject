@@ -5,15 +5,38 @@
 #include "v8inject/report.h"
 
 #include <windows.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+// Uncomment to write a trace to %TEMP%\v8i_payload.log when debugging.
+#define V8I_DEBUG_LOG 1
 
 using namespace v8i;
 
 namespace {
 
 SharedIo* g_io = nullptr;
+
+#ifdef V8I_DEBUG_LOG
+void DbgLog(const char* fmt, ...) {
+    char path[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, path);
+    strcat_s(path, "v8i_payload.log");
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "a") == 0 && f) {
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        fputc('\n', f);
+        fclose(f);
+    }
+}
+#else
+inline void DbgLog(const char*, ...) {}
+#endif
 
 void PutResponse(const std::string& json) {
     if (!g_io) return;
@@ -70,14 +93,19 @@ V8I_API int V8I_CALL v8i_version() {
 }
 
 V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
+    DbgLog("v8i_probe entered, pid=%lu sharedName=%ls", GetCurrentProcessId(),
+           sharedName ? sharedName : L"(null)");
     if (!sharedName) return -1;
 
     HANDLE hMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, sharedName);
+    DbgLog("OpenFileMapping -> %p err=%lu", (void*)hMap, GetLastError());
     if (!hMap) return -2;
 
     g_io = (SharedIo*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedIo));
+    DbgLog("MapViewOfFile -> %p err=%lu", (void*)g_io, GetLastError());
     if (!g_io) { CloseHandle(hMap); return -3; }
 
+    // Tell the host we are alive before anything can throw.
     PutResponse("{\"status\":\"loaded\"}");
 
     for (;;) {

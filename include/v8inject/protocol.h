@@ -29,6 +29,7 @@ struct SharedIo {
     LONG          requestLen;
     LONG          responseLen;
     LONG          seq;              // host increments per request
+    LONG          diag;             // payload diagnostics: why it failed
     wchar_t       request[kRequestChars];
     char          response[kResponseBytes];
 };

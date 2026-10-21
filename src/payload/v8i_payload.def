@@ -1,4 +1,0 @@
-LIBRARY v8i_payload
-EXPORTS
-    v8i_probe
-    v8i_version

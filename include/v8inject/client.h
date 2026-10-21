@@ -25,6 +25,9 @@ public:
     void Close(int timeoutMs = 5000);
 
     bool IsOpen() const { return hMap_ != nullptr; }
+    LONG LastDiag() const { return lastDiag_; }
+    // Last handshake failure text, empty when Open succeeded.
+    const wchar_t* LastError() const { return lastError_; }
     const wchar_t* SharedName() const { return sharedName_; }
 
 private:
@@ -38,6 +41,8 @@ private:
     void*         remoteArgs_ = nullptr;
     HANDLE        hProc_ = nullptr;
     LONG          seq_ = 0;
+    LONG          lastDiag_ = 0;
+    wchar_t       lastError_[256] = {};
     wchar_t       sharedName_[64] = {};
 };
 

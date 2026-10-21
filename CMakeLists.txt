@@ -51,8 +51,7 @@ set_target_properties(v8i_payload PROPERTIES
     PREFIX ""
 )
 v8i_set_output(v8i_payload)
-target_link_options(v8i_payload PRIVATE
-    "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/payload/v8i_payload.def")
+# no .def file: exports are declared with __declspec(dllexport) in v8i_export.h
 
 # ---- host + cli: runs OUTSIDE the target process ----
 add_executable(v8inject
