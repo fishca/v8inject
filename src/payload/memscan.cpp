@@ -196,7 +196,8 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
         }
 
         // Copy in chunks so a page fault mid-region cannot kill the scan.
-        const size_t kChunk = 0x10000;
+        // Page-sized chunks: an unreadable page then costs 4 KB, not 64 KB.
+        const size_t kChunk = 0x1000;
         for (uintptr_t cur = regionBase; cur < regionEnd && out.size() < maxHits; cur += kChunk) {
             size_t want2 = (size_t)std::min<uintptr_t>(kChunk, regionEnd - cur);
             static std::vector<unsigned char> buf;
@@ -280,7 +281,8 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
             continue;
         }
 
-        const size_t kChunk = 0x10000;
+        // Page-sized chunks: an unreadable page then costs 4 KB, not 64 KB.
+        const size_t kChunk = 0x1000;
         for (uintptr_t cur = regionBase; cur < regionEnd && out.size() < maxHits; cur += kChunk) {
             size_t want2 = (size_t)std::min<uintptr_t>(kChunk, regionEnd - cur);
             static std::vector<unsigned char> buf;
