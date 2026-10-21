@@ -163,6 +163,7 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
             sharedName ? sharedName : L"(null)");
 
     WorkerArgs args{};
+    args = WorkerArgs();          // no CRT init paths in a remote thread
     if (sharedName) {
         wcsncpy_s(args.name, _countof(args.name), sharedName, _TRUNCATE);
     }

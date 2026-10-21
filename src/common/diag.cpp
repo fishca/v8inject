@@ -77,8 +77,20 @@ void LogLine(const char* fmt, ...) {
         }
     }
 
-    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ,
+    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        // Fallback chain: temp dir, then next to the module.
+        wchar_t tmp[MAX_PATH] = {};
+        DWORD n = GetTempPathW(MAX_PATH, tmp);
+        if (n > 0 && n < MAX_PATH) {
+            lstrcatW(tmp, L"v8inject_payload.log");
+            h = CreateFileW(tmp, FILE_APPEND_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+    }
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, nullptr, FILE_END);
         DWORD written = 0;

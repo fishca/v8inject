@@ -208,6 +208,14 @@ bool StartPayloadThread(DWORD pid,
     hThreadOut = th;
     remoteNameOut = rn;
     remoteArgsOut = ra;
+
+    // Ask the thread what happened: exit code 259 means it is still running,
+    // anything else is the value v8i_probe returned (or a crash code).
+    DWORD wait = WaitForSingleObject(th, 3000);
+    DWORD code = 0;
+    GetExitCodeThread(th, &code);
+    LogLine("thread wait=%lu exitCode=%lu (259=STILL_ACTIVE, 0=returned)",
+            wait, code);
     return true;
 }
 
