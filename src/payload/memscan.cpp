@@ -155,10 +155,7 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
                                         size_t hwndOffset, size_t maxHits,
                                         size_t* scannedBytes, size_t* regions) {
     std::vector<HwndOwner> out;
-    size_t totalScanned = 0, regionCount = 0, skippedBytes = 0, commitTotal = 0;
-    (void)skippedBytes;
-    (void)commitTotal;
-    const uintptr_t want = (uintptr_t)hwnd;
+    size_t totalScanned = 0, regionCount = 0;
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
 
@@ -167,62 +164,54 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
     uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
     const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
 
-    // Walk committed private/writable memory: 1C allocates its objects on the heap.
+    // Mirrors FindInMemory: walk regions, read big windows, and never skip past
+    // unreadable space in a way that loses committed memory.
+    const size_t kChunk = 1u << 20;
+    std::vector<unsigned char> buf(kChunk);
+
     while (addr < maxAddr && out.size() < maxHits) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
 
         const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
         const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+        if (regionEnd <= addr) break;
+        if (mbi.State == MEM_COMMIT) ++regionCount;
 
-        if (mbi.State == MEM_COMMIT) { ++regionCount; commitTotal += mbi.RegionSize; }
-        // ReadProcessMemory works on any committed page that is not guarded,
-        // so the protection mask must not narrow the scan to PAGE_READWRITE:
-        // 1C keeps parts of its heap in PAGE_EXECUTE_READWRITE and mapped
-        // sections.
-        const DWORD prot = mbi.Protect & ~(PAGE_NOCACHE | PAGE_WRITECOMBINE);
-        const bool usable = mbi.State == MEM_COMMIT &&
-                            !(mbi.Protect & PAGE_GUARD) &&
-                            !(mbi.Protect & PAGE_NOACCESS) &&
-                            (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
-                             prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
-                             prot == PAGE_EXECUTE_READWRITE ||
-                             prot == PAGE_EXECUTE_WRITECOPY);
-
-        if (!usable || regionEnd <= addr) {
-            if (mbi.State == MEM_COMMIT) skippedBytes += mbi.RegionSize;
-            addr = regionEnd > addr ? regionEnd : addr + 0x1000;
+        bool usable = mbi.State == MEM_COMMIT;
+        if (usable) {
+            const DWORD prot = mbi.Protect & 0xFF;
+            usable = prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                     prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                     prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+            if (mbi.Protect & PAGE_GUARD) usable = false;
+        }
+        if (!usable) {
+            addr = regionEnd;
             continue;
         }
 
-        // Copy in chunks so a page fault mid-region cannot kill the scan.
-        // Page-sized chunks: an unreadable page then costs 4 KB, not 64 KB.
-        const size_t kChunk = 0x1000;
-        for (uintptr_t cur = regionBase; cur < regionEnd && out.size() < maxHits; cur += kChunk) {
-            size_t want2 = (size_t)std::min<uintptr_t>(kChunk, regionEnd - cur);
-            static std::vector<unsigned char> buf;
-            buf.resize(want2);
+        uintptr_t cur = std::max(addr, regionBase);
+        const uintptr_t stop = std::min(regionEnd, maxAddr);
+        while (cur < stop && out.size() < maxHits) {
+            const size_t want = (size_t)std::min<uintptr_t>(kChunk, stop - cur);
             SIZE_T got = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want2, &got) ||
-                got < 4) {
-                // Skip only this chunk: one unreadable page must not abandon the
-                // whole region, which is what hid the heap from the scan.
+            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want, &got) ||
+                got < 8) {
+                cur += kChunk;
                 continue;
             }
-
             totalScanned += got;
-            const size_t limit = got >= 4 ? got - 4 : 0;
-            for (size_t off = 0; off <= limit; off += 4) {
-                const uintptr_t val = *(const uint32_t*)(buf.data() + off);
-                if (val <= lo || val >= hi) continue;      // must point inside the module
 
-                // `val` is a candidate object address; the field at +hwndOffset
-                // must hold the handle we are looking for.
+            for (size_t off = 0; off + 4 <= got; off += 4) {
+                const uintptr_t val = *(const uint32_t*)(buf.data() + off);
+                if (val <= lo || val >= hi) continue;
+
                 const uintptr_t objField = val + hwndOffset;
                 uint32_t cand = 0;
                 if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)objField, &cand, 4, nullptr))
                     continue;
-                if (cand != (uint32_t)want) continue;
+                if (cand != (uint32_t)(uintptr_t)hwnd) continue;
 
                 HwndOwner o;
                 o.address = val;
@@ -233,6 +222,8 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
                 }
                 out.push_back(o);
             }
+            if (got < want) break;
+            cur += kChunk;
         }
         addr = regionEnd;
     }
@@ -245,7 +236,7 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                                        size_t maxHits, size_t* scannedBytes,
                                        size_t* regions, size_t* committedBytes) {
     std::vector<HeapObject> out;
-    size_t totalScanned = 0, regionCount = 0, skippedBytes = 0, commitTotal = 0;
+    size_t totalScanned = 0, regionCount = 0, commitTotal = 0;
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
 
@@ -254,42 +245,44 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
     uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
     const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
 
+    const size_t kChunk = 1u << 20;
+    std::vector<unsigned char> buf(kChunk);
+
     while (addr < maxAddr && out.size() < maxHits) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
 
         const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
         const uintptr_t regionEnd = regionBase + mbi.RegionSize;
-        if (mbi.State == MEM_COMMIT) ++regionCount;
+        if (regionEnd <= addr) break;
+        if (mbi.State == MEM_COMMIT) {
+            ++regionCount;
+            commitTotal += mbi.RegionSize;
+        }
 
-        // ReadProcessMemory works on any committed page that is not guarded,
-        // so the protection mask must not narrow the scan to PAGE_READWRITE:
-        // 1C keeps parts of its heap in PAGE_EXECUTE_READWRITE and mapped
-        // sections.
-        const DWORD prot = mbi.Protect & ~(PAGE_NOCACHE | PAGE_WRITECOMBINE);
-        const bool usable = mbi.State == MEM_COMMIT &&
-                            !(mbi.Protect & PAGE_GUARD) &&
-                            !(mbi.Protect & PAGE_NOACCESS) &&
-                            (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
-                             prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
-                             prot == PAGE_EXECUTE_READWRITE ||
-                             prot == PAGE_EXECUTE_WRITECOPY);
-
-        if (!usable || regionEnd <= addr) {
-            if (mbi.State == MEM_COMMIT) { /* skipped */ }
-            addr = regionEnd > addr ? regionEnd : addr + 0x1000;
+        bool usable = mbi.State == MEM_COMMIT;
+        if (usable) {
+            const DWORD prot = mbi.Protect & 0xFF;
+            usable = prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                     prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                     prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+            if (mbi.Protect & PAGE_GUARD) usable = false;
+        }
+        if (!usable) {
+            addr = regionEnd;
             continue;
         }
 
-        // Page-sized chunks: an unreadable page then costs 4 KB, not 64 KB.
-        const size_t kChunk = 0x1000;
-        for (uintptr_t cur = regionBase; cur < regionEnd && out.size() < maxHits; cur += kChunk) {
-            size_t want2 = (size_t)std::min<uintptr_t>(kChunk, regionEnd - cur);
-            static std::vector<unsigned char> buf;
-            buf.resize(want2);
+        uintptr_t cur = std::max(addr, regionBase);
+        const uintptr_t stop = std::min(regionEnd, maxAddr);
+        while (cur < stop && out.size() < maxHits) {
+            const size_t want = (size_t)std::min<uintptr_t>(kChunk, stop - cur);
             SIZE_T got = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want2, &got) ||
-                got < 4) continue;
+            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want, &got) ||
+                got < 16) {
+                cur += kChunk;
+                continue;
+            }
             totalScanned += got;
 
             for (size_t off = 0; off + 4 <= got; off += 4) {
@@ -297,18 +290,12 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                 if (vt <= lo || vt >= hi) continue;
 
                 // A real vtable holds pointers into the same module; demand at
-                // least three of the first four entries, otherwise the "vtable"
-                // is just text or numeric data that happens to look like a code
-                // address.
+                // least three of the first four entries.
                 uint32_t slots[4] = {};
                 if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)vt, slots, sizeof(slots),
-                                       nullptr)) {
-                    continue;
-                }
+                                       nullptr)) continue;
                 int inside = 0;
-                for (uint32_t v : slots) {
-                    if ((uintptr_t)v > lo && (uintptr_t)v < hi) ++inside;
-                }
+                for (uint32_t v : slots) if ((uintptr_t)v > lo && (uintptr_t)v < hi) ++inside;
                 if (inside < 3) continue;
 
                 HeapObject o;
@@ -317,12 +304,14 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                 o.vtableRva = (uint32_t)(vt - lo);
                 out.push_back(o);
             }
+            if (got < want) break;
+            cur += kChunk;
         }
         addr = regionEnd;
     }
     if (scannedBytes) *scannedBytes = totalScanned;
-    if (regions) *regions = regionCount + (skippedBytes ? 0 : 0);
-    (void)skippedBytes;
+    if (regions) *regions = regionCount;
+    if (committedBytes) *committedBytes = commitTotal;
     return out;
 }
 
