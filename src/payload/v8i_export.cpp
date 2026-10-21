@@ -60,28 +60,20 @@ std::string EscapeW(const std::wstring& w) {
 }
 
 std::string ObjectsToJson() {
-    std::vector<ObjectCandidate> cands = ProbeWindowObjects();
+    std::vector<WindowEntry> wins = EnumProcessWindows();
     std::string j = "{\"status\":\"ok\",\"windows\":[";
     bool first = true;
-    for (const ObjectCandidate& c : cands) {
+    for (const WindowEntry& w : wins) {
         if (!first) j += ",";
         first = false;
-        char num[64];
-        j += "{\"hwnd\":\"0x";
-        _snprintf_s(num, sizeof(num), _TRUNCATE, "%llX", (unsigned long long)(uintptr_t)c.hwnd);
-        j += num;
-        j += "\",\"class\":\"" + EscapeW(c.cls) + "\"";
-        j += ",\"title\":\"" + EscapeW(c.title) + "\"";
-        j += ",\"userdata\":\"0x";
-        _snprintf_s(num, sizeof(num), _TRUNCATE, "%llX", (unsigned long long)c.userData);
-        j += num;
-        j += "\"";
-        j += std::string(",\"readable\":") + (c.readable ? "true" : "false");
-        j += std::string(",\"iunknown\":") + (c.isUnknown ? "true" : "false");
-        j += std::string(",\"idispatch\":") + (c.isDispatch ? "true" : "false");
-        j += std::string(",\"typeinfo\":") + (c.hasTypeInfo ? "true" : "false");
-        if (!c.typeName.empty()) j += ",\"typename\":\"" + EscapeW(c.typeName) + "\"";
-        if (!c.error.empty())    j += ",\"error\":\"" + EscapeW(c.error) + "\"";
+        char num[32];
+        _snprintf_s(num, sizeof(num), _TRUNCATE, "%llX", (unsigned long long)(uintptr_t)w.hwnd);
+        j += "{\"hwnd\":\"0x"; j += num; j += "\"";
+        j += ",\"class\":\"" + EscapeW(w.cls) + "\"";
+        j += ",\"title\":\"" + EscapeW(w.title) + "\"";
+        _snprintf_s(num, sizeof(num), _TRUNCATE, "%llX", (unsigned long long)w.userData);
+        j += ",\"userdata\":\"0x"; j += num; j += "\"";
+        j += std::string(",\"readable\":") + (w.readable ? "true" : "false");
         j += "}";
     }
     j += "]}";
