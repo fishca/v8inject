@@ -288,6 +288,7 @@ struct ReArgs {
     uintptr_t    from = 0;
     uintptr_t    to = 0;
     size_t       count = 64;
+    std::vector<std::wstring> positional;   // module name, then a filter
     bool         haveAddr = false;
     bool         haveFrom = false;
     bool         haveTo = false;
@@ -322,7 +323,7 @@ ReArgs ParseReArgs(const std::wstring& args) {
         else if (tok == L"--to")     { a.to = ParseHexToken(NextToken(rest)); a.haveTo = true; }
         else if (tok == L"--count")  a.count = (size_t)_wtoi(NextToken(rest).c_str());
         else if (tok == L"--pattern") a.pattern = NextToken(rest);
-        else if (a.pattern.empty() && tok[0] != L'-') a.pattern = tok;
+        else if (tok[0] != L'-')     a.positional.push_back(tok);
     }
     if (a.count == 0) a.count = 64;
     return a;
@@ -356,6 +357,11 @@ const PeSection* CodeSection(const PeImage& img) {
 
 std::string DisasmToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
+    // disasm [<hex-addr>] [--module m] — a positional hex number is the address.
+    for (const std::wstring& p : a.positional) {
+        if (p.find(L'.') != std::wstring::npos) { if (a.module.empty()) a.module = p; }
+        else if (!a.haveAddr) { a.addr = ParseHexToken(p); a.haveAddr = true; }
+    }
     ModuleRange m;
     PeImage img;
     if (!ResolveModule(a.module, m, img)) {
@@ -403,6 +409,11 @@ std::string DisasmToJson(const std::wstring& args) {
 
 std::string ImportsToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
+    // imports <module> [filter] — the module is positional, not a filter.
+    if (a.module.empty() && !a.positional.empty()) {
+        a.module = a.positional[0];
+        if (a.positional.size() > 1 && a.pattern.empty()) a.pattern = a.positional[1];
+    }
     ModuleRange m;
     PeImage img;
     if (!ResolveModule(a.module, m, img)) {
@@ -424,7 +435,9 @@ std::string ImportsToJson(const std::wstring& args) {
             ++matched;
     }
 
-    std::string j = "{\"status\":\"ok\",\"total\":" ;
+    const wchar_t* modLeaf = wcsrchr(m.path.c_str(), L'\\');
+    std::string j = "{\"status\":\"ok\",\"module\":\"" +
+                    EscapeW(modLeaf ? modLeaf + 1 : m.path) + "\",\"total\":" ;
     char buf[512];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"matched\":%zu,\"imports\":[",
                 img.imports.size(), matched);
@@ -461,6 +474,8 @@ std::string ImportsToJson(const std::wstring& args) {
 // Resolves the target through the IAT when it looks like an import slot.
 std::string XrefToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
+    // xref <import-name> [--module m] — first positional is the import to follow.
+    if (a.pattern.empty() && !a.positional.empty()) a.pattern = a.positional[0];
     ModuleRange m;
     PeImage img;
     if (!ResolveModule(a.module, m, img)) {
