@@ -573,7 +573,13 @@ std::string XrefToJson(const std::wstring& args) {
 // Shows the instructions around an address, with a marker on the exact one.
 std::string AroundToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
-    if (!a.haveAddr) return "{\"status\":\"error\",\"message\":\"--addr required\"}";
+    // around <hex-addr> [--count n] — the address is positional, as in xref.
+    for (const std::wstring& p : a.positional) {
+        if (p.find(L'.') != std::wstring::npos) continue;   // a module name
+        uintptr_t v = ParseHexToken(p);
+        if (v) { a.addr = v; a.haveAddr = true; break; }
+    }
+    if (!a.haveAddr) return "{\"status\":\"error\",\"message\":\"address required\"}";
 
     // Walk back a little so the caller sees the setup before the call.
     uintptr_t start = a.addr >= 48 ? a.addr - 48 : a.addr;
