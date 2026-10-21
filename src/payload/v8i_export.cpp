@@ -129,13 +129,16 @@ std::string PeToJson(const std::wstring& args) {
     name = name.substr(start);
 
     ModuleRange m;
-    if (!name.empty() && !FindModule(name.c_str(), m)) {
-        // Fall back to the main executable when the name does not resolve.
+    if (name.empty()) {
+        // Default to the executable itself; in 1C that is 1cv8.exe regardless of
+        // how the file was renamed on disk.
+        HMODULE mainBase = GetModuleHandleW(nullptr);
+        m.base = (uintptr_t)mainBase;
         for (const ModuleRange& cand : EnumModules()) {
-            const wchar_t* f = wcsrchr(cand.path.c_str(), L'\\\\');
-            f = f ? f + 1 : cand.path.c_str();
-            if (_wcsicmp(f, L"1cv8.exe") == 0 || _wcsicmp(f, L"1cv8с.exe") == 0) { m = cand; break; }
+            if (cand.base == m.base) { m = cand; break; }
         }
+    } else {
+        FindModule(name.c_str(), m);
     }
     if (!m.base) return "{\"status\":\"error\",\"message\":\"module not found\"}";
 
@@ -179,6 +182,20 @@ std::string PeToJson(const std::wstring& args) {
                     e.forwarded ? ",\"forwarded\":true,\"to\":\"" : "",
                     e.forwarded ? e.forwarder.c_str() : "",
                     e.forwarded ? "\"" : "");
+        j += buf;
+    }
+    j += "]";
+
+    j += ",\"modules\":[";
+    bool firstM = true;
+    for (const ModuleRange& mr : EnumModules()) {
+        const wchar_t* f = wcsrchr(mr.path.c_str(), L'\\');
+        if (!firstM) j += ",";
+        firstM = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"name\":\"%ls\",\"base\":\"0x%llX\",\"size\":%zu}",
+                    f ? f + 1 : mr.path.c_str(),
+                    (unsigned long long)mr.base, mr.size);
         j += buf;
     }
     j += "]}";
