@@ -650,9 +650,10 @@ std::string HeapObjectsToJson(const std::wstring& args) {
     if (!ResolveModule(a.module, m, img))
         return "{\"status\":\"error\",\"message\":\"module not found\"}";
 
-    size_t scanned = 0, regions = 0;
+    size_t scanned = 0, regions = 0, committed = 0;
     size_t cap = a.count ? a.count : 20000;
-    std::vector<HeapObject> objs = FindHeapObjects(m.base, m.size, cap, &scanned, &regions);
+    std::vector<HeapObject> objs = FindHeapObjects(m.base, m.size, cap, &scanned, &regions,
+                                                   &committed);
 
     // Group by vtable RVA.
     std::vector<std::pair<uint32_t, size_t>> groups;
@@ -674,8 +675,9 @@ std::string HeapObjectsToJson(const std::wstring& args) {
     j += img.MachineName();
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "\",\"moduleBase\":\"0x%llX\",\"objects\":%zu,\"classes\":%zu,"
-                "\"scannedBytes\":%zu,\"regions\":%zu,\"vtables\":[",
-                (unsigned long long)m.base, objs.size(), groups.size(), scanned, regions);
+                "\"scannedBytes\":%zu,\"committedBytes\":%zu,\"regions\":%zu,\"vtables\":[",
+                (unsigned long long)m.base, objs.size(), groups.size(), scanned, committed,
+                regions);
     j += buf;
 
     size_t shown = 0;

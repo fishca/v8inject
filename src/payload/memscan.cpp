@@ -174,12 +174,19 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
         const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
         const uintptr_t regionEnd = regionBase + mbi.RegionSize;
 
-        if (mbi.State == MEM_COMMIT) ++regionCount;
+        if (mbi.State == MEM_COMMIT) { ++regionCount; commitTotal += mbi.RegionSize; }
+        // ReadProcessMemory works on any committed page that is not guarded,
+        // so the protection mask must not narrow the scan to PAGE_READWRITE:
+        // 1C keeps parts of its heap in PAGE_EXECUTE_READWRITE and mapped
+        // sections.
+        const DWORD prot = mbi.Protect & ~(PAGE_NOCACHE | PAGE_WRITECOMBINE);
         const bool usable = mbi.State == MEM_COMMIT &&
                             !(mbi.Protect & PAGE_GUARD) &&
                             !(mbi.Protect & PAGE_NOACCESS) &&
-                            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
-                                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+                            (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                             prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                             prot == PAGE_EXECUTE_READWRITE ||
+                             prot == PAGE_EXECUTE_WRITECOPY);
 
         if (!usable || regionEnd <= addr) {
             if (mbi.State == MEM_COMMIT) skippedBytes += mbi.RegionSize;
@@ -234,9 +241,9 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
 
 std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                                        size_t maxHits, size_t* scannedBytes,
-                                       size_t* regions) {
+                                       size_t* regions, size_t* committedBytes) {
     std::vector<HeapObject> out;
-    size_t totalScanned = 0, regionCount = 0, skippedBytes = 0;
+    size_t totalScanned = 0, regionCount = 0, skippedBytes = 0, commitTotal = 0;
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
 
@@ -253,11 +260,18 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
         const uintptr_t regionEnd = regionBase + mbi.RegionSize;
         if (mbi.State == MEM_COMMIT) ++regionCount;
 
+        // ReadProcessMemory works on any committed page that is not guarded,
+        // so the protection mask must not narrow the scan to PAGE_READWRITE:
+        // 1C keeps parts of its heap in PAGE_EXECUTE_READWRITE and mapped
+        // sections.
+        const DWORD prot = mbi.Protect & ~(PAGE_NOCACHE | PAGE_WRITECOMBINE);
         const bool usable = mbi.State == MEM_COMMIT &&
                             !(mbi.Protect & PAGE_GUARD) &&
                             !(mbi.Protect & PAGE_NOACCESS) &&
-                            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
-                                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+                            (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                             prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                             prot == PAGE_EXECUTE_READWRITE ||
+                             prot == PAGE_EXECUTE_WRITECOPY);
 
         if (!usable || regionEnd <= addr) {
             if (mbi.State == MEM_COMMIT) { /* skipped */ }

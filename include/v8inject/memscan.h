@@ -58,6 +58,7 @@ struct HeapObject {
 
 std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                                        size_t maxHits, size_t* scannedBytes = nullptr,
-                                       size_t* regions = nullptr);
+                                       size_t* regions = nullptr,
+                                       size_t* committedBytes = nullptr);
 
 }  // namespace v8i
