@@ -65,9 +65,20 @@ add_executable(v8inject
     src/cli/main.cpp
     src/host/injector.cpp
     src/host/client.cpp
+    src/host/procs.cpp
 )
 target_link_libraries(v8inject PRIVATE v8i_common psapi)
 v8i_set_output(v8inject)
+
+# ---- gui: same host logic, windowed front end ----
+add_executable(v8inject-gui WIN32
+    src/gui/main.cpp
+    src/host/injector.cpp
+    src/host/client.cpp
+    src/host/procs.cpp
+)
+target_link_libraries(v8inject-gui PRIVATE v8i_common psapi comctl32 comdlg32)
+v8i_set_output(v8inject-gui)
 
 # ---- smoke test ----
 enable_testing()
