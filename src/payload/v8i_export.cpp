@@ -591,12 +591,16 @@ bool RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
 // stack buffer before the call; the result is written into an out-parameter.
 typedef std::string (*CommandFn)(const std::wstring&);
 
-static int GuardCall(CommandFn fn, wchar_t* text, std::string* out, unsigned* code) {
+// SEH cannot protect a frame that needs C++ unwinding (MSVC C2712), so the
+// guarded function receives no C++ objects at all: it calls a POD-shaped
+// thunk that writes into a raw buffer and reports a status code.
+typedef int (*PackedFn)(const wchar_t* text, char* out, size_t outCap, size_t* outLen);
+
+static int GuardCall(PackedFn fn, const wchar_t* text, char* out, size_t outCap,
+                     size_t* outLen, unsigned* code) {
     int ok = 0;
     __try {
-        std::wstring args(text);       // constructed inside the guarded frame
-        *out = fn(args);
-        ok = 1;
+        ok = fn(text, out, outCap, outLen);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *code = GetExceptionCode();
         ok = 0;
@@ -606,14 +610,39 @@ static int GuardCall(CommandFn fn, wchar_t* text, std::string* out, unsigned* co
 
 // Runs one command under SEH. A crash becomes a JSON error reply instead of
 // taking the host process down with it.
+namespace {
+
+// Carries the real command function through a POD-only interface.
+struct ThunkCtx {
+    CommandFn fn;
+};
+ThunkCtx g_thunk{};
+
+int PackedThunk(const wchar_t* text, char* out, size_t outCap, size_t* outLen) {
+    if (!g_thunk.fn) return 0;
+    std::string tmp = g_thunk.fn(std::wstring(text ? text : L""));
+    size_t n = tmp.size();
+    if (n > outCap - 1) n = outCap - 1;
+    memcpy(out, tmp.data(), n);
+    out[n] = 0;
+    *outLen = n;
+    return 1;
+}
+
+}  // namespace
+
 static std::string Guarded(const wchar_t* what, CommandFn fn, const std::wstring& args) {
-    // Cap the length so the copy into the guarded frame cannot overflow.
     wchar_t safe[1024] = {};
     wcsncpy_s(safe, _countof(safe), args.c_str(), _TRUNCATE);
 
-    std::string out;
+    static std::vector<char> buffer(512 * 1024);
+    buffer.resize(512 * 1024);
+
+    g_thunk.fn = fn;
+    size_t len = 0;
     unsigned code = 0;
-    if (GuardCall(fn, safe, &out, &code)) return out;
+    if (GuardCall(PackedThunk, safe, buffer.data(), buffer.size(), &len, &code))
+        return std::string(buffer.data(), len);
 
     char buf[320];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
@@ -629,11 +658,6 @@ static std::string Guarded(const wchar_t* what, CommandFn fn, const std::wstring
 V8I_API int V8I_CALL v8i_version() {
     return 1;
 }
-
-// Every command runs behind a guard: a bad pointer in a foreign image must
-// produce an error reply, never take the host process down.
-static std::string Guarded(const wchar_t* what, std::string (*fn)(const std::wstring&),
-                           const std::wstring& args);
 
 static int RunPayload(const wchar_t* sharedName) {
     if (!sharedName) return -1;
