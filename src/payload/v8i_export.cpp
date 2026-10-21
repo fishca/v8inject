@@ -142,8 +142,6 @@ V8I_API int V8I_CALL v8i_version() {
     return 1;
 }
 
-std::string ObjectsToJson();
-
 static int RunPayload(const wchar_t* sharedName) {
     if (!sharedName) return -1;
 
