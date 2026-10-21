@@ -44,6 +44,18 @@ size_t DecodeOne(uintptr_t address, Insn* out, bool is64);
 std::vector<Xref> FindXrefs(uintptr_t start, uintptr_t end, uintptr_t target,
                             bool is64, size_t maxHits);
 
+// Diagnostic variant: also reports how far the sweep actually got and how many
+// bytes failed to decode, so an empty result can be told apart from a broken scan.
+struct XrefResult {
+    std::vector<Xref> hits;
+    uintptr_t scannedTo = 0;
+    size_t    bytesSeen = 0;
+    size_t    badBytes = 0;
+    bool      hitLimit = false;
+};
+XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
+                            bool is64, size_t maxHits);
+
 // Scans for MSVC function prologues (push ebp / mov ebp,esp and the x64
 // equivalents) and returns the candidate function starts.
 std::vector<uintptr_t> FindFunctionPrologues(uintptr_t start, uintptr_t end,

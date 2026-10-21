@@ -531,7 +531,8 @@ std::string XrefToJson(const std::wstring& args) {
     }
     if (!to) to = SectionEnd(img, CodeSection(img));
 
-    std::vector<Xref> hits = FindXrefs(from, to, target, sizeof(void*) == 8, a.count);
+    XrefResult xr = FindXrefsVerbose(from, to, target, sizeof(void*) == 8, a.count);
+    const std::vector<Xref>& hits = xr.hits;
 
     // Report what was actually scanned: a wrong module here silently produces
     // an empty result that looks like "no references".
@@ -539,9 +540,12 @@ std::string XrefToJson(const std::wstring& args) {
     char buf[320];
     std::string j = "{\"status\":\"ok\",\"target\":\"" + targetKind + "\"";
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                ",\"module\":\"%ls\",\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu",
+                ",\"module\":\"%ls\",\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu"
+                ",\"scannedTo\":\"0x%llX\",\"bytesSeen\":%zu,\"badBytes\":%zu%s",
                 leaf ? leaf + 1 : m.path.c_str(),
-                (unsigned long long)img.base, (size_t)m.size);
+                (unsigned long long)img.base, (size_t)m.size,
+                (unsigned long long)xr.scannedTo, xr.bytesSeen, xr.badBytes,
+                xr.hitLimit ? ",\"hitLimit\":true" : "");
     j += buf;
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"targetAddr\":\"0x%llX\",\"scanned\":\"0x%llX-0x%llX\",\"hitCount\":%zu,\"xrefs\":[",

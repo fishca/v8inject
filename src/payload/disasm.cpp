@@ -111,65 +111,90 @@ std::vector<Insn> Disassemble(uintptr_t start, size_t size, size_t maxInsns,
     return out;
 }
 
-std::vector<Xref> FindXrefs(uintptr_t start, uintptr_t end, uintptr_t target,
+XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
                             bool is64, size_t maxHits) {
-    std::vector<Xref> out;
+    XrefResult r;
+    r.scannedTo = start;
     csh h = GetHandles().Get(is64);
-    if (!h) return out;
+    if (!h) return r;
+
+    // Copy each page into a local buffer once instead of per instruction: the
+    // sweep touches millions of bytes and a syscall per byte is hopeless.
+    static const size_t kChunk = 0x1000;
+    std::vector<uint8_t> buf(kChunk + 16);
+    uintptr_t chunkBase = 0;
+    size_t chunkHave = 0;
 
     uintptr_t cur = start;
-    while (cur < end && out.size() < maxHits) {
-        if (!IsReadable((const void*)cur, 1)) {
-            // Skip to the next committed page instead of giving up.
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi))) break;
-            cur = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-            continue;
+    while (cur < end) {
+        if (r.hits.size() >= maxHits) { r.hitLimit = true; break; }
+
+        if (cur < chunkBase || cur >= chunkBase + chunkHave) {
+            chunkBase = cur;
+            chunkHave = 0;
+            size_t want = (size_t)std::min<uintptr_t>(kChunk, end - cur);
+            if (!IsReadable((const void*)cur, want)) {
+                // Find the next readable region rather than dying here.
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (!VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi))) break;
+                uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+                if (next <= cur) break;
+                cur = next;
+                continue;
+            }
+            memcpy(buf.data(), (const void*)cur, want);
+            chunkHave = want;
         }
 
-        uint8_t scratch[16] = {};
-        size_t want = (size_t)std::min<uintptr_t>(sizeof(scratch), end - cur);
-        memcpy(scratch, (const void*)cur, want);
+        size_t off = (size_t)(cur - chunkBase);
+        size_t avail = std::min<size_t>(chunkHave - off, 15);
+        if (avail == 0) { cur += 1; continue; }
 
         cs_insn* insn = nullptr;
-        size_t n = cs_disasm(h, scratch, want, (uint64_t)cur, 1, &insn);
+        size_t n = cs_disasm(h, buf.data() + off, avail, (uint64_t)cur, 1, &insn);
         if (n == 0 || !insn) {
-            cur += 1;           // data in a code section: resync byte by byte
+            ++cur;
+            ++r.badBytes;
             continue;
         }
 
         bool hit = false;
         std::string how;
-        for (int k = 0; k < insn[0].detail->x86.op_count; ++k) {
-            const cs_x86_op& op = insn[0].detail->x86.operands[k];
+        const cs_x86& x = insn[0].detail->x86;
+        for (int k = 0; k < x.op_count; ++k) {
+            const cs_x86_op& op = x.operands[k];
             if (op.type == X86_OP_IMM && (uintptr_t)op.imm == target) {
                 hit = true;
                 how = insn[0].mnemonic;
             } else if (op.type == X86_OP_MEM && op.mem.base == X86_REG_INVALID &&
-                       op.mem.index == X86_REG_INVALID) {
-                // Absolute memory operand: call [0x401234] / mov eax,[0x401234]
-                uintptr_t abs = (uintptr_t)op.mem.disp;
-                if (abs == target) {
-                    hit = true;
-                    how = std::string(insn[0].mnemonic) + " [mem]";
-                }
+                       op.mem.index == X86_REG_INVALID &&
+                       (uintptr_t)op.mem.disp == target) {
+                hit = true;
+                how = std::string(insn[0].mnemonic) + " [mem]";
             }
         }
 
-        size_t sz = insn[0].size;
+        size_t sz = insn[0].size ? insn[0].size : 1;
         cs_free(insn, n);
-        if (sz == 0) { cur += 1; continue; }
 
         if (hit) {
-            Xref x;
-            x.from = cur;
-            x.to = target;
-            x.how = how;
-            out.push_back(std::move(x));
+            Xref xr;
+            xr.from = cur;
+            xr.to = target;
+            xr.how = how;
+            r.hits.push_back(std::move(xr));
         }
         cur += sz;
+        r.bytesSeen += sz;
+        r.scannedTo = cur;
     }
-    return out;
+    if (r.scannedTo < start) r.scannedTo = start;
+    return r;
+}
+
+std::vector<Xref> FindXrefs(uintptr_t start, uintptr_t end, uintptr_t target,
+                            bool is64, size_t maxHits) {
+    return FindXrefsVerbose(start, end, target, is64, maxHits).hits;
 }
 
 std::vector<uintptr_t> FindFunctionPrologues(uintptr_t start, uintptr_t end,
