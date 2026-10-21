@@ -586,12 +586,16 @@ bool RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
     return SUCCEEDED(hr);
 }
 
-// POD-only arguments so __try can coexist with C++ objects in the caller.
-static int GuardCall(std::string (*fn)(const std::wstring&), const std::wstring* args,
-                     std::string* out, unsigned* code) {
+// MSVC C2712: __try cannot live in a function that needs C++ unwinding, so the
+// guarded body takes only POD pointers. The command text is copied into a
+// stack buffer before the call; the result is written into an out-parameter.
+typedef std::string (*CommandFn)(const std::wstring&);
+
+static int GuardCall(CommandFn fn, wchar_t* text, std::string* out, unsigned* code) {
     int ok = 0;
     __try {
-        *out = fn(*args);
+        std::wstring args(text);       // constructed inside the guarded frame
+        *out = fn(args);
         ok = 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *code = GetExceptionCode();
@@ -600,18 +604,23 @@ static int GuardCall(std::string (*fn)(const std::wstring&), const std::wstring*
     return ok;
 }
 
-std::string Guarded(const wchar_t* what, std::string (*fn)(const std::wstring&),
-                    const std::wstring& args) {
+// Runs one command under SEH. A crash becomes a JSON error reply instead of
+// taking the host process down with it.
+static std::string Guarded(const wchar_t* what, CommandFn fn, const std::wstring& args) {
+    // Cap the length so the copy into the guarded frame cannot overflow.
+    wchar_t safe[1024] = {};
+    wcsncpy_s(safe, _countof(safe), args.c_str(), _TRUNCATE);
+
     std::string out;
     unsigned code = 0;
-    if (GuardCall(fn, &args, &out, &code)) return out;
+    if (GuardCall(fn, safe, &out, &code)) return out;
 
-    char buf[256];
+    char buf[320];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "{\"status\":\"error\",\"message\":\"command crashed\","
                 "\"command\":\"%ls\",\"exception\":\"0x%08X\"}",
-                what, code);
-    LogLine("command %ls raised 0x%08X", what, code);
+                what ? what : L"?", code);
+    LogLine("command raised 0x%08X", code);
     return buf;
 }
 
