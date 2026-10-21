@@ -1,6 +1,11 @@
 #include "v8inject/diag.h"
 
+#include <cstdlib>
 #include <cstring>
+
+#ifndef _countof
+#define _countof(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 namespace v8i {
 
