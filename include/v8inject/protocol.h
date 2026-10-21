@@ -41,6 +41,10 @@ inline void MakeSharedName(wchar_t* buf, size_t cch, uint32_t pid) {
     _snwprintf_s(buf, cch, _TRUNCATE, L"Local\\v8inject.%u", pid);
 }
 
+// Window/object discovery is done through a dedicated request kind: the payload
+// enumerates top-level windows of its own process, walks GWLP_USERDATA on the
+// classical 1C frame class, and probes each candidate as IUnknown/IDispatch.
+
 // Payload entry point. Returns 0 on clean shutdown.
 using FnProbe = int (__stdcall*)(const wchar_t* sharedName);
 

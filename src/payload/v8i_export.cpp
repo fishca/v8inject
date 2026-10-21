@@ -1,5 +1,6 @@
 #include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
+#include "v8inject/objects.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/protocol.h"
 #include "v8inject/typeinfo_utils.h"
@@ -34,6 +35,57 @@ void InitPayloadLog(const wchar_t* dirFromBlock) {
         if (slash) *slash = 0;
         SetLogDirectory(self);
     }
+}
+
+// JSON-escape into UTF-8; window titles are often Cyrillic.
+std::string EscapeW(const std::wstring& w) {
+    std::string out;
+    out.reserve(w.size());
+    for (wchar_t ch : w) {
+        unsigned c = (unsigned)ch;
+        switch (ch) {
+        case L'"':  out += "\\\""; break;
+        case L'\\': out += "\\\\"; break;
+        case L'\n': out += "\\n"; break;
+        case L'\r': out += "\\r"; break;
+        case L'\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) { char b[8]; _snprintf_s(b, sizeof(b), _TRUNCATE, "\\u%04x", c); out += b; }
+            else if (c < 0x80) out += (char)c;
+            else if (c < 0x800) { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
+            else { out += (char)(0xE0 | (c >> 12)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
+        }
+    }
+    return out;
+}
+
+std::string ObjectsToJson() {
+    std::vector<ObjectCandidate> cands = ProbeWindowObjects();
+    std::string j = "{\"status\":\"ok\",\"windows\":[";
+    bool first = true;
+    for (const ObjectCandidate& c : cands) {
+        if (!first) j += ",";
+        first = false;
+        char num[64];
+        j += "{\"hwnd\":\"0x";
+        _snprintf_s(num, sizeof(num), _TRUNCATE, "%llX", (unsigned long long)(uintptr_t)c.hwnd);
+        j += num;
+        j += "\",\"class\":\"" + EscapeW(c.cls) + "\"";
+        j += ",\"title\":\"" + EscapeW(c.title) + "\"";
+        j += ",\"userdata\":\"0x";
+        _snprintf_s(num, sizeof(num), _TRUNCATE, "%llX", (unsigned long long)c.userData);
+        j += num;
+        j += "\"";
+        j += std::string(",\"readable\":") + (c.readable ? "true" : "false");
+        j += std::string(",\"iunknown\":") + (c.isUnknown ? "true" : "false");
+        j += std::string(",\"idispatch\":") + (c.isDispatch ? "true" : "false");
+        j += std::string(",\"typeinfo\":") + (c.hasTypeInfo ? "true" : "false");
+        if (!c.typeName.empty()) j += ",\"typename\":\"" + EscapeW(c.typeName) + "\"";
+        if (!c.error.empty())    j += ",\"error\":\"" + EscapeW(c.error) + "\"";
+        j += "}";
+    }
+    j += "]}";
+    return j;
 }
 
 void PutResponse(const std::string& json) {
@@ -90,6 +142,8 @@ V8I_API int V8I_CALL v8i_version() {
     return 1;
 }
 
+std::string ObjectsToJson();
+
 static int RunPayload(const wchar_t* sharedName) {
     if (!sharedName) return -1;
 
@@ -128,6 +182,12 @@ static int RunPayload(const wchar_t* sharedName) {
                         "{\"status\":\"ok\",\"api\":%d,\"pointerSize\":%d}",
                         v8i_version(), (int)sizeof(void*));
             PutResponse(buf);
+            continue;
+        }
+
+        if (wcscmp(g_io->request, L"objects") == 0) {
+            LogLine("objects: enumerating windows");
+            PutResponse(ObjectsToJson());
             continue;
         }
 

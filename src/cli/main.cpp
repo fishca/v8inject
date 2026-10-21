@@ -20,6 +20,7 @@ void PrintUsage() {
     wprintf(L"  v8inject inject  <exe> [--dll <path>]\n");
     wprintf(L"  v8inject probe   <exe> [--dll <path>] [--timeout <ms>]\n");
     wprintf(L"  v8inject scan    <exe> <iunknown-addr-hex> [--module <name>] [--dll <path>]\n");
+    wprintf(L"  v8inject objects <exe> [--dll <path>] [--timeout <ms>]\n");
     wprintf(L"  v8inject log     [--clear]\n\n");
     wprintf(L"examples:\n");
     wprintf(L"  v8inject probe 1cv8.exe\n");
@@ -77,6 +78,18 @@ Options ParseOptions(int argc, wchar_t** argv, int first) {
     return o;
 }
 
+void PrintOpenFailure(v8i::Client& client, const Options& o) {
+    wprintf(L"handshake failed\n  reason : %s\n  diag   : %ld\n"
+            L"  stage  : %d  win32: %lu\n"
+            L"  shared : %s\n  payload: %s\n",
+            client.LastError(), client.LastDiag(),
+            client.LastStage(), client.LastWin32Error(),
+            client.SharedName(), o.dll.c_str());
+    v8i::LogLine("handshake FAILED stage=%d win32=%lu diag=%ld",
+                 client.LastStage(), client.LastWin32Error(), client.LastDiag());
+    wprintf(L"log    : %ls\n", v8i::GetLogPath());
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -87,6 +100,28 @@ int wmain(int argc, wchar_t** argv) {
 
     // Everything below this point is a real session and gets logged.
     InitHostLog();
+
+    if (cmd == L"objects") {
+        if (argc < 3) { PrintUsage(); return 1; }
+        DWORD pid = v8i::FindProcessByName(argv[2]);
+        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+
+        Options o = ParseOptions(argc, argv, 3);
+        v8i::LogLine("objects: target pid=%lu", pid);
+
+        v8i::Client client;
+        if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
+            PrintOpenFailure(client, o);
+            return 4;
+        }
+
+        std::string resp;
+        bool ok = client.Call(L"objects", resp, o.timeoutMs);
+        wprintf(L"reply : %hs\n", ok ? resp.c_str() : "<no reply>");
+        wprintf(L"log   : %ls\n", v8i::GetLogPath());
+        client.Close();
+        return ok ? 0 : 5;
+    }
 
     if (cmd == L"log") {
         bool clear = false;
@@ -146,15 +181,7 @@ int wmain(int argc, wchar_t** argv) {
 
         v8i::Client client;
         if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
-            wprintf(L"handshake failed\n  reason : %s\n  diag   : %ld\n"
-                    L"  stage  : %d  win32: %lu\n"
-                    L"  shared : %s\n  payload: %s\n",
-                    client.LastError(), client.LastDiag(),
-                    client.LastStage(), client.LastWin32Error(),
-                    client.SharedName(), o.dll.c_str());
-            v8i::LogLine("probe: handshake FAILED stage=%d win32=%lu diag=%ld",
-                         client.LastStage(), client.LastWin32Error(), client.LastDiag());
-            wprintf(L"log        : %ls\n", v8i::GetLogPath());
+            PrintOpenFailure(client, o);
             return 4;
         }
         v8i::LogLine("probe: handshake ok, sending version");
