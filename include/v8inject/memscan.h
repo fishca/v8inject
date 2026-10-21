@@ -61,4 +61,14 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                                        size_t* regions = nullptr,
                                        size_t* committedBytes = nullptr);
 
+// Finds every 4-byte occurrence of `value` in writable committed memory.
+// Used to locate the field that stores an HWND inside an object: the offset is
+// then foundAddress - nearestObjectStart.
+struct DwordHit {
+    uintptr_t address = 0;
+};
+
+std::vector<DwordHit> FindDword(uint32_t value, size_t maxHits,
+                               size_t* scannedBytes = nullptr);
+
 }  // namespace v8i

@@ -717,6 +717,44 @@ std::string HeapObjectsToJson(const std::wstring& args) {
     return j;
 }
 
+
+// findvalue <hex> [--count n] [--module m] — every 4-byte occurrence of the value
+// in memory, annotated with the module/offset when it lands inside a module and
+// with the distance to the nearest object header candidate.
+std::string FindValueToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+
+    uint32_t value = 0;
+    bool have = false;
+    for (const std::wstring& p : a.positional) {
+        if (p.find(L'.') != std::wstring::npos) { if (a.module.empty()) a.module = p; }
+        else if (!have) { value = (uint32_t)ParseHexToken(p); have = true; }
+    }
+    if (!have) return "{\"status\":\"error\",\"message\":\"value required\"}";
+
+    size_t scanned = 0;
+    std::vector<DwordHit> hits = FindDword(value, a.count ? a.count : 32, &scanned);
+
+    char buf[512];
+    std::string j = "{\"status\":\"ok\",\"value\":\"0x";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "%X\",\"scannedBytes\":%zu,\"hitCount\":%zu,\"hits\":[",
+                value, scanned, hits.size());
+    j += buf;
+
+    bool first = true;
+    for (const DwordHit& hh : hits) {
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"addr\":\"0x%llX\",\"pageOff\":\"0x%llX\"}",
+                    (unsigned long long)hh.address, (unsigned long long)(hh.address & 0xFFF));
+        j += buf;
+    }
+    j += "]}";
+    return j;
+}
+
 std::string ByHwndToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
 
@@ -1008,6 +1046,14 @@ static int RunPayload(const wchar_t* sharedName) {
             PutResponse(Guarded(L"heapobjects", HeapObjectsToJson,
                                 std::wstring(g_io->request).size() > 11
                                     ? std::wstring(g_io->request).substr(11)
+                                    : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"findvalue", 9) == 0) {
+            PutResponse(Guarded(L"findvalue", FindValueToJson,
+                                std::wstring(g_io->request).size() > 10
+                                    ? std::wstring(g_io->request).substr(10)
                                     : std::wstring()));
             continue;
         }

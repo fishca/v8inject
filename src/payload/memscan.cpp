@@ -315,4 +315,65 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
     return out;
 }
 
+std::vector<DwordHit> FindDword(uint32_t value, size_t maxHits, size_t* scannedBytes) {
+    std::vector<DwordHit> hits;
+    size_t totalScanned = 0;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+    const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
+
+    const size_t kChunk = 1u << 20;
+    std::vector<unsigned char> buf(kChunk);
+
+    while (addr < maxAddr && hits.size() < maxHits) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
+
+        const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
+        const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+        if (regionEnd <= addr) break;
+
+        bool usable = mbi.State == MEM_COMMIT;
+        if (usable) {
+            const DWORD prot = mbi.Protect & 0xFF;
+            usable = prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                     prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                     prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+            if (mbi.Protect & PAGE_GUARD) usable = false;
+        }
+        if (!usable) {
+            addr = regionEnd;
+            continue;
+        }
+
+        uintptr_t cur = std::max(addr, regionBase);
+        const uintptr_t stop = std::min(regionEnd, maxAddr);
+        while (cur < stop && hits.size() < maxHits) {
+            const size_t want = (size_t)std::min<uintptr_t>(kChunk, stop - cur);
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want, &got) ||
+                got < 4) {
+                cur += kChunk;
+                continue;
+            }
+            totalScanned += got;
+
+            for (size_t off = 0; off + 4 <= got; off += 4) {
+                if (*(const uint32_t*)(buf.data() + off) != value) continue;
+                DwordHit hh;
+                hh.address = cur + off;
+                hits.push_back(hh);
+                if (hits.size() >= maxHits) break;
+            }
+            if (got < want) break;
+            cur += kChunk;
+        }
+        addr = regionEnd;
+    }
+    if (scannedBytes) *scannedBytes = totalScanned;
+    return hits;
+}
+
 }  // namespace v8i
