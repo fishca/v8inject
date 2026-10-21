@@ -139,6 +139,8 @@ int wmain(int argc, wchar_t** argv) {
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
 
         Options o = ParseOptions(argc, argv, 3);
+        v8i::LogLine("probe: target pid=%lu payload=%ls timeout=%d",
+                     pid, o.dll.c_str(), o.timeoutMs);
 
         v8i::Client client;
         if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
@@ -148,11 +150,15 @@ int wmain(int argc, wchar_t** argv) {
                     client.LastError(), client.LastDiag(),
                     client.LastStage(), client.LastWin32Error(),
                     client.SharedName(), o.dll.c_str());
+            v8i::LogLine("probe: handshake FAILED stage=%d win32=%lu diag=%ld",
+                         client.LastStage(), client.LastWin32Error(), client.LastDiag());
             wprintf(L"log        : %ls\n", v8i::GetLogPath());
             return 4;
         }
+        v8i::LogLine("probe: handshake ok, sending version");
         std::string resp;
         bool ok = client.Call(L"version", resp, o.timeoutMs);
+        v8i::LogLine("probe: version reply ok=%d", (int)ok);
         wprintf(L"session    : %s\n", client.SharedName());
         wprintf(L"reply      : %hs\n", ok ? resp.c_str() : "<no reply>");
         wprintf(L"log        : %ls\n", v8i::GetLogPath());
@@ -173,6 +179,8 @@ int wmain(int argc, wchar_t** argv) {
 
         Options o = ParseOptions(argc, argv, 4);
         if (o.module.empty()) o.module = argv[2];
+        v8i::LogLine("scan: target pid=%lu addr=%llx module=%ls",
+                     pid, (unsigned long long)addr, o.module.c_str());
 
         v8i::Client client;
         if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
@@ -182,6 +190,8 @@ int wmain(int argc, wchar_t** argv) {
                     client.LastError(), client.LastDiag(),
                     client.LastStage(), client.LastWin32Error(),
                     client.SharedName(), o.dll.c_str());
+            v8i::LogLine("scan: handshake FAILED stage=%d win32=%lu diag=%ld",
+                         client.LastStage(), client.LastWin32Error(), client.LastDiag());
             return 4;
         }
 

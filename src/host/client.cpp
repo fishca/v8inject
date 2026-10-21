@@ -64,6 +64,8 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     if (!hMap_) return false;
 
     io_ = (SharedIo*)MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedIo));
+    LogLine("Client: shared block mapped at %p (size=%llu)",
+            (void*)io_, (unsigned long long)sizeof(SharedIo));
     if (!io_) { ReleaseHandles(); return false; }
 
     io_->ready = kStateIdle;

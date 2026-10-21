@@ -48,8 +48,12 @@ void LogLine(const char* fmt, ...) {
     }
 
     EnterCriticalSection(&g_cs);
+    // Keep the file UTF-8 and unbuffered-ish: the payload may die at any
+    // moment, and the log is the only witness.
     FILE* f = nullptr;
-    if (_wfopen_s(&f, g_logPath, L"a") == 0 && f) {
+    errno_t err = _wfopen_s(&f, g_logPath, L"a, ccs=UTF-8");
+    if (err != 0 || !f) err = _wfopen_s(&f, g_logPath, L"a");
+    if (err == 0 && f) {
         SYSTEMTIME st{};
         GetLocalTime(&st);
         fprintf(f, "%02u:%02u:%02u.%03u [pid %5lu tid %5lu] ",
@@ -60,6 +64,7 @@ void LogLine(const char* fmt, ...) {
         vfprintf(f, fmt, ap);
         va_end(ap);
         fputc('\n', f);
+        fflush(f);
         fclose(f);
     }
     LeaveCriticalSection(&g_cs);
