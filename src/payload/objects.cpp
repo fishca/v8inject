@@ -23,10 +23,27 @@ BOOL CALLBACK EnumProc(HWND hwnd, LPARAM lp) {
 
     WindowEntry e;
     e.hwnd = hwnd;
-    wchar_t buf[512] = {};
-    if (GetClassNameW(hwnd, buf, _countof(buf)) > 0) e.cls = buf;
-    buf[0] = 0;
-    if (GetWindowTextW(hwnd, buf, _countof(buf)) > 0) e.title = buf;
+
+    // RealGetWindowClass works across threads and does not depend on the
+    // message queue of the owning thread.
+    wchar_t cls[256] = {};
+    if (RealGetWindowClassW(hwnd, cls, _countof(cls)) > 0) e.cls = cls;
+    else {
+        cls[0] = 0;
+        if (GetClassNameW(hwnd, cls, _countof(cls)) > 0) e.cls = cls;
+    }
+
+    // GetWindowTextW silently returns 0 for windows owned by another thread;
+    // ask explicitly with a short timeout and a zeroed buffer so a failure
+    // cannot leak stale bytes into the report.
+    wchar_t title[512] = {};
+    DWORD_PTR copied = 0;
+    if (SendMessageTimeoutW(hwnd, WM_GETTEXT, _countof(title),
+                            (LPARAM)title, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                            100, &copied) == 0 || copied == 0) {
+        title[0] = 0;
+    }
+    e.title = title;
     e.userData = (uintptr_t)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     ctx->out->push_back(e);
     return TRUE;
