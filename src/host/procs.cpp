@@ -42,6 +42,14 @@ bool IsPe64(const std::wstring& path) {
     return false;
 }
 
+// Processes in session 0 are services; injecting into them needs SYSTEM rights
+// and is never the goal, so the GUI hides them.
+bool IsSession0(DWORD pid) {
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(pid, &session)) return false;
+    return session == 0;
+}
+
 bool IsProcess64(DWORD pid) {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return false;
@@ -66,6 +74,7 @@ std::vector<ProcessEntry> ListProcesses() {
             e.name.assign(pe.szExeFile);
             e.path = QueryImagePath(e.pid);
             e.is64 = e.path.empty() ? IsProcess64(e.pid) : IsPe64(e.path);
+            e.session0 = IsSession0(e.pid);
             out.push_back(std::move(e));
         } while (Process32NextW(snap, &pe));
     }

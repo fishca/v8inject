@@ -52,6 +52,7 @@ target_link_libraries(v8i_common PUBLIC oleaut32 ole32)
 # ---- payload: loaded INTO the target process ----
 add_library(v8i_payload SHARED
     src/payload/dllmain.cpp
+    src/payload/memscan.cpp
     src/payload/objects.cpp
     src/payload/v8i_export.cpp
 )

@@ -13,6 +13,7 @@
 #include "v8inject/injector.h"
 #include "v8inject/procs.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -112,6 +113,7 @@ void FillList() {
 
     int row = 0;
     for (const auto& p : g_procs) {
+        if (p.session0) continue;          // services: not injectable targets
         if (!MatchesFilter(p, filter)) continue;
         wchar_t pidBuf[16];
         _snwprintf_s(pidBuf, _countof(pidBuf), _TRUNCATE, L"%lu", p.pid);
@@ -139,7 +141,14 @@ void FillList() {
 }
 
 void RefreshProcesses() {
+    // Sorting here keeps the list stable across refreshes; the filter box is
+    // left alone so typing is never interrupted.
     g_procs = v8i::ListProcesses();
+    std::sort(g_procs.begin(), g_procs.end(),
+              [](const v8i::ProcessEntry& a, const v8i::ProcessEntry& b) {
+                  int c = _wcsicmp(a.name.c_str(), b.name.c_str());
+                  return c != 0 ? c < 0 : a.pid < b.pid;
+              });
     FillList();
 }
 
@@ -216,6 +225,8 @@ void DoInject() {
 
     g_targetPid = pid;
     g_targetName = SelectedName();
+
+    Log(L"------------------------------");
 
     wchar_t msg[512];
     _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"[%lu] %s — подключаюсь...",

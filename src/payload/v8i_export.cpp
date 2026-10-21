@@ -1,6 +1,7 @@
 #include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
 #include "v8inject/objects.h"
+#include "v8inject/memscan.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/protocol.h"
@@ -193,6 +194,68 @@ std::string PeToJson(const std::wstring& args) {
     return j;
 }
 
+// find <pattern> [--module <dll>] [--wide] [--max N]
+std::string FindToJson(const std::wstring& args) {
+    v8i::FindOptions opt;
+    std::wstring rest = args;
+
+    auto takeToken = [](std::wstring& in) -> std::wstring {
+        while (!in.empty() && in.front() == L' ') in.erase(in.begin());
+        if (in.empty()) return std::wstring();
+        if (in.front() == L'"') {
+            size_t end = in.find(L'"', 1);
+            if (end == std::wstring::npos) { std::wstring all = in.substr(1); in.clear(); return all; }
+            std::wstring tok = in.substr(1, end - 1);
+            in.erase(0, end + 1);
+            return tok;
+        }
+        size_t sp = in.find(L' ');
+        std::wstring tok = sp == std::wstring::npos ? in : in.substr(0, sp);
+        in = sp == std::wstring::npos ? std::wstring() : in.substr(sp);
+        return tok;
+    };
+
+    std::wstring first = takeToken(rest);
+    if (first.empty()) {
+        return "{\"status\":\"error\",\"message\":\"usage: find <pattern> [--module <dll>] [--wide] [--max N]\"}";
+    }
+    opt.pattern = first;
+
+    for (;;) {
+        std::wstring tok = takeToken(rest);
+        if (tok.empty()) break;
+        if (tok == L"--module")      opt.module = takeToken(rest);
+        else if (tok == L"--wide")   opt.wide = true;
+        else if (tok == L"--max")    opt.maxHits = (size_t)_wtoi(takeToken(rest).c_str());
+        else if (tok == L"--first")  opt.stopAtFirst = true;
+    }
+    if (opt.maxHits == 0) opt.maxHits = 64;
+
+    size_t scanned = 0;
+    std::vector<MemoryHit> hits = FindInMemory(opt, &scanned);
+
+    char buf[256];
+    std::string j = "{\"status\":\"ok\",\"pattern\":\"" + EscapeW(opt.pattern) + "\"";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                ",\"wide\":%s,\"scannedBytes\":%llu,\"hitCount\":%zu,\"hits\":[",
+                opt.wide ? "true" : "false", (unsigned long long)scanned, hits.size());
+    j += buf;
+
+    size_t shown = 0;
+    for (const MemoryHit& h : hits) {
+        if (shown++) j += ",";
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "{\"address\":\"0x%llX\"",
+                    (unsigned long long)h.address);
+        j += buf;
+        if (h.inModule) j += ",\"module\":\"" + EscapeW(h.module) + "\"";
+        if (!h.bytesBefore.empty()) j += ",\"before\":\"" + h.bytesBefore + "\"";
+        if (!h.bytesAfter.empty())  j += ",\"after\":\"" + h.bytesAfter + "\"";
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
 std::string ObjectsToJson() {
     std::vector<WindowEntry> wins = EnumProcessWindows();
     std::string j = "{\"status\":\"ok\",\"windows\":[";
@@ -306,6 +369,13 @@ static int RunPayload(const wchar_t* sharedName) {
                         "{\"status\":\"ok\",\"api\":%d,\"pointerSize\":%d}",
                         v8i_version(), (int)sizeof(void*));
             PutResponse(buf);
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"find ", 5) == 0) {
+            LogLine("find: starting scan");
+            PutResponse(FindToJson(std::wstring(g_io->request + 5)));
+            LogLine("find: done");
             continue;
         }
 

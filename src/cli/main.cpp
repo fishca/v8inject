@@ -23,6 +23,7 @@ void PrintUsage() {
     wprintf(L"  v8inject objects <exe> [--dll <path>] [--timeout <ms>]\n");
     wprintf(L"  v8inject peek    <exe> <hex-addr> [len] [--dll <path>]\n");
     wprintf(L"  v8inject pe      <exe> [module] [--dll <path>]\n");
+    wprintf(L"  v8inject find    <exe> <pattern> [--module <dll>] [--wide] [--max N]\n");
     wprintf(L"  v8inject log     [--clear]\n\n");
     wprintf(L"examples:\n");
     wprintf(L"  v8inject probe 1cv8.exe\n");
@@ -136,6 +137,33 @@ int wmain(int argc, wchar_t** argv) {
         bool ok = client.Call(L"objects", resp, o.timeoutMs);
         wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         wprintf(L"log   : %ls\n", v8i::GetLogPath());
+        client.Close();
+        return ok ? 0 : 5;
+    }
+
+    if (cmd == L"find") {
+        if (argc < 4) { PrintUsage(); return 1; }
+        DWORD pid = v8i::FindProcessByName(argv[2]);
+        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+
+        Options o = ParseOptions(argc, argv, 4);
+        std::wstring request = L"find ";
+        for (int i = 3; i < argc; ++i) {
+            std::wstring a = argv[i];
+            if (a == L"--dll" || a == L"--timeout") { ++i; continue; }
+            request += a;
+            request += L" ";
+        }
+        v8i::LogLine("request: %ls", request.c_str());
+
+        v8i::Client client;
+        if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
+            PrintOpenFailure(client, o);
+            return 4;
+        }
+        std::string resp;
+        bool ok = client.Call(request, resp, 120000);
+        wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         client.Close();
         return ok ? 0 : 5;
     }

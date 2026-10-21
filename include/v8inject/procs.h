@@ -11,6 +11,7 @@ struct ProcessEntry {
     std::wstring name;        // image file name, e.g. "1cv8.exe"
     std::wstring path;        // full path when readable (may be empty)
     bool         is64 = false;
+    bool         session0 = false;   // service session: hidden in the GUI
     int          bitness() const { return is64 ? 64 : 32; }
 };
 
