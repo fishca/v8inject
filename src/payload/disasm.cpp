@@ -17,13 +17,16 @@ struct Handles {
     csh h64 = 0;
     bool ok32 = false;
     bool ok64 = false;
+    cs_err lastErr = CS_ERR_OK;
 
     csh Get(bool is64) {
         csh& h = is64 ? h64 : h32;
         bool& ok = is64 ? ok64 : ok32;
         if (h) return ok ? h : 0;
         cs_mode mode = is64 ? CS_MODE_64 : CS_MODE_32;
-        if (cs_open(CS_ARCH_X86, mode, &h) != CS_ERR_OK) {
+        cs_err e = cs_open(CS_ARCH_X86, mode, &h);
+        if (e != CS_ERR_OK) {
+            lastErr = e;
             h = 0;
             ok = false;
             return 0;
@@ -116,7 +119,13 @@ XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
     XrefResult r;
     r.scannedTo = start;
     csh h = GetHandles().Get(is64);
-    if (!h) return r;
+    if (!h) {
+        // Capstone never came up: report it instead of an empty hit list that
+        // looks like "no references found".
+        r.stopReason = "capstone init failed";
+        r.csError = (int)GetHandles().lastErr;
+        return r;
+    }
 
     // Copy each page into a local buffer once instead of per instruction: the
     // sweep touches millions of bytes and a syscall per byte is hopeless.

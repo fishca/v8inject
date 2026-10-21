@@ -53,6 +53,7 @@ struct XrefResult {
     size_t    badBytes = 0;
     bool      hitLimit = false;
     const char* stopReason = "";
+    int       csError = 0;         // cs_err when Capstone failed to initialise
 };
 XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
                             bool is64, size_t maxHits);

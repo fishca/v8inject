@@ -542,13 +542,13 @@ std::string XrefToJson(const std::wstring& args) {
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"module\":\"%ls\",\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu"
                 ",\"scannedTo\":\"0x%llX\",\"bytesSeen\":%zu,\"badBytes\":%zu%s"
-                ",\"from\":\"0x%llX\",\"to\":\"0x%llX\",\"stop\":\"%s\"",
+                ",\"from\":\"0x%llX\",\"to\":\"0x%llX\",\"stop\":\"%s\",\"csError\":%d",
                 leaf ? leaf + 1 : m.path.c_str(),
                 (unsigned long long)img.base, (size_t)m.size,
                 (unsigned long long)xr.scannedTo, xr.bytesSeen, xr.badBytes,
                 xr.hitLimit ? ",\"hitLimit\":true" : "",
                 (unsigned long long)from, (unsigned long long)to,
-                xr.stopReason ? xr.stopReason : "");
+                xr.stopReason ? xr.stopReason : "", xr.csError);
     j += buf;
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"targetAddr\":\"0x%llX\",\"scanned\":\"0x%llX-0x%llX\",\"hitCount\":%zu,\"xrefs\":[",
