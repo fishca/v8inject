@@ -9,6 +9,7 @@ set(CAPSTONE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/capstone)
 add_library(capstone STATIC
     ${CAPSTONE_DIR}/cs.c
     ${CAPSTONE_DIR}/MCInst.c
+    ${CAPSTONE_DIR}/MCInstrDesc.c
     ${CAPSTONE_DIR}/MCRegisterInfo.c
     ${CAPSTONE_DIR}/SStream.c
     ${CAPSTONE_DIR}/Mapping.c
@@ -16,6 +17,7 @@ add_library(capstone STATIC
     ${CAPSTONE_DIR}/arch/X86/X86Disassembler.c
     ${CAPSTONE_DIR}/arch/X86/X86DisassemblerDecoder.c
     ${CAPSTONE_DIR}/arch/X86/X86InstPrinterCommon.c
+    ${CAPSTONE_DIR}/arch/X86/X86ATTInstPrinter.c
     ${CAPSTONE_DIR}/arch/X86/X86IntelInstPrinter.c
     ${CAPSTONE_DIR}/arch/X86/X86Mapping.c
     ${CAPSTONE_DIR}/arch/X86/X86Module.c
