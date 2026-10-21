@@ -517,7 +517,7 @@ std::string XrefToJson(const std::wstring& args) {
     return j;
 }
 
-std::string ObjectsToJson() {
+std::string ObjectsToJson(const std::wstring& /*unused*/) {
     std::vector<WindowEntry> wins = EnumProcessWindows();
     std::string j = "{\"status\":\"ok\",\"windows\":[";
     bool first = true;
