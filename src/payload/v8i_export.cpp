@@ -602,16 +602,34 @@ std::string MemMapToJson(const std::wstring& args) {
     struct Reg { uintptr_t base; size_t size; uint32_t protect; uint32_t state; uint32_t type; };
     std::vector<Reg> big;
 
+    size_t committedRw = 0, committedAll = 0, regTotal = 0;
+    size_t rwRegions = 0;
+    uintptr_t highestCommit = 0;
+
     while (addr < maxAddr) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
         const uintptr_t rb = (uintptr_t)mbi.BaseAddress;
+        const uintptr_t re = rb + mbi.RegionSize;
+        ++regTotal;
+        if (mbi.State == MEM_COMMIT) {
+            committedAll += mbi.RegionSize;
+            const DWORD pr = mbi.Protect & ~(PAGE_NOCACHE | PAGE_WRITECOMBINE);
+            if (!(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                (pr == PAGE_READONLY || pr == PAGE_READWRITE || pr == PAGE_WRITECOPY ||
+                 pr == PAGE_EXECUTE_READ || pr == PAGE_EXECUTE_READWRITE ||
+                 pr == PAGE_EXECUTE_WRITECOPY)) {
+                committedRw += mbi.RegionSize;
+                ++rwRegions;
+            }
+            if (re > highestCommit) highestCommit = re;
+        }
         if (mbi.State == MEM_COMMIT && mbi.RegionSize >= 0x10000) {
             big.push_back({rb, (size_t)mbi.RegionSize, (uint32_t)mbi.Protect,
                            (uint32_t)mbi.State, (uint32_t)mbi.Type});
         }
-        addr = rb + mbi.RegionSize;
-        if (rb + mbi.RegionSize <= rb) break;
+        if (re <= rb) break;
+        addr = re;
     }
 
     // Largest first.
@@ -621,7 +639,11 @@ std::string MemMapToJson(const std::wstring& args) {
 
     char buf[512];
     std::string j = "{\"status\":\"ok\",\"regions\":";
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"regions\":[", big.size());
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "%zu,\"regionsTotal\":%zu,\"committedBytes\":%zu,\"readableBytes\":%zu,"
+                "\"readableRegions\":%zu,\"highestCommit\":\"0x%llX\",\"regions\":[",
+                big.size(), regTotal, committedAll, committedRw, rwRegions,
+                (unsigned long long)highestCommit);
     j += buf;
 
     size_t shown = 0;
