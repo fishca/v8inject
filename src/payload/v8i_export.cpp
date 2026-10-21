@@ -186,18 +186,9 @@ std::string PeToJson(const std::wstring& args) {
     }
     j += "]";
 
-    j += ",\"modules\":[";
-    bool firstM = true;
-    for (const ModuleRange& mr : EnumModules()) {
-        const wchar_t* f = wcsrchr(mr.path.c_str(), L'\\');
-        if (!firstM) j += ",";
-        firstM = false;
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"name\":\"%ls\",\"base\":\"0x%llX\",\"size\":%zu}",
-                    f ? f + 1 : mr.path.c_str(),
-                    (unsigned long long)mr.base, mr.size);
-        j += buf;
-    }
+    // Only the module names: a full list with bases overflows the response
+    // buffer and hides the interesting fields.
+    j += ",\"moduleCount\":" + std::to_string(EnumModules().size());
     j += "]}";
     return j;
 }
