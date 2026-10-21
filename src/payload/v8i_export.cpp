@@ -1,6 +1,7 @@
 #include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
 #include "v8inject/objects.h"
+#include "v8inject/disasm.h"
 #include "v8inject/memscan.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
@@ -275,6 +276,229 @@ std::string FindToJson(const std::wstring& args) {
     return j;
 }
 
+// ---------------------------------------------------------------------------
+// Reverse-engineering commands: disasm / xref / imports / iat
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct ReArgs {
+    std::wstring module;
+    uintptr_t    addr = 0;
+    uintptr_t    from = 0;
+    uintptr_t    to = 0;
+    size_t       count = 64;
+    bool         haveAddr = false;
+    bool         haveFrom = false;
+    bool         haveTo = false;
+    std::wstring pattern;
+};
+
+std::wstring NextToken(std::wstring& in) {
+    while (!in.empty() && in.front() == L' ') in.erase(in.begin());
+    if (in.empty()) return std::wstring();
+    size_t sp = in.find(L' ');
+    std::wstring tok = sp == std::wstring::npos ? in : in.substr(0, sp);
+    in = sp == std::wstring::npos ? std::wstring() : in.substr(sp);
+    return tok;
+}
+
+uintptr_t ParseHexToken(const std::wstring& t) {
+    if (t.empty()) return 0;
+    std::wstring s = t;
+    if (s.size() > 2 && s[0] == L'0' && (s[1] == L'x' || s[1] == L'X')) s = s.substr(2);
+    return (uintptr_t)_wcstoui64(s.c_str(), nullptr, 16);
+}
+
+ReArgs ParseReArgs(const std::wstring& args) {
+    ReArgs a;
+    std::wstring rest = args;
+    for (;;) {
+        std::wstring tok = NextToken(rest);
+        if (tok.empty()) break;
+        if (tok == L"--module")      a.module = NextToken(rest);
+        else if (tok == L"--addr")   { a.addr = ParseHexToken(NextToken(rest)); a.haveAddr = true; }
+        else if (tok == L"--from")   { a.from = ParseHexToken(NextToken(rest)); a.haveFrom = true; }
+        else if (tok == L"--to")     { a.to = ParseHexToken(NextToken(rest)); a.haveTo = true; }
+        else if (tok == L"--count")  a.count = (size_t)_wtoi(NextToken(rest).c_str());
+        else if (tok == L"--pattern") a.pattern = NextToken(rest);
+        else if (a.pattern.empty() && tok[0] != L'-') a.pattern = tok;
+    }
+    if (a.count == 0) a.count = 64;
+    return a;
+}
+
+// Resolves the module to work on, defaulting to the process executable.
+bool ResolveModule(const std::wstring& name, ModuleRange& m, PeImage& img) {
+    if (name.empty()) {
+        HMODULE mainBase = GetModuleHandleW(nullptr);
+        m.base = (uintptr_t)mainBase;
+        for (const ModuleRange& cand : EnumModules()) {
+            if (cand.base == m.base) { m = cand; break; }
+        }
+    } else if (!FindModule(name.c_str(), m)) {
+        return false;
+    }
+    if (!m.base) return false;
+    img = ParsePe(m.base);
+    return img.valid;
+}
+
+const PeSection* CodeSection(const PeImage& img) {
+    for (const PeSection& s : img.sections)
+        if (s.name == ".text") return &s;
+    for (const PeSection& s : img.sections)
+        if (s.Executable()) return &s;
+    return nullptr;
+}
+
+}  // namespace
+
+std::string DisasmToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    ModuleRange m;
+    PeImage img;
+    if (!ResolveModule(a.module, m, img)) {
+        return "{\"status\":\"error\",\"message\":\"module not found or not a PE\"}";
+    }
+
+    uintptr_t start = a.haveAddr ? a.addr : 0;
+    if (!a.haveAddr) {
+        const PeSection* c = CodeSection(img);
+        if (!c) return "{\"status\":\"error\",\"message\":\"no executable section\"}";
+        start = img.base + c->va;
+    }
+    if (start < img.base || start > img.base + img.sizeOfImage) {
+        char b[160];
+        _snprintf_s(b, sizeof(b), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"address outside module\","
+                    "\"base\":\"0x%llX\",\"size\":%u}",
+                    (unsigned long long)img.base, img.sizeOfImage);
+        return b;
+    }
+
+    uintptr_t stopped = start;
+    std::vector<Insn> insns = Disassemble(start, a.count * 8, a.count, &stopped, sizeof(void*) == 8);
+
+    char buf[256];
+    std::string j = "{\"status\":\"ok\",\"module\":\"" + EscapeW(img.MachineName()) + "\"";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                ",\"start\":\"0x%llX\",\"count\":%zu,\"stoppedAt\":\"0x%llX\",\"insns\":[",
+                (unsigned long long)start, insns.size(), (unsigned long long)stopped);
+    j += buf;
+
+    bool first = true;
+    for (const Insn& i : insns) {
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"addr\":\"0x%llX\",\"bytes\":\"%s\",\"text\":\"%s %s\"}",
+                    (unsigned long long)i.address, i.bytes.c_str(),
+                    i.mnemonic.c_str(), i.opStr.c_str());
+        j += buf;
+    }
+    j += "]}";
+    return j;
+}
+
+std::string ImportsToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    ModuleRange m;
+    PeImage img;
+    if (!ResolveModule(a.module, m, img)) {
+        return "{\"status\":\"error\",\"message\":\"module not found or not a PE\"}";
+    }
+
+    std::wstring want = a.pattern;
+    for (auto& c : want) c = (wchar_t)towlower(c);
+
+    std::string j = "{\"status\":\"ok\",\"total\":" ;
+    char buf[512];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"imports\":[", img.imports.size());
+    j += buf;
+
+    bool first = true;
+    size_t shown = 0;
+    for (const PeImport& im : img.imports) {
+        if (!want.empty()) {
+            std::wstring hay = std::wstring(im.name.begin(), im.name.end());
+            for (auto& c : hay) c = (wchar_t)towlower(c);
+            if (_wcsicmp(im.dll.c_str(), want.c_str()) != 0 && hay.find(want) == std::wstring::npos)
+                continue;
+        }
+        if (shown++ >= a.count) break;
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"dll\":\"%s\",\"name\":\"%s\",\"ordinal\":%u,\"iat\":\"0x%llX\"}",
+                    im.dll.c_str(), im.name.c_str(), im.ordinal,
+                    (unsigned long long)(img.base + im.iatRva));
+        j += buf;
+    }
+    j += "]}";
+    return j;
+}
+
+// xref --addr <target> [--module m] [--from a --to b] [--count N]
+// Resolves the target through the IAT when it looks like an import slot.
+std::string XrefToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    ModuleRange m;
+    PeImage img;
+    if (!ResolveModule(a.module, m, img)) {
+        return "{\"status\":\"error\",\"message\":\"module not found or not a PE\"}";
+    }
+
+    uintptr_t target = a.addr;
+    std::string targetKind = "absolute";
+    if (!a.haveAddr && !a.pattern.empty()) {
+        // Allow "xref CreateWindowExW" — look the name up in the IAT.
+        std::string want(a.pattern.begin(), a.pattern.end());
+        for (const PeImport& im : img.imports) {
+            if (_stricmp(im.name.c_str(), want.c_str()) == 0) {
+                target = img.base + im.iatRva;
+                targetKind = "iat:" + im.dll + "!" + im.name;
+                break;
+            }
+        }
+        if (!a.haveAddr && targetKind == "absolute") {
+            return "{\"status\":\"error\",\"message\":\"import not found in module\"}";
+        }
+    }
+    if (!target) return "{\"status\":\"error\",\"message\":\"--addr required\"}";
+
+    uintptr_t from = a.haveFrom ? a.from : 0;
+    uintptr_t to = a.haveTo ? a.to : 0;
+    if (!from) {
+        const PeSection* c = CodeSection(img);
+        if (!c) return "{\"status\":\"error\",\"message\":\"no executable section\"}";
+        from = img.base + c->va;
+    }
+    if (!to) to = from + (CodeSection(img) ? CodeSection(img)->virtualSize : 0x100000);
+
+    std::vector<Xref> hits = FindXrefs(from, to, target, sizeof(void*) == 8, a.count);
+
+    char buf[320];
+    std::string j = "{\"status\":\"ok\",\"target\":\"" + targetKind + "\"";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                ",\"targetAddr\":\"0x%llX\",\"scanned\":\"0x%llX-0x%llX\",\"hitCount\":%zu,\"xrefs\":[",
+                (unsigned long long)target, (unsigned long long)from,
+                (unsigned long long)to, hits.size());
+    j += buf;
+
+    bool first = true;
+    for (const Xref& x : hits) {
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"from\":\"0x%llX\",\"how\":\"%s\"}",
+                    (unsigned long long)x.from, x.how.c_str());
+        j += buf;
+    }
+    j += "]}";
+    return j;
+}
+
 std::string ObjectsToJson() {
     std::vector<WindowEntry> wins = EnumProcessWindows();
     std::string j = "{\"status\":\"ok\",\"windows\":[";
@@ -388,6 +612,30 @@ static int RunPayload(const wchar_t* sharedName) {
                         "{\"status\":\"ok\",\"api\":%d,\"pointerSize\":%d}",
                         v8i_version(), (int)sizeof(void*));
             PutResponse(buf);
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"disasm", 6) == 0) {
+            LogLine("disasm: decoding");
+            PutResponse(DisasmToJson(std::wstring(g_io->request).size() > 7
+                                         ? std::wstring(g_io->request).substr(7)
+                                         : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"imports", 7) == 0) {
+            PutResponse(ImportsToJson(std::wstring(g_io->request).size() > 8
+                                          ? std::wstring(g_io->request).substr(8)
+                                          : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"xref", 4) == 0) {
+            LogLine("xref: scanning code");
+            PutResponse(XrefToJson(std::wstring(g_io->request).size() > 5
+                                       ? std::wstring(g_io->request).substr(5)
+                                       : std::wstring()));
+            LogLine("xref: done");
             continue;
         }
 

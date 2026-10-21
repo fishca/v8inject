@@ -111,6 +111,47 @@ PeImage ParsePe(uintptr_t base) {
             }
         }
     }
+    // Import directory
+    const IMAGE_DATA_DIRECTORY& imp =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (imp.VirtualAddress && imp.Size) {
+        auto* desc = (const IMAGE_IMPORT_DESCRIPTOR*)(base + imp.VirtualAddress);
+        for (int d = 0; d < 256; ++d, ++desc) {
+            if (!IsReadable(desc, sizeof(IMAGE_IMPORT_DESCRIPTOR))) break;
+            if (!desc->Name && !desc->FirstThunk) break;   // terminator
+
+            PeImage tmp;                     // ReadAsciiString only needs the base
+            tmp.base = base;
+            std::string dllName = ReadAsciiString(tmp, desc->Name, 256);
+            if (dllName.empty()) continue;
+
+            uint32_t thunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                        : desc->FirstThunk;
+            auto* thunk = (const IMAGE_THUNK_DATA*)(base + thunkRva);
+            uint32_t iatRva = desc->FirstThunk;
+
+            for (int i = 0; i < 8192; ++i) {
+                if (!IsReadable(thunk + i, sizeof(IMAGE_THUNK_DATA))) break;
+                if (thunk[i].u1.AddressOfData == 0) break;
+
+                PeImport pi;
+                pi.dll = dllName;
+                pi.iatRva = iatRva + (uint32_t)(i * sizeof(IMAGE_THUNK_DATA));
+
+                uintptr_t raw = thunk[i].u1.AddressOfData;
+                // High bit set means "imported by ordinal" (only on PE32+).
+                if (raw & 0x8000000000000000ULL) {
+                    pi.ordinal = (uint16_t)(raw & 0xFFFF);
+                } else {
+                    uint32_t nameRva = (uint32_t)raw;
+                    pi.name = ReadAsciiString(tmp, nameRva + 2, 256);   // skip Hint
+                    pi.ordinal = *(const uint16_t*)(base + nameRva);
+                }
+                img.imports.push_back(std::move(pi));
+            }
+        }
+    }
+
     return img;
 }
 

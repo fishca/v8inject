@@ -19,6 +19,13 @@ struct PeSection {
     bool Writable()   const { return (characteristics & IMAGE_SCN_MEM_WRITE) != 0; }
 };
 
+struct PeImport {
+    std::string  dll;         // module name, e.g. "USER32.dll"
+    std::string  name;        // function name (empty when imported by ordinal)
+    uint16_t     ordinal = 0;
+    uint32_t     iatRva = 0;  // RVA of the IAT slot holding the resolved address
+};
+
 struct PeExport {
     std::string name;
     uint32_t    rva = 0;
@@ -40,6 +47,7 @@ struct PeImage {
 
     std::vector<PeSection> sections;
     std::vector<PeExport>  exports;
+    std::vector<PeImport>  imports;
 
     const PeSection* SectionOf(uint32_t rva) const;
     std::string MachineName() const;

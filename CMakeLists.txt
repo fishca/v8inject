@@ -13,6 +13,8 @@ if(MSVC)
     add_link_options(/utf-8)
 endif()
 
+include(cmake/capstone.cmake)
+
 if(NOT WIN32)
     message(FATAL_ERROR "v8inject: Windows-only project")
 endif()
@@ -52,12 +54,13 @@ target_link_libraries(v8i_common PUBLIC oleaut32 ole32)
 # ---- payload: loaded INTO the target process ----
 add_library(v8i_payload SHARED
     src/payload/dllmain.cpp
+    src/payload/disasm.cpp
     src/payload/memscan.cpp
     src/payload/objects.cpp
     src/payload/v8i_export.cpp
 )
 target_compile_definitions(v8i_payload PRIVATE V8I_PAYLOAD_EXPORTS)
-target_link_libraries(v8i_payload PRIVATE v8i_common)
+target_link_libraries(v8i_payload PRIVATE v8i_common capstone)
 set_target_properties(v8i_payload PROPERTIES
     OUTPUT_NAME "v8i_payload"
     PREFIX ""
