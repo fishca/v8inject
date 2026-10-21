@@ -44,7 +44,7 @@ jobs:
         run: |
           $dir = "build/${{ matrix.arch }}/bin/${{ matrix.arch }}"
           Get-ChildItem $dir
-          foreach ($f in @('v8inject.exe', 'v8i_payload.dll')) {
+          foreach ($f in @('v8inject.exe', 'v8inject-gui.exe', 'v8i_payload.dll')) {
             if (-not (Test-Path "$dir/$f")) {
               throw "missing artifact: $dir/$f"
             }
