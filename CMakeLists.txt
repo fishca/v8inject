@@ -60,7 +60,7 @@ add_executable(v8inject
     src/host/injector.cpp
     src/host/client.cpp
 )
-target_link_libraries(v8inject PRIVATE v8i_common)
+target_link_libraries(v8inject PRIVATE v8i_common psapi)
 v8i_set_output(v8inject)
 
 # ---- smoke test ----

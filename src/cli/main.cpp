@@ -19,7 +19,8 @@ void PrintUsage() {
     wprintf(L"  v8inject modules <exe>\n");
     wprintf(L"  v8inject inject  <exe> [--dll <path>]\n");
     wprintf(L"  v8inject probe   <exe> [--dll <path>] [--timeout <ms>]\n");
-    wprintf(L"  v8inject scan    <exe> <iunknown-addr-hex> [--module <name>] [--dll <path>]\n\n");
+    wprintf(L"  v8inject scan    <exe> <iunknown-addr-hex> [--module <name>] [--dll <path>]\n");
+    wprintf(L"  v8inject log     [--clear]\n\n");
     wprintf(L"examples:\n");
     wprintf(L"  v8inject probe 1cv8.exe\n");
     wprintf(L"  v8inject scan  1cv8.exe 0x1A2B3C4D --module 1cv8.exe\n");
@@ -84,6 +85,28 @@ int wmain(int argc, wchar_t** argv) {
 
     std::wstring cmd = argv[1];
     if (cmd == L"--help" || cmd == L"-h" || cmd == L"/?") { PrintUsage(); return 0; }
+
+    if (cmd == L"log") {
+        bool clear = false;
+        for (int i = 2; i < argc; ++i)
+            if (std::wstring(argv[i]) == L"--clear") clear = true;
+
+        if (clear) {
+            _wremove(v8i::GetLogPath());
+            wprintf(L"cleared: %ls\n", v8i::GetLogPath());
+            return 0;
+        }
+
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, v8i::GetLogPath(), L"r") != 0 || !f) {
+            wprintf(L"no log at %ls\n", v8i::GetLogPath());
+            return 2;
+        }
+        char buf[4096];
+        while (fgets(buf, sizeof(buf), f)) fputs(buf, stdout);
+        fclose(f);
+        return 0;
+    }
 
     if (cmd == L"modules") {
         if (argc < 3) { PrintUsage(); return 1; }

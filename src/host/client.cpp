@@ -1,4 +1,5 @@
 #include "v8inject/client.h"
+#include "v8inject/diag.h"
 #include "v8inject/injector.h"
 
 #include <chrono>
@@ -55,6 +56,7 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     if (hMap_) return false;
 
     MakeSharedName(sharedName_, _countof(sharedName_), pid);
+    LogLine("Client::Open pid=%u name=%ls logDir=%ls", pid, sharedName_, logDir.c_str());
 
     // 2 GB block is virtual; only touched pages become resident.
     hMap_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,

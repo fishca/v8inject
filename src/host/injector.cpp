@@ -1,5 +1,7 @@
 #include "v8inject/injector.h"
+#include "v8inject/diag.h"
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <cstring>
 
 namespace v8i {
@@ -18,8 +20,9 @@ void* AllocRemote(HANDLE hProc, const void* data, size_t bytes) {
     return remote;
 }
 
-// LoadLibraryW has the same address in every process of the same bitness
-// because kernel32 maps at a fixed base, so the address is usable remotely.
+// LoadLibraryW lives at the same address in every process of one bitness,
+// so its address is valid remotely. The returned HMODULE is fetched separately
+// because GetExitCodeThread only carries 32 bits and would truncate it on x64.
 bool RemoteLoadLibrary(HANDLE hProc, const std::wstring& dllPath, HMODULE* baseOut) {
     void* remote = AllocRemote(hProc, dllPath.c_str(),
                                (dllPath.size() + 1) * sizeof(wchar_t));
@@ -36,14 +39,43 @@ bool RemoteLoadLibrary(HANDLE hProc, const std::wstring& dllPath, HMODULE* baseO
         DWORD code = 0;
         GetExitCodeThread(th, &code);
         ok = (code != 0);
-        if (baseOut && ok) *baseOut = (HMODULE)(uintptr_t)code;
         CloseHandle(th);
     }
     VirtualFreeEx(hProc, remote, 0, MEM_RELEASE);
-    return ok;
+    LogLine("RemoteLoadLibrary(%ls) -> %s", dllPath.c_str(), ok ? "ok" : "FAILED");
+    if (!ok) return false;
+
+    // Resolve the real module base inside the target.
+    if (baseOut) {
+        HMODULE remoteBase = FindModuleInProcess(hProc, dllPath);
+        LogLine("FindModuleInProcess -> %p", (void*)remoteBase);
+        if (!remoteBase) return false;
+        *baseOut = remoteBase;
+    }
+    return true;
 }
 
 }  // namespace
+
+HMODULE FindModuleInProcess(HANDLE hProc, const std::wstring& dllPath) {
+    const wchar_t* want = wcsrchr(dllPath.c_str(), L'\\');
+    want = want ? want + 1 : dllPath.c_str();
+
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModulesEx(hProc, mods, sizeof(mods), &needed, LIST_MODULES_ALL))
+        return nullptr;
+
+    DWORD count = needed / sizeof(HMODULE);
+    for (DWORD i = 0; i < count; ++i) {
+        wchar_t path[MAX_PATH] = {};
+        if (!GetModuleFileNameExW(hProc, mods[i], path, MAX_PATH)) continue;
+        const wchar_t* got = wcsrchr(path, L'\\');
+        got = got ? got + 1 : path;
+        if (_wcsicmp(got, want) == 0) return mods[i];
+    }
+    return nullptr;
+}
 
 DWORD FindProcessByName(const wchar_t* exeName) {
     if (!exeName) return 0;
@@ -138,6 +170,9 @@ bool StartPayloadThread(DWORD pid,
 
     uintptr_t delta = (uintptr_t)targetBase - (uintptr_t)localBase;
     uintptr_t remoteProbeAddr = (uintptr_t)localProbe + delta;
+    LogLine("targetBase=%p localBase=%p delta=%lld localProbe=%p -> remoteProbe=%p",
+            (void*)targetBase, (void*)localBase, (long long)(intptr_t)delta,
+            (void*)localProbe, (void*)remoteProbeAddr);
     FreeLibrary(localBase);   // target keeps its own reference
 
     stageOut = kStageAllocName;
@@ -159,6 +194,7 @@ bool StartPayloadThread(DWORD pid,
     HANDLE th = CreateRemoteThread(hProc, nullptr, 0,
                                    (LPTHREAD_START_ROUTINE)remoteProbeAddr,
                                    ra, 0, nullptr);
+    LogLine("CreateRemoteThread -> %p err=%lu", (void*)th, GetLastError());
     if (!th) {
         win32ErrorOut = GetLastError();
         VirtualFreeEx(hProc, rn, 0, MEM_RELEASE);

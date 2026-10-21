@@ -5,6 +5,9 @@
 namespace v8i {
 
 DWORD FindProcessByName(const wchar_t* exeName);
+
+// Base address of a DLL loaded in another process (nullptr when absent).
+HMODULE FindModuleInProcess(HANDLE hProc, const std::wstring& dllPath);
 bool  IsProcess64(DWORD pid);
 bool  InjectLibrary(DWORD pid, const std::wstring& dllPath);
 
