@@ -132,16 +132,25 @@ XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
         if (cur < chunkBase || cur >= chunkBase + chunkHave) {
             chunkBase = cur;
             chunkHave = 0;
-            size_t want = (size_t)std::min<uintptr_t>(kChunk, end - cur);
-            if (!IsReadable((const void*)cur, want)) {
-                // Find the next readable region rather than dying here.
-                MEMORY_BASIC_INFORMATION mbi{};
-                if (!VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi))) break;
+
+            // Only the first byte must be readable. Requiring the whole chunk
+            // to be readable rejects the tail of every region, which is most of
+            // the last page — that stalled the sweep at its very first step.
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi))) break;
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) ||
+                (mbi.Protect & PAGE_GUARD)) {
                 uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
                 if (next <= cur) break;
                 cur = next;
                 continue;
             }
+
+            // Stay inside this region and inside the requested range.
+            uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            uintptr_t limit = regionEnd < end ? regionEnd : end;
+            size_t want = (size_t)std::min<uintptr_t>(kChunk, limit - cur);
+            if (want == 0) break;
             memcpy(buf.data(), (const void*)cur, want);
             chunkHave = want;
         }
