@@ -1,4 +1,5 @@
 #include "v8inject/injector.h"
+#include "v8inject/procs.h"
 #include "v8inject/diag.h"
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -92,21 +93,6 @@ DWORD FindProcessByName(const wchar_t* exeName) {
     }
     CloseHandle(snap);
     return pid;
-}
-
-bool IsProcess64(DWORD pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return false;
-
-    BOOL wow = FALSE;
-    bool ok = IsWow64Process(h, &wow) != FALSE;
-    CloseHandle(h);
-
-#if defined(_WIN64)
-    return !ok ? true : (wow == FALSE);
-#else
-    return false;   // a 32-bit host can only reach 32-bit targets
-#endif
 }
 
 bool InjectLibrary(DWORD pid, const std::wstring& dllPath) {
