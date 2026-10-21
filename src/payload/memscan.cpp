@@ -152,8 +152,10 @@ std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes
 }
 
 std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t moduleSize,
-                                        size_t hwndOffset, size_t maxHits) {
+                                        size_t hwndOffset, size_t maxHits,
+                                        size_t* scannedBytes, size_t* regions) {
     std::vector<HwndOwner> out;
+    size_t totalScanned = 0, regionCount = 0;
     const uintptr_t want = (uintptr_t)hwnd;
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
@@ -171,6 +173,7 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
         const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
         const uintptr_t regionEnd = regionBase + mbi.RegionSize;
 
+        if (mbi.State == MEM_COMMIT) ++regionCount;
         const bool usable = mbi.State == MEM_COMMIT &&
                             !(mbi.Protect & PAGE_GUARD) &&
                             !(mbi.Protect & PAGE_NOACCESS) &&
@@ -194,6 +197,7 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
                 break;
             }
 
+            totalScanned += got;
             const size_t limit = got >= 4 ? got - 4 : 0;
             for (size_t off = 0; off <= limit; off += 4) {
                 const uintptr_t val = *(const uint32_t*)(buf.data() + off);
@@ -219,6 +223,8 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
         }
         addr = regionEnd;
     }
+    if (scannedBytes) *scannedBytes = totalScanned;
+    if (regions) *regions = regionCount;
     return out;
 }
 

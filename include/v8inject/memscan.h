@@ -43,6 +43,8 @@ struct HwndOwner {
 };
 
 std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t moduleSize,
-                                        size_t hwndOffset, size_t maxHits);
+                                        size_t hwndOffset, size_t maxHits,
+                                        size_t* scannedBytes = nullptr,
+                                        size_t* regions = nullptr);
 
 }  // namespace v8i

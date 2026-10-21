@@ -290,6 +290,8 @@ struct ReArgs {
     size_t       count = 64;
     std::vector<std::wstring> positional;   // module name, then a filter
     bool         haveAddr = false;
+    size_t       offset = 0;                 // --offset, for byhwnd
+    bool         haveOffset = false;
     bool         haveFrom = false;
     bool         haveTo = false;
     std::wstring pattern;
@@ -322,6 +324,7 @@ ReArgs ParseReArgs(const std::wstring& args) {
         else if (tok == L"--from")   { a.from = ParseHexToken(NextToken(rest)); a.haveFrom = true; }
         else if (tok == L"--to")     { a.to = ParseHexToken(NextToken(rest)); a.haveTo = true; }
         else if (tok == L"--count")  a.count = (size_t)_wtoi(NextToken(rest).c_str());
+        else if (tok == L"--offset") { a.offset = (size_t)_wtoi(NextToken(rest).c_str()); a.haveOffset = true; }
         else if (tok == L"--pattern") a.pattern = NextToken(rest);
         else if (tok[0] != L'-')     a.positional.push_back(tok);
     }
@@ -583,20 +586,25 @@ std::string ByHwndToJson(const std::wstring& args) {
     }
     if (!hwndVal) return "{\"status\":\"error\",\"message\":\"hwnd required\"}";
 
-    size_t off = a.haveAddr ? a.addr : 0x34;
+    size_t off = a.haveOffset ? a.offset : 0x34;
 
     ModuleRange m;
     PeImage img;
     if (!ResolveModule(a.module, m, img))
         return "{\"status\":\"error\",\"message\":\"module not found\"}";
 
+    size_t scanned = 0, regions = 0;
     std::vector<HwndOwner> found =
-        FindObjectsByHwnd((HWND)hwndVal, m.base, m.size, off, a.count ? a.count : 16);
+        FindObjectsByHwnd((HWND)hwndVal, m.base, m.size, off, a.count ? a.count : 16,
+                          &scanned, &regions);
 
     char buf[512];
     std::string j = "{\"status\":\"ok\",\"hwnd\":\"0x";
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%llX\",\"offset\":%zu,\"count\":%zu,\"objects\":[",
-                (unsigned long long)hwndVal, off, found.size());
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "%llX\",\"offset\":%zu,\"count\":%zu,\"scannedBytes\":%zu,"
+                "\"regions\":%zu,\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu,\"objects\":[",
+                (unsigned long long)hwndVal, off, found.size(), scanned, regions,
+                (unsigned long long)m.base, m.size);
     j += buf;
 
     bool first = true;
