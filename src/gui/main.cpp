@@ -70,6 +70,17 @@ std::wstring DefaultPayloadFor(bool targetIs64) {
     return dir + (targetIs64 ? L"\\x64\\v8i_payload.dll" : L"\\x86\\v8i_payload.dll");
 }
 
+// Payload replies are UTF-8; the window is wide. Converting byte-by-byte
+// (wstring(begin, end)) produces mojibake for every non-ASCII name.
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+    return out;
+}
+
 void Log(const std::wstring& line) {
     std::wstring text = line + L"\r\n";
     int len = GetWindowTextLengthW(g_log);
@@ -227,7 +238,7 @@ void DoInject() {
 
     std::string resp;
     if (g_client.Call(L"version", resp, 10000)) {
-        Log(L"Подключено: " + std::wstring(resp.begin(), resp.end()));
+        Log(L"Подключено: " + Utf8ToWide(resp));
         SetStatus(L"Подключено к " + g_targetName);
         EnableWindow(GetDlgItem(g_hwnd, kIdSend), TRUE);
         EnableWindow(GetDlgItem(g_hwnd, kIdDetach), TRUE);
@@ -261,7 +272,7 @@ void DoSend() {
     Log(std::wstring(L"> ") + cmd);
     std::string resp;
     if (g_client.Call(cmd, resp, 20000)) {
-        Log(std::wstring(resp.begin(), resp.end()));
+        Log(Utf8ToWide(resp));
     } else {
         Log(L"(нет ответа)");
     }

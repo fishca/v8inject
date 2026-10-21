@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Sources contain Cyrillic UI strings. Without these MSVC reads the files in the
+# local ANSI code page (1251) and emits broken literals, and the linker has no
+# reason to treat the resulting bytes as UTF-8.
+if(MSVC)
+    add_compile_options(/utf-8)
+    add_link_options(/utf-8)
+endif()
+
 if(NOT WIN32)
     message(FATAL_ERROR "v8inject: Windows-only project")
 endif()
