@@ -93,34 +93,44 @@ bool StartPayloadThread(DWORD pid,
                         HANDLE& hProcessOut,
                         HANDLE& hThreadOut,
                         void*& remoteNameOut,
-                        void*& remoteArgsOut) {
+                        void*& remoteArgsOut,
+                        int& stageOut,
+                        DWORD& win32ErrorOut) {
     hProcessOut = nullptr;
     hThreadOut = nullptr;
     remoteNameOut = nullptr;
     remoteArgsOut = nullptr;
-    if (!sharedName) return false;
+    stageOut = kStageOpenProcess;
+    win32ErrorOut = 0;
+    if (!sharedName) { win32ErrorOut = ERROR_INVALID_PARAMETER; return false; }
 
     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
                                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
                                FALSE, pid);
-    if (!hProc) return false;
+    if (!hProc) { win32ErrorOut = GetLastError(); return false; }
 
     // The target base comes back as the thread's exit code (HMODULE value).
+    stageOut = kStageLoadLibrary;
     HMODULE targetBase = nullptr;
     if (!RemoteLoadLibrary(hProc, payloadDll, &targetBase)) {
+        win32ErrorOut = GetLastError();
         CloseHandle(hProc);
         return false;
     }
 
     // Load the very same file here so the export RVA is known locally,
     // then map it into the target's address space.
+    stageOut = kStageLocalLoad;
     HMODULE localBase = LoadLibraryW(payloadDll.c_str());
     if (!localBase) {
+        win32ErrorOut = GetLastError();
         CloseHandle(hProc);
         return false;
     }
+    stageOut = kStageGetProcAddress;
     FARPROC localProbe = GetProcAddress(localBase, "v8i_probe");
     if (!localProbe) {
+        win32ErrorOut = GetLastError();
         FreeLibrary(localBase);
         CloseHandle(hProc);
         return false;
@@ -130,28 +140,34 @@ bool StartPayloadThread(DWORD pid,
     uintptr_t remoteProbeAddr = (uintptr_t)localProbe + delta;
     FreeLibrary(localBase);   // target keeps its own reference
 
+    stageOut = kStageAllocName;
     const size_t nameBytes = (wcslen(sharedName) + 1) * sizeof(wchar_t);
     void* rn = AllocRemote(hProc, sharedName, nameBytes);
-    if (!rn) { CloseHandle(hProc); return false; }
+    if (!rn) { win32ErrorOut = GetLastError(); CloseHandle(hProc); return false; }
 
+    stageOut = kStageAllocArgs;
     const uintptr_t nameArg = (uintptr_t)rn;
     void* ra = AllocRemote(hProc, &nameArg, sizeof(nameArg));
     if (!ra) {
+        win32ErrorOut = GetLastError();
         VirtualFreeEx(hProc, rn, 0, MEM_RELEASE);
         CloseHandle(hProc);
         return false;
     }
 
+    stageOut = kStageCreateThread;
     HANDLE th = CreateRemoteThread(hProc, nullptr, 0,
                                    (LPTHREAD_START_ROUTINE)remoteProbeAddr,
                                    ra, 0, nullptr);
     if (!th) {
+        win32ErrorOut = GetLastError();
         VirtualFreeEx(hProc, rn, 0, MEM_RELEASE);
         VirtualFreeEx(hProc, ra, 0, MEM_RELEASE);
         CloseHandle(hProc);
         return false;
     }
 
+    stageOut = kStageOk;
     hProcessOut = hProc;
     hThreadOut = th;
     remoteNameOut = rn;

@@ -26,6 +26,8 @@ public:
 
     bool IsOpen() const { return hMap_ != nullptr; }
     LONG LastDiag() const { return lastDiag_; }
+    int  LastStage() const { return lastStage_; }
+    DWORD LastWin32Error() const { return lastWin32_; }
     // Last handshake failure text, empty when Open succeeded.
     const wchar_t* LastError() const { return lastError_; }
     const wchar_t* SharedName() const { return sharedName_; }
@@ -42,6 +44,8 @@ private:
     HANDLE        hProc_ = nullptr;
     LONG          seq_ = 0;
     LONG          lastDiag_ = 0;
+    int           lastStage_ = 0;
+    DWORD         lastWin32_ = 0;
     wchar_t       lastError_[256] = {};
     wchar_t       sharedName_[64] = {};
 };

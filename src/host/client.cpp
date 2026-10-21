@@ -73,7 +73,11 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll, int timeoutMs) {
 
     // Copy the payload into the target and start v8i_probe on its own thread.
     if (!StartPayloadThread(pid, payloadDll, sharedName_,
-                            hProc_, hThread_, remoteName_, remoteArgs_)) {
+                            hProc_, hThread_, remoteName_, remoteArgs_,
+                            lastStage_, lastWin32_)) {
+        _snwprintf_s(lastError_, _countof(lastError_), _TRUNCATE,
+                     L"start-up failed at stage %d (win32=%lu)",
+                     lastStage_, lastWin32_);
         ReleaseHandles();
         return false;
     }

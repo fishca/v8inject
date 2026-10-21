@@ -92,8 +92,8 @@ V8I_API int V8I_CALL v8i_version() {
     return 1;
 }
 
-V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
-    DbgLog("v8i_probe entered, pid=%lu sharedName=%ls", GetCurrentProcessId(),
+static int RunPayload(const wchar_t* sharedName) {
+    DbgLog("RunPayload entered, pid=%lu sharedName=%ls", GetCurrentProcessId(),
            sharedName ? sharedName : L"(null)");
     if (!sharedName) return -1;
 
@@ -105,7 +105,7 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
     DbgLog("MapViewOfFile -> %p err=%lu", (void*)g_io, GetLastError());
     if (!g_io) { CloseHandle(hMap); return -3; }
 
-    // Tell the host we are alive before anything can throw.
+    // Report readiness before anything that can fail.
     PutResponse("{\"status\":\"loaded\"}");
 
     for (;;) {
@@ -120,10 +120,8 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
         if (wcscmp(g_io->request, L"version") == 0) {
             char buf[128] = {};
             _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                        "{\"status\":\"ok\",\"api\":%d,\"arch\":\"%s\","
-                        "\"pointerSize\":%d,\"process\":\"%s\"}",
-                        v8i_version(), sizeof(void*) == 8 ? "x64" : "x86",
-                        (int)sizeof(void*), "");
+                        "{\"status\":\"ok\",\"api\":%d,\"pointerSize\":%d}",
+                        v8i_version(), (int)sizeof(void*));
             PutResponse(buf);
             continue;
         }
@@ -140,5 +138,39 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
     UnmapViewOfFile(g_io);
     CloseHandle(hMap);
     g_io = nullptr;
+    return 0;
+}
+
+struct WorkerArgs {
+    wchar_t name[64];
+};
+
+static DWORD WINAPI WorkerProc(LPVOID param) {
+    auto* args = (WorkerArgs*)param;
+    RunPayload(args->name);
+    return 0;
+}
+
+// The host starts this on a remote thread. We immediately hand the work to our
+// own thread and keep the caller blocked, so the payload keeps running even
+// though the host opened that thread with default settings.
+V8I_API int V8I_CALL v8i_probe(const wchar_t* sharedName) {
+    DbgLog("v8i_probe entered, pid=%lu", GetCurrentProcessId());
+
+    WorkerArgs args{};
+    if (sharedName) {
+        wcsncpy_s(args.name, _countof(args.name), sharedName, _TRUNCATE);
+    }
+
+    HANDLE hWorker = CreateThread(nullptr, 0, WorkerProc, &args, 0, nullptr);
+    if (hWorker) {
+        DbgLog("worker thread created %p", (void*)hWorker);
+        // Block the remote thread forever; the worker owns the session.
+        WaitForSingleObject(hWorker, INFINITE);
+        CloseHandle(hWorker);
+    } else {
+        DbgLog("CreateThread failed err=%lu", GetLastError());
+        RunPayload(args.name);   // fall back to running inline
+    }
     return 0;
 }

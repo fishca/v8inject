@@ -107,8 +107,10 @@ int wmain(int argc, wchar_t** argv) {
         v8i::Client client;
         if (!client.Open(pid, o.dll, o.timeoutMs)) {
             wprintf(L"handshake failed\n  reason : %s\n  diag   : %ld\n"
+                    L"  stage  : %d  win32: %lu\n"
                     L"  shared : %s\n  payload: %s\n",
                     client.LastError(), client.LastDiag(),
+                    client.LastStage(), client.LastWin32Error(),
                     client.SharedName(), o.dll.c_str());
             return 4;
         }
@@ -137,8 +139,10 @@ int wmain(int argc, wchar_t** argv) {
         v8i::Client client;
         if (!client.Open(pid, o.dll, o.timeoutMs)) {
             wprintf(L"handshake failed\n  reason : %s\n  diag   : %ld\n"
+                    L"  stage  : %d  win32: %lu\n"
                     L"  shared : %s\n  payload: %s\n",
                     client.LastError(), client.LastDiag(),
+                    client.LastStage(), client.LastWin32Error(),
                     client.SharedName(), o.dll.c_str());
             return 4;
         }
