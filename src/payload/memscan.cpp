@@ -155,8 +155,9 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
                                         size_t hwndOffset, size_t maxHits,
                                         size_t* scannedBytes, size_t* regions) {
     std::vector<HwndOwner> out;
-    size_t totalScanned = 0, regionCount = 0, skippedBytes = 0;
+    size_t totalScanned = 0, regionCount = 0, skippedBytes = 0, commitTotal = 0;
     (void)skippedBytes;
+    (void)commitTotal;
     const uintptr_t want = (uintptr_t)hwnd;
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
