@@ -30,6 +30,12 @@ const wchar_t* GetLogPath() {
 }
 
 void LogLine(const char* fmt, ...) {
+    if (!g_csReady) {
+        // Never take an uninitialised critical section: this can happen when
+        // the payload logs before it knows where the log lives.
+        InitializeCriticalSection(&g_cs);
+        g_csReady = true;
+    }
     if (!g_logPath[0]) {
         // No path configured: still write something so the failure is visible.
         char tmp[MAX_PATH * 2] = {};
@@ -48,24 +54,36 @@ void LogLine(const char* fmt, ...) {
     }
 
     EnterCriticalSection(&g_cs);
-    // Keep the file UTF-8 and unbuffered-ish: the payload may die at any
-    // moment, and the log is the only witness.
-    FILE* f = nullptr;
-    errno_t err = _wfopen_s(&f, g_logPath, L"a, ccs=UTF-8");
-    if (err != 0 || !f) err = _wfopen_s(&f, g_logPath, L"a");
-    if (err == 0 && f) {
-        SYSTEMTIME st{};
-        GetLocalTime(&st);
-        fprintf(f, "%02u:%02u:%02u.%03u [pid %5lu tid %5lu] ",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                GetCurrentProcessId(), GetCurrentThreadId());
+
+    // Build the whole line first, then append it in one WriteFile call: cheap,
+    // crash-safe, and unaffected by CRT buffering.
+    char line[2048];
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "%02u:%02u:%02u.%03u [pid %5lu tid %5lu] ",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                        GetCurrentProcessId(), GetCurrentThreadId());
+    if (n > 0) {
         va_list ap;
         va_start(ap, fmt);
-        vfprintf(f, fmt, ap);
+        int m = _vsnprintf_s(line + n, sizeof(line) - n, _TRUNCATE, fmt, ap);
         va_end(ap);
-        fputc('\n', f);
-        fflush(f);
-        fclose(f);
+        if (m > 0) n += m;
+        if (n < (int)sizeof(line) - 2) {
+            line[n++] = '\r';
+            line[n++] = '\n';
+            line[n] = 0;
+        }
+    }
+
+    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        SetFilePointer(h, 0, nullptr, FILE_END);
+        DWORD written = 0;
+        WriteFile(h, line, (DWORD)n, &written, nullptr);
+        CloseHandle(h);
     }
     LeaveCriticalSection(&g_cs);
 }

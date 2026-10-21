@@ -80,11 +80,13 @@ Options ParseOptions(int argc, wchar_t** argv, int first) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    InitHostLog();
     if (argc < 2) { PrintUsage(); return 1; }
 
     std::wstring cmd = argv[1];
     if (cmd == L"--help" || cmd == L"-h" || cmd == L"/?") { PrintUsage(); return 0; }
+
+    // Everything below this point is a real session and gets logged.
+    InitHostLog();
 
     if (cmd == L"log") {
         bool clear = false;
