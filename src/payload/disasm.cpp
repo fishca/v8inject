@@ -231,16 +231,10 @@ CopyInsn DecodeForCopy(uintptr_t address, bool is64) {
     out.size = insn[0].size;
     out.text = std::string(insn[0].mnemonic) + " " + insn[0].op_str;
 
-    // A relative branch keeps its encoded displacement, so copying it to the
-    // trampoline would send control flow to the wrong place. A rip-relative
-    // operand has the same problem with data, but its displacement can be
-    // rewritten, so the caller gets the offset instead of a refusal.
-    if (cs_insn_group(h, &insn[0], CS_GRP_JUMP) ||
-        cs_insn_group(h, &insn[0], CS_GRP_CALL) ||
-        cs_insn_group(h, &insn[0], CS_GRP_BRANCH_RELATIVE)) {
-        out.positionDependent = true;
-    }
     const cs_x86& x = insn[0].detail->x86;
+
+    // A rip-relative operand carries a displacement that has to be rewritten
+    // when the instruction moves; report where it sits.
     for (int k = 0; k < x.op_count; ++k) {
         const cs_x86_op& op = x.operands[k];
         if (op.type == X86_OP_MEM &&
@@ -251,9 +245,28 @@ CopyInsn DecodeForCopy(uintptr_t address, bool is64) {
         }
     }
 
+    // A relative branch/call with an immediate target. Indirect forms (jmp rax,
+    // jmp [mem]) have no displacement of their own and need nothing here.
+    bool isJump = cs_insn_group(h, &insn[0], CS_GRP_JUMP) != 0;
+    bool isCall = cs_insn_group(h, &insn[0], CS_GRP_CALL) != 0;
+    if ((isJump || isCall) && x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
+        out.isBranch = true;
+        out.branchTarget = (uintptr_t)x.operands[0].imm;
+        out.immOffset = x.encoding.imm_offset;
+        out.immSize = x.encoding.imm_size;
+
+        // loop / loope / loopne / jcxz / jecxz / jrcxz only exist with an 8-bit
+        // displacement, so there is no wider encoding to widen them into.
+        const char* m = insn[0].mnemonic;
+        if (strncmp(m, "loop", 4) == 0 || strcmp(m, "jcxz") == 0 ||
+            strcmp(m, "jecxz") == 0 || strcmp(m, "jrcxz") == 0) {
+            out.unsupportedBranch = true;
+        }
+    }
+
     if (cs_insn_group(h, &insn[0], CS_GRP_RET) || cs_insn_group(h, &insn[0], CS_GRP_INT)) {
         out.terminal = true;
-    } else if (insn[0].mnemonic[0] == 'j' && strcmp(insn[0].mnemonic, "jmp") == 0) {
+    } else if (strcmp(insn[0].mnemonic, "jmp") == 0) {
         out.terminal = true;
     } else if (strcmp(insn[0].mnemonic, "hlt") == 0 || strcmp(insn[0].mnemonic, "ud2") == 0) {
         out.terminal = true;

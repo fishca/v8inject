@@ -40,13 +40,26 @@ size_t DecodeOne(uintptr_t address, Insn* out, bool is64);
 
 // Decodes one instruction and answers the question an inline hook needs: can
 // these bytes be copied somewhere else and still mean the same thing?
+//
+// Three kinds of operand care about their address, and each is handled
+// differently when the bytes move into a trampoline:
+//   * rip/eip-relative memory operand -- displacement is rewritten in place;
+//   * relative branch/call (rel32)     -- displacement is rewritten in place;
+//   * relative branch/call (rel8)      -- widened to rel32, because the new
+//                                         displacement will not fit in a byte.
 struct CopyInsn {
     size_t      size = 0;
-    bool        positionDependent = false;  // relative branch: cannot be copied
-    bool        ripRelative = false;        // rip/eip-relative operand: fixable
+    bool        ripRelative = false;
     size_t      dispOffset = 0;             // where that displacement sits
     size_t      dispSize = 0;
-    bool        terminal = false;           // ret / int3 / unconditional jmp
+
+    bool        isBranch = false;           // relative branch with an immediate target
+    uintptr_t   branchTarget = 0;           // absolute target, as decoded
+    size_t      immOffset = 0;              // displacement inside the instruction
+    size_t      immSize = 0;                // 1 = rel8 (widened), 4 = rel32
+    bool        unsupportedBranch = false;  // loop/jecxz: no rel32 form exists
+
+    bool        terminal = false;           // ret / int3 / jmp: control does not fall through
     std::string text;                       // "jmp 0x401000" for error messages
 };
 CopyInsn DecodeForCopy(uintptr_t address, bool is64);

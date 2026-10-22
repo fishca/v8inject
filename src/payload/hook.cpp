@@ -24,8 +24,10 @@ namespace {
 // ---------------------------------------------------------------------------
 
 #if defined(_M_X64)
-// mov rax, imm64; jmp rax -- reaches anywhere in the 64-bit address space.
-constexpr size_t kPatchLen = 12;
+// jmp rel32. The stub is always allocated within +-2 GB of the target
+// (AllocNear), so a 32-bit displacement reaches it and a 12-byte absolute jump
+// would only overwrite more of the function than necessary.
+constexpr size_t kPatchLen = 5;
 #else
 // jmp rel32 -- the stub has to live within +-2 GB of the target.
 constexpr size_t kPatchLen = 5;
@@ -354,18 +356,20 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
     if (!((mbi.Protect & 0xFF) & 0xF0)) { error = "target is not executable"; return 0; }
 
     // Steal whole instructions: a jump written into the middle of one would
-    // leave the remainder as garbage that the trampoline then executes.
-    // Keep a per-instruction plan so the trampoline can relocate rip-relative
-    // operands whose meaning would otherwise change when the bytes move.
-    struct StolenInsn {
-        size_t offset;
-        size_t size;
-        bool   ripRelative;
-        size_t dispOffset;
+    // leave the remainder as garbage that the trampoline then executes. Each
+    // stolen instruction keeps its own record, because moving it changes the
+    // meaning of three things: rip-relative operands, relative branches, and
+    // 8-bit branch displacements that no longer fit where they land.
+    struct PlanInsn {
+        size_t   origOffset;
+        size_t   origSize;
+        size_t   newOffset;   // where it lands in the trampoline
+        size_t   newSize;     // larger than origSize when a rel8 is widened
+        CopyInsn ci;
     };
 
     uint8_t original[kMaxStolen + 8] = {};
-    std::vector<StolenInsn> plan;
+    std::vector<PlanInsn> plan;
     size_t stolen = 0;
     while (stolen < kPatchLen) {
         if (stolen + 16 > sizeof(original)) { error = "prologue is too long"; return 0; }
@@ -377,9 +381,9 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
             error = b;
             return 0;
         }
-        if (ci.positionDependent) {
-            error = "prologue contains a position-dependent instruction (" + ci.text +
-                    "); not hookable yet";
+        if (ci.unsupportedBranch) {
+            error = "prologue contains " + ci.text +
+                    ", which has no 32-bit displacement form to widen into";
             return 0;
         }
         if (ci.ripRelative && ci.dispSize != 4) {
@@ -387,15 +391,37 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
                     ci.text + ")";
             return 0;
         }
+        // A ret or a jump away from the prologue means the function's own code
+        // stops here: the bytes after it may belong to something else, and
+        // overwriting them would corrupt it. A jump that stays inside the
+        // prologue is fine -- it is a forward/backward branch within the prefix
+        // being copied, and its target is remapped in the trampoline.
         if (ci.terminal) {
-            error = "target looks like a jump stub or ends immediately (" + ci.text +
-                    "); resolve the real function first";
-            return 0;
+            const bool inPrologue = ci.isBranch &&
+                                    ci.branchTarget >= target &&
+                                    ci.branchTarget < target + kMaxStolen;
+            if (!inPrologue && stolen + ci.size < kPatchLen) {
+                error = "the function's code ends before the patch fits (" + ci.text + ")";
+                return 0;
+            }
         }
-        plan.push_back({stolen, ci.size, ci.ripRelative, ci.dispOffset});
+
+        size_t newSize = ci.size;
+        if (ci.isBranch && ci.immSize == 1) {
+            newSize = ci.text.compare(0, 3, "jmp") == 0 ? 5 : 6;   // E9 rel32 / 0F 8x rel32
+        }
+        plan.push_back({stolen, ci.size, 0, newSize, ci});
         stolen += ci.size;
     }
     memcpy(original, (const void*)target, stolen);
+
+    // Lay the trampoline out first: widening an instruction shifts everything
+    // that follows it, so no displacement can be computed before this pass.
+    size_t trampLen = 0;
+    for (PlanInsn& p : plan) {
+        p.newOffset = trampLen;
+        trampLen += p.newSize;
+    }
 
     HookCtx* ctx = new (std::nothrow) HookCtx();
     if (!ctx) { error = "out of memory"; return 0; }
@@ -416,38 +442,83 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
 
     BuildStub((uint8_t*)block, ctx);
 
-    // Trampoline: the stolen bytes, then a jump back to the first instruction we
-    // did not overwrite. rip-relative operands get their displacement rewritten:
-    // the operand addresses target + (size after the disp), so the correction
-    // is the same for every instruction in the plan -- how far the trampoline
-    // sits from the original prologue.
+    // Trampoline: every stolen instruction re-emitted, then a jump back to the
+    // first byte we did not overwrite. An instruction is rewritten only when
+    // moving it would change what it means; everything else is copied verbatim.
     uint8_t* tramp = (uint8_t*)block + kTrampOffset;
-    memcpy(tramp, original, stolen);
-    {
-        int32_t delta = (int32_t)((intptr_t)target - (intptr_t)tramp);
-        for (const StolenInsn& si : plan) {
-            if (!si.ripRelative) continue;
-            int32_t disp = 0;
-            memcpy(&disp, original + si.offset + si.dispOffset, 4);
-            disp += delta;
-            memcpy(tramp + si.offset + si.dispOffset, &disp, 4);
+
+    auto fail = [&](const std::string& why) -> uint32_t {
+        VirtualFree(block, 0, MEM_RELEASE);
+        delete ctx;
+        error = why;
+        return 0;
+    };
+
+    const int32_t ripDelta = (int32_t)((intptr_t)target - (intptr_t)tramp);
+    for (const PlanInsn& p : plan) {
+        const uint8_t* src = original + p.origOffset;
+        uint8_t* dst = tramp + p.newOffset;
+        const uintptr_t dstAddr = (uintptr_t)dst;
+
+        if (p.ci.isBranch) {
+            // A target inside the stolen window moved with the instruction; a
+            // target outside it did not.
+            uintptr_t tgt = p.ci.branchTarget;
+            if (tgt >= target && tgt < target + stolen) {
+                const size_t off = (size_t)(tgt - target);
+                const PlanInsn* moved = nullptr;
+                for (const PlanInsn& q : plan) {
+                    if (q.origOffset == off) { moved = &q; break; }
+                }
+                if (!moved) {
+                    return fail("prologue branch lands inside another instruction (" + p.ci.text + ")");
+                }
+                tgt = (uintptr_t)(tramp + moved->newOffset);
+            }
+
+            const int64_t disp = (int64_t)tgt - (int64_t)(dstAddr + p.newSize);
+            if (p.ci.immSize == 1) {
+                // A rel8 cannot reach a trampoline up to a gigabyte away, so the
+                // instruction is re-emitted in its rel32 form.
+                if (p.ci.text.compare(0, 3, "jmp") == 0) {
+                    dst[0] = 0xE9;
+                    int32_t d = (int32_t)disp;
+                    memcpy(dst + 1, &d, 4);
+                } else {
+                    dst[0] = 0x0F;
+                    dst[1] = (uint8_t)(0x80 | (src[0] & 0x0F));   // same condition code
+                    int32_t d = (int32_t)disp;
+                    memcpy(dst + 2, &d, 4);
+                }
+            } else {
+                if (disp < INT32_MIN || disp > INT32_MAX) {
+                    return fail("prologue branch is out of reach of a 32-bit displacement (" +
+                                p.ci.text + ")");
+                }
+                memcpy(dst, src, p.origSize);
+                int32_t d = (int32_t)disp;
+                memcpy(dst + p.ci.immOffset, &d, 4);
+            }
+        } else {
+            memcpy(dst, src, p.origSize);
+            if (p.ci.ripRelative) {
+                int32_t d = 0;
+                memcpy(&d, src + p.ci.dispOffset, 4);
+                d += ripDelta;
+                memcpy(dst + p.ci.dispOffset, &d, 4);
+            }
         }
     }
-    BuildTrampolineTail(tramp + stolen, target + stolen);
-    FlushInstructionCache(GetCurrentProcess(), tramp, stolen + 16);
+    BuildTrampolineTail(tramp + trampLen, target + stolen);
+    FlushInstructionCache(GetCurrentProcess(), tramp, trampLen + 16);
 
-    // The patch itself.
+    // The patch itself: a rel32 jump to the stub, on both architectures.
     uint8_t patch[kPatchLen] = {};
-#if defined(_M_X64)
-    patch[0] = 0x48; patch[1] = 0xB8;
-    uint64_t s = (uint64_t)ctx->stub;
-    memcpy(patch + 2, &s, 8);
-    patch[10] = 0xFF; patch[11] = 0xE0;           // jmp rax
-#else
     patch[0] = 0xE9;
-    int32_t rel = (int32_t)((intptr_t)ctx->stub - (intptr_t)(target + 5));
-    memcpy(patch + 1, &rel, 4);
-#endif
+    {
+        int32_t rel = (int32_t)((intptr_t)ctx->stub - (intptr_t)(target + 5));
+        memcpy(patch + 1, &rel, 4);
+    }
 
     {
         Suspender sus;
