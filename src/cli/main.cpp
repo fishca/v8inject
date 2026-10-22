@@ -34,6 +34,11 @@ void PrintUsage() {
     wprintf(L"  v8inject byhwnd  <exe> <hwnd> [--module <dll>] [--offset 0x200]\n");
     wprintf(L"  v8inject around  <exe> <hex-addr> [--count N]\n");
     wprintf(L"  v8inject xref    <exe> <hex-addr|name> [--module <dll>] [--from A --to B] [--count N]\n");
+    wprintf(L"  v8inject attach  <exe> [--dll <path>]          # interactive session, one command per line\n");
+    wprintf(L"  v8inject hook    <exe> <addr|module!Export|module+0xRVA> [--name <text>]\n");
+    wprintf(L"  v8inject hooks   <exe>\n");
+    wprintf(L"  v8inject unhook  <exe> <id|all>\n");
+    wprintf(L"  v8inject trace   <exe> [--count N] [--since N] [--clear]\n");
     wprintf(L"  v8inject log     [--clear]\n\n");
     wprintf(L"examples:\n");
     wprintf(L"  v8inject probe 1cv8.exe\n");
@@ -220,7 +225,8 @@ int wmain(int argc, wchar_t** argv) {
     // at least the target process; the payload enforces its own argument count.
     if (cmd == L"disasm" || cmd == L"imports" || cmd == L"exports" || cmd == L"mods" ||
         cmd == L"memmap" || cmd == L"heapobjects" || cmd == L"findvalue" || cmd == L"byhwnd" ||
-        cmd == L"around" || cmd == L"xref") {
+        cmd == L"around" || cmd == L"xref" ||
+        cmd == L"hook" || cmd == L"hooks" || cmd == L"unhook" || cmd == L"trace") {
         if (argc < 3) { PrintUsage(); return 1; }
         if (cmd == L"imports" && argc < 4) { PrintUsage(); return 1; }
         int timeout = (cmd == L"xref") ? 120000 : 15000;
@@ -266,6 +272,52 @@ int wmain(int argc, wchar_t** argv) {
         wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         client.Close();
         return ok ? 0 : 5;
+    }
+
+    if (cmd == L"attach") {
+        if (argc < 3) { PrintUsage(); return 1; }
+        DWORD pid = v8i::FindProcessByName(argv[2]);
+        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+
+        Options o = ParseOptions(argc, argv, 3);
+        v8i::Client client;
+        if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
+            PrintOpenFailure(client, o);
+            return 4;
+        }
+
+        // One session, many commands: hooks stay installed for as long as this
+        // loop runs, which is the whole point of the mode. `sleep <ms>` is
+        // handled here, not in the payload, so a script can wait for the target
+        // to call into a hook.
+        wprintf(L"attached: %ls pid=%lu\n", client.SharedName(), pid);
+        fflush(stdout);
+
+        char line[4096];
+        while (fgets(line, sizeof(line), stdin)) {
+            std::wstring req = Utf8ToWide(line);
+            while (!req.empty() && (req.back() == L'\n' || req.back() == L'\r' ||
+                                    req.back() == L' ' || req.back() == L'\t')) {
+                req.pop_back();
+            }
+            if (req.empty()) continue;
+            if (req == L"exit" || req == L"quit") break;
+
+            if (req.compare(0, 6, L"sleep ") == 0) {
+                Sleep((DWORD)_wtoi(req.c_str() + 6));
+                wprintf(L"{\"status\":\"ok\",\"slept\":true}\n");
+                fflush(stdout);
+                continue;
+            }
+
+            std::string resp;
+            bool ok = client.Call(req, resp, 120000);
+            wprintf(L"%ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
+            fflush(stdout);
+        }
+
+        client.Close();
+        return 0;
     }
 
     if (cmd == L"log") {

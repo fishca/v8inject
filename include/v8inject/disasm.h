@@ -38,6 +38,19 @@ std::vector<Insn> Disassemble(uintptr_t start, size_t size, size_t maxInsns,
 // Decodes one instruction; returns its length or 0 when it cannot be decoded.
 size_t DecodeOne(uintptr_t address, Insn* out, bool is64);
 
+// Decodes one instruction and answers the question an inline hook needs: can
+// these bytes be copied somewhere else and still mean the same thing?
+struct CopyInsn {
+    size_t      size = 0;
+    bool        positionDependent = false;  // relative branch: cannot be copied
+    bool        ripRelative = false;        // rip/eip-relative operand: fixable
+    size_t      dispOffset = 0;             // where that displacement sits
+    size_t      dispSize = 0;
+    bool        terminal = false;           // ret / int3 / unconditional jmp
+    std::string text;                       // "jmp 0x401000" for error messages
+};
+CopyInsn DecodeForCopy(uintptr_t address, bool is64);
+
 // Finds call/jmp/lea/mov references to `target` inside [start, end).
 // This is the primitive used to locate code that touches a known address,
 // such as an IAT slot for CreateWindowExW.

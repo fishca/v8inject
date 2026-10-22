@@ -57,6 +57,12 @@ jobs:
           & "$dir/v8inject.exe" --help
           if ($LASTEXITCODE -ne 0) { throw "v8inject --help failed" }
 
+      # cli_help plus hook_smoke: the latter injects the payload into
+      # v8i_hook_target.exe, hooks a function with known arguments and checks the
+      # recorded call.
+      - name: Run tests
+        run: ctest --test-dir build/${{ matrix.arch }} -C Release --output-on-failure
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

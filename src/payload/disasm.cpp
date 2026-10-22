@@ -215,6 +215,54 @@ XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
     return r;
 }
 
+CopyInsn DecodeForCopy(uintptr_t address, bool is64) {
+    CopyInsn out;
+    csh h = GetHandles().Get(is64);
+    if (!h) return out;
+    if (!IsReadable((const void*)address, 16)) return out;
+
+    uint8_t scratch[16] = {};
+    memcpy(scratch, (const void*)address, sizeof(scratch));
+
+    cs_insn* insn = nullptr;
+    size_t n = cs_disasm(h, scratch, sizeof(scratch), (uint64_t)address, 1, &insn);
+    if (n == 0 || !insn) return out;
+
+    out.size = insn[0].size;
+    out.text = std::string(insn[0].mnemonic) + " " + insn[0].op_str;
+
+    // A relative branch keeps its encoded displacement, so copying it to the
+    // trampoline would send control flow to the wrong place. A rip-relative
+    // operand has the same problem with data, but its displacement can be
+    // rewritten, so the caller gets the offset instead of a refusal.
+    if (cs_insn_group(h, &insn[0], CS_GRP_JUMP) ||
+        cs_insn_group(h, &insn[0], CS_GRP_CALL) ||
+        cs_insn_group(h, &insn[0], CS_GRP_BRANCH_RELATIVE)) {
+        out.positionDependent = true;
+    }
+    const cs_x86& x = insn[0].detail->x86;
+    for (int k = 0; k < x.op_count; ++k) {
+        const cs_x86_op& op = x.operands[k];
+        if (op.type == X86_OP_MEM &&
+            (op.mem.base == X86_REG_RIP || op.mem.base == X86_REG_EIP)) {
+            out.ripRelative = true;
+            out.dispOffset = x.encoding.disp_offset;
+            out.dispSize = x.encoding.disp_size;
+        }
+    }
+
+    if (cs_insn_group(h, &insn[0], CS_GRP_RET) || cs_insn_group(h, &insn[0], CS_GRP_INT)) {
+        out.terminal = true;
+    } else if (insn[0].mnemonic[0] == 'j' && strcmp(insn[0].mnemonic, "jmp") == 0) {
+        out.terminal = true;
+    } else if (strcmp(insn[0].mnemonic, "hlt") == 0 || strcmp(insn[0].mnemonic, "ud2") == 0) {
+        out.terminal = true;
+    }
+
+    cs_free(insn, n);
+    return out;
+}
+
 std::vector<Xref> FindXrefs(uintptr_t start, uintptr_t end, uintptr_t target,
                             bool is64, size_t maxHits) {
     return FindXrefsVerbose(start, end, target, is64, maxHits).hits;

@@ -1,5 +1,6 @@
 #include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
+#include "v8inject/hook.h"
 #include "v8inject/objects.h"
 #include "v8inject/disasm.h"
 #include "v8inject/memscan.h"
@@ -1137,6 +1138,7 @@ static int RunPayload(const wchar_t* sharedName) {
     if (!g_io) { CloseHandle(hMap); return -3; }
 
     InitPayloadLog(g_io->logDir);
+    HookInstallFaultLogger();
     LogLine("RunPayload started, pid=%lu arch=%s", GetCurrentProcessId(),
             sizeof(void*) == 8 ? "x64" : "x86");
     LogLine("MapViewOfFile -> %p", (void*)g_io);
@@ -1266,6 +1268,35 @@ static int RunPayload(const wchar_t* sharedName) {
             continue;
         }
 
+        // ---- extension layer: hooks and call tracing ----
+        if (wcscmp(g_io->request, L"hooks") == 0) {
+            PutResponse(Guarded(L"hooks", HooksCommandToJson, std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"hook ", 5) == 0) {
+            LogLine("hook: installing");
+            PutResponse(Guarded(L"hook", HookCommandToJson, std::wstring(g_io->request + 5)));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"unhook", 6) == 0) {
+            LogLine("unhook: restoring");
+            PutResponse(Guarded(L"unhook", UnhookCommandToJson,
+                                std::wstring(g_io->request).size() > 7
+                                    ? std::wstring(g_io->request).substr(7)
+                                    : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"trace", 5) == 0) {
+            PutResponse(Guarded(L"trace", TraceCommandToJson,
+                                std::wstring(g_io->request).size() > 6
+                                    ? std::wstring(g_io->request).substr(6)
+                                    : std::wstring()));
+            continue;
+        }
+
         TypeInfoReport rep;
         if (!RunScan(g_io->request, rep)) {
             PutResponse("{\"status\":\"error\",\"message\":\"scan failed\"}");
@@ -1273,6 +1304,12 @@ static int RunPayload(const wchar_t* sharedName) {
         }
         PutResponse(ToJson(rep));
         LogLine("response sent, %zu bytes", rep.funcs.size());
+    }
+
+    // Hooks must be gone before the DLL that owns their thunks is unloaded.
+    {
+        size_t removed = HookRemoveAll();
+        if (removed) LogLine("payload exit: %zu hook(s) restored", removed);
     }
 
     InterlockedExchange((volatile LONG*)&g_io->ready, kStateExit);
