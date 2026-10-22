@@ -90,11 +90,12 @@ jobs:
             # These lines go FIRST: GitHub caps a step at ten annotations.
             $log = "build/${{ matrix.arch }}/bin/${{ matrix.arch }}/v8inject.log"
             if (Test-Path $log) {
-              # Nine requests per session, nine "command received" lines: this
-              # is the payload's verbatim view of every command, first included.
+              # Both sides of the hook exchanges: the host's Call(... posted or
+              # BUSY) and the payload's verbatim "command received: ...". The
+              # fate of the FIRST command is what the question is about.
               $last += Get-Content $log |
-                Where-Object { $_ -match 'command received' } |
-                Select-Object -Last 9
+                Where-Object { $_ -match 'Call\(hook|command received: hook' } |
+                Select-Object -Last 12
             }
             $fail = $keep | Where-Object { $_ -match 'FAIL' } | Select-Object -Unique -First 2
             ($last + $fail) | Select-Object -Unique | Select-Object -First 12 |
