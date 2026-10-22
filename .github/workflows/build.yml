@@ -90,8 +90,10 @@ jobs:
             # These lines go FIRST: GitHub caps a step at ten annotations.
             $log = "build/${{ matrix.arch }}/bin/${{ matrix.arch }}/v8inject.log"
             if (Test-Path $log) {
+              # Nine requests per session, nine "command received" lines: this
+              # is the payload's verbatim view of every command, first included.
               $last += Get-Content $log |
-                Where-Object { $_ -match 'command received: hook|Call\(hook|scan failed' } |
+                Where-Object { $_ -match 'command received' } |
                 Select-Object -Last 9
             }
             $fail = $keep | Where-Object { $_ -match 'FAIL' } | Select-Object -Unique -First 2
