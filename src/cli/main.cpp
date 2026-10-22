@@ -24,10 +24,20 @@ void PrintUsage() {
     wprintf(L"  v8inject peek    <exe> <hex-addr> [len] [--dll <path>]\n");
     wprintf(L"  v8inject pe      <exe> [module] [--dll <path>]\n");
     wprintf(L"  v8inject find    <exe> <pattern> [--module <dll>] [--wide] [--max N]\n");
+    wprintf(L"  v8inject disasm  <exe> [<hex-addr>] [--module <dll>]\n");
+    wprintf(L"  v8inject imports <exe> <module> [filter]\n");
+    wprintf(L"  v8inject memmap  <exe> [--count N]\n");
+    wprintf(L"  v8inject heapobjects <exe> [--module <dll>] [--count N]\n");
+    wprintf(L"  v8inject findvalue <exe> <hex> [--count N] [--module <dll>]\n");
+    wprintf(L"  v8inject byhwnd  <exe> <hwnd> [--module <dll>] [--offset 0x34]\n");
+    wprintf(L"  v8inject around  <exe> <hex-addr> [--count N]\n");
+    wprintf(L"  v8inject xref    <exe> <hex-addr|name> [--module <dll>] [--from A --to B] [--count N]\n");
     wprintf(L"  v8inject log     [--clear]\n\n");
     wprintf(L"examples:\n");
     wprintf(L"  v8inject probe 1cv8.exe\n");
     wprintf(L"  v8inject scan  1cv8.exe 0x1A2B3C4D --module 1cv8.exe\n");
+    wprintf(L"  v8inject xref  1cv8.exe 0x140001234 --module 1cv8.exe --from 0x140000000 --to 0x140100000\n");
+    wprintf(L"  v8inject byhwnd 1cv8.exe 0x1090C --offset 0x34\n");
 }
 
 std::wstring ExeDir() {
@@ -104,6 +114,42 @@ void PrintOpenFailure(v8i::Client& client, const Options& o) {
     wprintf(L"log    : %ls\n", v8i::GetLogPath());
 }
 
+// A payload command that just forwards its argument string across the shared
+// memory. The payload (not the CLI) owns the grammar, so the CLI's job is only
+// to build the request line and print whatever JSON comes back.
+int RunPayloadCommand(const wchar_t* cmdName, const wchar_t* exe,
+                      int argc, wchar_t** argv, int first, int timeoutMs) {
+    DWORD pid = v8i::FindProcessByName(exe);
+    if (!pid) { wprintf(L"process not found: %s\n", exe); return 2; }
+
+    Options o = ParseOptions(argc, argv, first);
+    v8i::LogLine("%ls: target pid=%lu", cmdName, pid);
+
+    // Rebuild the request verbatim from the trailing args, but strip the
+    // CLI-level options (--dll / --timeout) the payload doesn't understand.
+    // Everything else — positional args plus --module/--count/--offset/--from/
+    // --to/--addr/--pattern — is the payload's concern and passes through.
+    std::wstring request = cmdName;
+    for (int i = first; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--dll" || a == L"--timeout") { ++i; continue; }
+        request += L" ";
+        request += a;
+    }
+    v8i::LogLine("%ls: request: %ls", cmdName, request.c_str());
+
+    v8i::Client client;
+    if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
+        PrintOpenFailure(client, o);
+        return 4;
+    }
+    std::string resp;
+    bool ok = client.Call(request, resp, timeoutMs);
+    wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
+    client.Close();
+    return ok ? 0 : 5;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -166,6 +212,18 @@ int wmain(int argc, wchar_t** argv) {
         wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         client.Close();
         return ok ? 0 : 5;
+    }
+
+    // Reverse-engineering commands forwarded verbatim to the payload. Each needs
+    // at least the target process; the payload enforces its own argument count.
+    if (cmd == L"disasm" || cmd == L"imports" || cmd == L"memmap" ||
+        cmd == L"heapobjects" || cmd == L"findvalue" || cmd == L"byhwnd" ||
+        cmd == L"around" || cmd == L"xref") {
+        if (argc < 3) { PrintUsage(); return 1; }
+        if (cmd == L"imports" && argc < 4) { PrintUsage(); return 1; }
+        int timeout = (cmd == L"xref") ? 120000 : 15000;
+        Options o = ParseOptions(argc, argv, 3);
+        return RunPayloadCommand(cmd.c_str(), argv[2], argc, argv, 3, timeout);
     }
 
     if (cmd == L"peek" || cmd == L"pe") {
