@@ -57,6 +57,7 @@ target_link_libraries(v8i_common PUBLIC oleaut32 ole32)
 add_library(v8i_payload SHARED
     src/payload/dllmain.cpp
     src/payload/disasm.cpp
+    src/payload/gitbar.cpp
     src/payload/hook.cpp
     src/payload/menu.cpp
     src/payload/memscan.cpp
