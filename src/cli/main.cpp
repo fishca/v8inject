@@ -318,6 +318,12 @@ int wmain(int argc, wchar_t** argv) {
         char line[4096];
         while (fgets(line, sizeof(line), stdin)) {
             std::wstring req = Utf8ToWide(line);
+            // A piped stream may start with a UTF-8 BOM. Left in place it turns
+            // the first command into "\uFEFFhook ...", which matches no command
+            // prefix -- the payload answers "scan failed" and the command is
+            // silently lost. This bit us in CI, where the runner's pipe
+            // encoding differs from a local console's.
+            if (!req.empty() && req[0] == 0xFEFF) req.erase(0, 1);
             while (!req.empty() && (req.back() == L'\n' || req.back() == L'\r' ||
                                     req.back() == L' ' || req.back() == L'\t')) {
                 req.pop_back();

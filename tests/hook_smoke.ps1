@@ -84,6 +84,9 @@ trace --count 3
 exit
 "@
 
+# Force BOM-less UTF-8 into the pipe: with the runner's default the first
+# command arrived as "\uFEFFhook ...", which the payload cannot match.
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $out = $script | & $exe attach 'v8i_hook_target.exe' 2>&1 | Out-String
 Write-Host $out.Trim()
 
