@@ -90,12 +90,13 @@ jobs:
             # These lines go FIRST: GitHub caps a step at ten annotations.
             $log = "build/${{ matrix.arch }}/bin/${{ matrix.arch }}/v8inject.log"
             if (Test-Path $log) {
-              # Both sides of the hook exchanges: the host's Call(... posted or
-              # BUSY) and the payload's verbatim "command received: ...". The
-              # fate of the FIRST command is what the question is about.
+              # Only the FIRST hook exchange fits under the annotation cap, and
+              # that is the one in question: the host's Call(...) line says
+              # whether it was posted or BUSY, the payload's line says what text
+              # it received.
               $last += Get-Content $log |
                 Where-Object { $_ -match 'Call\(hook|command received: hook' } |
-                Select-Object -Last 12
+                Select-Object -First 4
             }
             $fail = $keep | Where-Object { $_ -match 'FAIL' } | Select-Object -Unique -First 2
             ($last + $fail) | Select-Object -Unique | Select-Object -First 12 |
