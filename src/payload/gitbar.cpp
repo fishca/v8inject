@@ -7,14 +7,13 @@
 
 // Git toolbar ("GitBar") for the running 1C configurator.
 //
-// The designer's menu bar is a custom-painted control with no Win32 menu, so
-// the only reliable way to place git controls inside the configurator window
-// is a real Win32 window created INSIDE the 1C process by the payload. This
-// version embeds the toolbar AS A CHILD of the configurator frame and docks
-// it into the right end of the toolbar row, matching the 1C look: a slim
-// flat strip, 16px classic-style icons (diskette / check / push / gear),
-// tooltips, draggable along the toolbar row. The result comes as close to a
-// native 1C panel as a foreign window can.
+// The designer's UI is fully custom-painted (no Win32 menus), so the git
+// controls live in a real Win32 window created INSIDE the 1C process and
+// parented to the configurator frame, docked at the right end of the toolbar
+// row. Everything is drawn by hand in WM_PAINT: owner-drawn BUTTON children
+// were invisible here (the frame's own toolbar children paint over them and
+// the WM_DRAWITEM round-trip is unreliable in a foreign message loop), so the
+// strip draws its four 16px glyphs itself and hit-tests clicks.
 //
 //   gitbar            -- show the toolbar (creates the window + thread)
 //   gitbar hide       -- destroy it
@@ -25,6 +24,7 @@
 #ifndef TTM_POPUP
 #define TTM_POPUP (WM_USER + 34)
 #endif
+
 namespace v8i {
 
 namespace {
@@ -116,8 +116,6 @@ std::wstring NowStamp() {
     return b;
 }
 
-// Finds the configurator frame (the designer's top-level window). The bar is
-// a CHILD of it, so this parent must be the frame and not our own window.
 HWND FindFrame() {
     struct Ctx { HWND h; DWORD pid; } ctx = { nullptr, GetCurrentProcessId() };
     EnumWindows([](HWND h, LPARAM lp) -> BOOL {
@@ -137,106 +135,136 @@ HWND FindFrame() {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded 1C-style toolbar: child of the frame, docked at the right end of
-// the toolbar row, 24px high, 16px classic icons, draggable.
+// Hand-drawn 1C-style strip: everything painted in WM_PAINT, clicks hit-tested.
 // ---------------------------------------------------------------------------
 
-const int kBarW = 100;      // 4 x 24px buttons + 4px padding
+const int kBarW = 100;
 const int kBarH = 24;
-const int kBtn = 24;
+const int kCell = 24;       // per-button cell width
 const int kDockY = 28;      // toolbar row, just under the menu
 const int kWinIdDump = 1, kWinIdCommit = 2, kWinIdPush = 3, kWinIdSettings = 4;
 
 struct GitBar {
     HWND hwnd = nullptr;
     HWND tooltip = nullptr;
+    int hover = 0;          // cell index under the cursor (1..4), 0 = none
+    bool pressed = false;
     bool dragging = false;
-    int dragDx = 0;          // x offset from the drag start
-    RECT lastFrame{};        // cached frame client rect
+    POINT pressPt{};
+    RECT lastFrame{};
     DWORD threadId = 0;
     HANDLE thread = nullptr;
 };
 
 GitBar g_bar;
 
-int BtnX(int id) {
-    static const int order[] = { kWinIdDump, kWinIdCommit, kWinIdPush, kWinIdSettings };
-    for (int i = 0; i < 4; ++i)
-        if (order[i] == id) return 2 + i * kBtn;
+int CellX(int id) { return 2 + (id - 1) * kCell; }
+
+int IdFromPoint(POINT pt) {
+    if (pt.y < 0 || pt.y >= kBarH) return 0;
+    for (int id = 1; id <= 4; ++id) {
+        int x = CellX(id);
+        if (pt.x >= x && pt.x < x + kCell) return id;
+    }
     return 0;
 }
 
-// 1C-classic 16x16 glyphs, drawn with GDI.
-void DrawIcon(HDC dc, int id, bool hot) {
-    HPEN penDark = CreatePen(PS_SOLID, 1, RGB(70, 80, 90));
-    HPEN penThick = CreatePen(PS_SOLID, 2, RGB(70, 80, 90));
-    HBRUSH fillGrey = CreateSolidBrush(RGB(225, 226, 230));
-    HBRUSH fillBlue = CreateSolidBrush(RGB(0, 96, 160));
-    HBRUSH fillGreen = CreateSolidBrush(RGB(0, 140, 60));
-    HPEN oldPen = (HPEN)SelectObject(dc, penDark);
+// 16x16 glyphs, drawn with visible 1-2px strokes.
+void DrawGlyph(HDC dc, int id, int ox, int oy) {
+    HBRUSH blue = CreateSolidBrush(RGB(0, 96, 160));
+    HBRUSH green = CreateSolidBrush(RGB(0, 140, 60));
+    HPEN dark = CreatePen(PS_SOLID, 1, RGB(40, 50, 60));
+    HPEN thick = CreatePen(PS_SOLID, 2, RGB(40, 50, 60));
+    HPEN oldPen = (HPEN)SelectObject(dc, dark);
     HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    (void)hot;
 
     switch (id) {
-    case kWinIdDump: {  // diskette = "выгрузить в файлы"
-        SelectObject(dc, fillGrey);
-        POINT body[] = { {1,2},{10,2},{14,6},{14,14},{1,14} };
+    case kWinIdDump: {  // diskette: "выгрузить в файлы"
+        SelectObject(dc, blue);
+        POINT body[] = { {ox+2,oy+2},{ox+10,oy+2},{ox+14,oy+6},{ox+14,oy+14},{ox+2,oy+14} };
         Polygon(dc, body, 5);
-        SelectObject(dc, GetStockObject(NULL_BRUSH));
-        POINT cut[] = { {10,2},{14,6},{14,14},{1,14},{1,2} };
-        Polygon(dc, cut, 5);
-        // label (top-left, blue) and shutter square
-        SelectObject(dc, fillBlue);
-        Rectangle(dc, 2, 3, 9, 9);
-        SelectObject(dc, fillGrey);
-        Rectangle(dc, 9, 10, 13, 13);
+        SelectObject(dc, GetStockObject(WHITE_BRUSH));
+        Rectangle(dc, ox + 4, oy + 3, ox + 10, oy + 8);   // label
+        Rectangle(dc, ox + 9, oy + 10, ox + 13, oy + 14); // shutter
         break;
     }
     case kWinIdCommit: {  // green check
-        SelectObject(dc, penThick);
-        SelectObject(dc, fillGreen);
-        POINT mark[] = { {2,8},{6,12},{14,3} };
+        SelectObject(dc, thick);
+        SelectObject(dc, green);
+        POINT mark[] = { {ox+2,oy+8},{ox+6,oy+12},{ox+14,oy+3} };
         Polyline(dc, mark, 3);
         break;
     }
-    case kWinIdPush: {  // up arrow on a base bar
-        SelectObject(dc, fillBlue);
-        POINT head[] = { {3,7},{8,1},{13,7} };
+    case kWinIdPush: {  // blue up arrow over a base bar
+        SelectObject(dc, blue);
+        POINT head[] = { {ox+3,oy+8},{ox+8,oy+2},{ox+13,oy+8} };
         Polygon(dc, head, 3);
-        SelectObject(dc, penDark);
-        MoveToEx(dc, 8, 14, nullptr); LineTo(dc, 8, 8);
-        SelectObject(dc, fillBlue);
-        Rectangle(dc, 1, 14, 15, 15);
+        SelectObject(dc, thick);
+        MoveToEx(dc, ox + 8, oy + 14, nullptr); LineTo(dc, ox + 8, oy + 8);
+        SelectObject(dc, blue);
+        Rectangle(dc, ox + 2, oy + 14, ox + 14, oy + 15);
         break;
     }
-    case kWinIdSettings: {  // gear: ring + 4 teeth
-        SelectObject(dc, fillGrey);
-        // teeth drawn with explicit rects below
-        SelectObject(dc, penDark);
-        static const RECT teeth[] = { {6,0,10,3}, {6,13,10,16}, {0,6,3,10}, {13,6,16,10} };
+    case kWinIdSettings: {  // gear: ring + teeth
+        SelectObject(dc, blue);
+        static const RECT teeth[] = { {6,1,10,4}, {6,12,10,15}, {1,6,4,10}, {12,6,15,10} };
         for (const RECT& r : teeth) {
-            SelectObject(dc, fillGrey);
-            Rectangle(dc, r.left, r.top, r.right, r.bottom);
+            Rectangle(dc, ox + r.left, oy + r.top, ox + r.right, oy + r.bottom);
         }
-        SelectObject(dc, fillGrey);
-        Ellipse(dc, 3, 3, 13, 13);
+        Ellipse(dc, ox + 3, oy + 3, ox + 13, oy + 13);
         SelectObject(dc, GetStockObject(WHITE_BRUSH));
-        Ellipse(dc, 6, 6, 10, 10);
+        Ellipse(dc, ox + 6, oy + 6, ox + 10, oy + 10);
         break;
     }
     }
 
     SelectObject(dc, oldPen);
     SelectObject(dc, oldBrush);
-    DeleteObject(penDark);
-    DeleteObject(penThick);
-    DeleteObject(fillGrey);
-    DeleteObject(fillBlue);
-    DeleteObject(fillGreen);
+    DeleteObject(blue);
+    DeleteObject(green);
+    DeleteObject(dark);
+    DeleteObject(thick);
+}
+
+void Paint(HWND hwnd) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+
+    // Panel background and a 1C-ish border, so the strip reads as a toolbar.
+    HBRUSH bg = CreateSolidBrush(RGB(238, 234, 222));
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    HPEN border = CreatePen(PS_SOLID, 1, RGB(176, 166, 142));
+    SelectObject(dc, border);
+    SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    DeleteObject(border);
+
+    for (int id = 1; id <= 4; ++id) {
+        int x = CellX(id);
+        RECT cell{ x, 1, x + kCell, kBarH - 1 };
+        if (id == g_bar.hover || (g_bar.pressed && id == g_bar.hover)) {
+            HBRUSH hl = CreateSolidBrush(id == g_bar.hover && g_bar.pressed
+                                             ? RGB(226, 216, 178)
+                                             : RGB(250, 244, 214));
+            FillRect(dc, &cell, hl);
+            DeleteObject(hl);
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(198, 184, 148));
+            SelectObject(dc, pen);
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, cell.left, cell.top, cell.right, cell.bottom);
+            DeleteObject(pen);
+        }
+        DrawGlyph(dc, id, x + (kCell - 16) / 2, (kBarH - 16) / 2);
+    }
+    EndPaint(hwnd, &ps);
 }
 
 // Docks the bar at the right end of the toolbar row unless the user dragged
-// it somewhere else; re-arms to the dock when the frame changes size.
+// it; keeps it raised above the frame's own toolbar children, which 1C
+// re-creates and would otherwise paint over us.
 void Reposition(bool forceDock) {
     HWND frame = GetParent(g_bar.hwnd);
     if (!frame) { frame = FindFrame(); if (frame) SetParent(g_bar.hwnd, frame); }
@@ -252,22 +280,19 @@ void Reposition(bool forceDock) {
     POINT tl{ cur.left, cur.top };
     ScreenToClient(frame, &tl);
 
-    bool frameChanged = (cr.left != g_bar.lastFrame.left || cr.right != g_bar.lastFrame.right ||
+    bool frameChanged = (cr.right != g_bar.lastFrame.right ||
                          cr.bottom != g_bar.lastFrame.bottom);
     g_bar.lastFrame = cr;
-    if (forceDock || frameChanged || !g_bar.dragging) {
-        if (forceDock || frameChanged) {
-            // dock to the right end of the toolbar row
-            tl.x = w - kBarW - 4;
-            tl.y = kDockY;
-        }
-        if (tl.x < 0) tl.x = 0;
-        if (tl.y < 0) tl.y = 0;
-        if (tl.x > w - kBarW) tl.x = w - kBarW;
-        if (tl.y > h - kBarH) tl.y = h - kBarH;
-        SetWindowPos(g_bar.hwnd, HWND_TOP, tl.x, tl.y, 0, 0,
-                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (forceDock || frameChanged) {
+        tl.x = w - kBarW - 4;
+        tl.y = kDockY;
     }
+    if (tl.x < 0) tl.x = 0;
+    if (tl.y < 0) tl.y = 0;
+    if (tl.x > w - kBarW) tl.x = w - kBarW;
+    if (tl.y > h - kBarH) tl.y = h - kBarH;
+    SetWindowPos(g_bar.hwnd, HWND_TOP, tl.x, tl.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 void ShowTip(const std::wstring& text) {
@@ -353,85 +378,89 @@ void ShowSettings(HWND owner) {
     Reposition(true);
 }
 
+void DoAction(int id) {
+    switch (id) {
+    case kWinIdDump: ShowTip(L"выгрузить: внутренняя точка выгрузки — реверс в работе"); break;
+    case kWinIdCommit: RunCommit(); break;
+    case kWinIdPush: RunPush(); break;
+    case kWinIdSettings: ShowSettings(g_bar.hwnd); break;
+    }
+}
+
 LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case kWinIdDump:
-            ShowTip(L"выгрузить: внутренняя точка выгрузки — реверс в работе");
-            return 0;
-        case kWinIdCommit: RunCommit(); return 0;
-        case kWinIdPush:   RunPush(); return 0;
-        case kWinIdSettings: ShowSettings(hwnd); return 0;
-        }
+    case WM_PAINT:
+        Paint(hwnd);
         return 0;
 
-    case WM_DRAWITEM: {
-        auto* di = (DRAWITEMSTRUCT*)lp;
-        HDC dc = di->hDC;
-        SetBkMode(dc, TRANSPARENT);
-        RECT rc = di->rcItem;
-        bool hot = (di->itemState & ODS_HOTLIGHT) != 0;
-        bool down = (di->itemState & ODS_SELECTED) != 0;
+    case WM_ERASEBKGND:
+        return 1;  // WM_PAINT fills everything
 
-        // 1C-style: flat, gentle highlight box on hover, subtle press.
-        HBRUSH bg = CreateSolidBrush(hot ? RGB(255, 250, 220) : RGB(246, 244, 238));
-        FillRect(dc, &rc, bg);
-        DeleteObject(bg);
-        if (hot || down) {
-            HPEN pen = CreatePen(PS_SOLID, 1,
-                                 down ? RGB(200, 170, 60) : RGB(180, 190, 205));
-            SelectObject(dc, pen);
-            HBRUSH br = CreateSolidBrush(down ? RGB(238, 232, 200) : RGB(255, 252, 235));
-            RECT in = rc;
-            InflateRect(&in, -1, -1);
-            FillRect(dc, &in, br);
-            FrameRect(dc, &rc, br);
-            DeleteObject(br);
-            SelectObject(dc, GetStockObject(NULL_BRUSH));
-            Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
-            DeleteObject(pen);
-        }
-
-        int cx = rc.left + (rc.right - rc.left - 16) / 2;
-        int cy = rc.top + (rc.bottom - rc.top - 16) / 2;
-        SaveDC(dc);
-        SetViewportOrgEx(dc, cx, cy, nullptr);
-        DrawIcon(dc, (int)di->itemID, hot);
-        RestoreDC(dc, -1);
-        return TRUE;
-    }
-
-    case WM_LBUTTONDOWN: {
-        SetCapture(hwnd);
-        g_bar.dragging = true;
-        return 0;
-    }
     case WM_MOUSEMOVE: {
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         if (g_bar.dragging && (wp & MK_LBUTTON)) {
             HWND frame = GetParent(hwnd);
             if (frame) {
-                POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
                 RECT cr{};
                 GetClientRect(frame, &cr);
                 int w = cr.right - cr.left;
-                int x = pt.x - g_bar.dragDx;
+                int x = pt.x - g_bar.pressPt.x;
                 if (x < 0) x = 0;
                 if (x > w - kBarW) x = w - kBarW;
-                SetWindowPos(hwnd, HWND_TOP, x, pt.y, 0, 0,
+                int y = pt.y - g_bar.pressPt.y;
+                if (y < 0) y = 0;
+                SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0,
                              SWP_NOSIZE | SWP_NOACTIVATE);
             }
+            return 0;
+        }
+        int id = IdFromPoint(pt);
+        if (id != g_bar.hover) {
+            g_bar.hover = id;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        // Ask for WM_MOUSELEAVE so the highlight clears when the mouse leaves.
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        if (g_bar.hover) {
+            g_bar.hover = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        g_bar.pressPt = pt;
+        g_bar.pressed = true;
+        g_bar.dragging = false;
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        int moved = abs(pt.x - g_bar.pressPt.x) + abs(pt.y - g_bar.pressPt.y);
+        bool wasDragging = g_bar.dragging;
+        g_bar.pressed = false;
+        g_bar.dragging = false;
+        ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (!wasDragging && moved < 5) {
+            int id = IdFromPoint(pt);
+            if (id) DoAction(id);
         }
         return 0;
     }
-    case WM_LBUTTONUP:
-        g_bar.dragging = false;
-        ReleaseCapture();
-        return 0;
 
     case WM_TIMER:
         if (wp == 1) Reposition(false);
         return 0;
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -448,7 +477,7 @@ DWORD WINAPI BarThread(LPVOID) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = BarWndProc;
     wc.hInstance = hInst;
-    wc.hbrBackground = CreateSolidBrush(RGB(246, 244, 238));
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = L"V8iGitBar";
     RegisterClassW(&wc);
 
@@ -457,40 +486,31 @@ DWORD WINAPI BarThread(LPVOID) {
                                  WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                  0, kDockY, kBarW, kBarH, frame, nullptr, hInst, nullptr);
 
-    auto Btn = [&](int id) {
-        return CreateWindowExW(0, L"BUTTON", L"",
-                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                               BtnX(id), 0, kBtn, kBarH,
-                               g_bar.hwnd, (HMENU)(INT_PTR)id, hInst, nullptr);
-    };
-    Btn(kWinIdDump);
-    Btn(kWinIdCommit);
-    Btn(kWinIdPush);
-    Btn(kWinIdSettings);
-
-    // Tooltips with the action names + a status tool on the bar itself.
+    // Tooltips: one tool per cell, hit by rect.
     g_bar.tooltip = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr,
                                     WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                     CW_USEDEFAULT, CW_USEDEFAULT, 0, 0,
                                     g_bar.hwnd, nullptr, hInst, nullptr);
-    struct Tip { int id; const wchar_t* text; };
-    const Tip tips[] = {
-        { kWinIdDump, L"Выгрузить конфигурацию в файлы (реверс в работе)" },
-        { kWinIdCommit, L"Коммит изменений" },
-        { kWinIdPush, L"Пуш в удалённый репозиторий" },
-        { kWinIdSettings, L"Настройки: git.exe и папка выгрузки" },
+    const wchar_t* texts[] = {
+        L"Выгрузить конфигурацию в файлы (реверс в работе)",
+        L"Коммит изменений",
+        L"Пуш в удалённый репозиторий",
+        L"Настройки: git.exe и папка выгрузки",
     };
-    for (const Tip& t : tips) {
-        TOOLINFOW ti{ sizeof(ti), TTF_IDISHWND | TTF_SUBCLASS };
+    for (int i = 0; i < 4; ++i) {
+        TOOLINFOW ti{ sizeof(ti), TTF_SUBCLASS };
         ti.hwnd = g_bar.hwnd;
-        ti.uId = (UINT_PTR)GetDlgItem(g_bar.hwnd, t.id);
-        ti.lpszText = (LPWSTR)t.text;
+        ti.uId = (UINT_PTR)(i + 1);
+        int x = CellX(i + 1);
+        ti.rect = { x, 1, x + kCell, kBarH - 1 };
+        ti.lpszText = (LPWSTR)texts[i];
         SendMessageW(g_bar.tooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
     }
     {  // status tool: the whole bar, shown programmatically by ShowTip()
-        TOOLINFOW ti{ sizeof(ti), TTF_IDISHWND };
+        TOOLINFOW ti{ sizeof(ti), TTF_SUBCLASS };
         ti.hwnd = g_bar.hwnd;
-        ti.uId = (UINT_PTR)g_bar.hwnd;
+        ti.uId = 100;
+        ti.rect = { 0, 0, kBarW, kBarH };
         ti.lpszText = (LPWSTR)L"";
         SendMessageW(g_bar.tooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
     }
@@ -536,7 +556,6 @@ std::string GitBarCommandToJson(const std::wstring& args) {
     if (!g_bar.thread) {
         return "{\"status\":\"error\",\"message\":\"cannot create toolbar thread\"}";
     }
-    // Give the window a moment to appear before reporting.
     for (int i = 0; i < 50 && !g_bar.hwnd; ++i) Sleep(10);
     char buf[128];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
