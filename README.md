@@ -56,7 +56,7 @@ v8inject imports 1cv8.exe <module> [filter]           # импорты моду�
 v8inject memmap 1cv8.exe [--count N]                  # карта приватной памяти
 v8inject heapobjects 1cv8.exe [--module m] [--count N]   # живые объекты кучи
 v8inject findvalue 1cv8.exe <hex> [--count N] [--module m] # все 4-байтные вхождения
-v8inject byhwnd 1cv8.exe <hwnd> [--offset 0x34]       # объект, владеющий окном
+v8inject byhwnd 1cv8.exe <hwnd> [--offset 0x200]       # объект, владеющий окном
 v8inject log [--clear]                                # лог хоста
 ```
 

@@ -153,11 +153,13 @@ std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes
 
 std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t moduleSize,
                                         size_t hwndOffset, size_t maxHits,
-                                        size_t* scannedBytes, size_t* regions) {
+                                        size_t* scannedBytes2, size_t* regions) {
     std::vector<HwndOwner> out;
-    size_t totalScanned = 0, regionCount = 0;
+    size_t totalScanned = 0;
+    const uint32_t want = (uint32_t)(uintptr_t)hwnd;
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
+    const bool anyModule = (moduleBase == 0);
 
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
@@ -168,6 +170,7 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
     // unreadable space in a way that loses committed memory.
     const size_t kChunk = 1u << 20;
     std::vector<unsigned char> buf(kChunk);
+    size_t regionCount = 0;
 
     while (addr < maxAddr && out.size() < maxHits) {
         MEMORY_BASIC_INFORMATION mbi{};
@@ -194,40 +197,74 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
         uintptr_t cur = std::max(addr, regionBase);
         const uintptr_t stop = std::min(regionEnd, maxAddr);
         while (cur < stop && out.size() < maxHits) {
-            const size_t want = (size_t)std::min<uintptr_t>(kChunk, stop - cur);
+            const size_t want2 = (size_t)std::min<uintptr_t>(kChunk, stop - cur);
             SIZE_T got = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want, &got) ||
+            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(), want2, &got) ||
                 got < 8) {
                 cur += kChunk;
                 continue;
             }
             totalScanned += got;
 
+            // Only slots that hold the handle itself can be the hwnd field.
+            // From each slot, walk backwards up to `hwndOffset` bytes to find
+            // the nearest slot whose VALUE is a vtable pointer — that is the
+            // object start. Different 1C builds put the handle at different
+            // offsets inside the object, so asking "is the vtable within N
+            // bytes above this handle" works across versions without the caller
+            // guessing the exact field offset.
             for (size_t off = 0; off + 4 <= got; off += 4) {
-                const uintptr_t val = *(const uint32_t*)(buf.data() + off);
-                if (val <= lo || val >= hi) continue;
+                if (*(const uint32_t*)(buf.data() + off) != want) continue;
+                const uintptr_t hitAddr = cur + off;
+                if (hitAddr < hwndOffset + 0x100) continue;   // object would underflow
 
-                const uintptr_t objField = val + hwndOffset;
-                uint32_t cand = 0;
-                if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)objField, &cand, 4, nullptr))
-                    continue;
-                if (cand != (uint32_t)(uintptr_t)hwnd) continue;
+                uintptr_t bestSlot = 0;
+                uint32_t  bestVtable = 0;
+                size_t    bestDist = hwndOffset + 1;
+                std::wstring bestMod;
+                uintptr_t bestRva = 0;
+
+                for (size_t back = 0; back <= hwndOffset; back += 4) {
+                    const uintptr_t slot = hitAddr - back;
+                    uint32_t vtable = 0;
+                    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)slot, &vtable, 4,
+                                           nullptr))
+                        continue;
+
+                    std::wstring mod;
+                    uintptr_t rva = 0;
+                    if (anyModule) {
+                        if (!ModuleOfAddress(vtable, &mod, &rva)) continue;
+                    } else if (vtable < lo || vtable >= hi) {
+                        continue;
+                    } else {
+                        rva = vtable - lo;
+                    }
+                    // The nearest valid object start wins.
+                    bestSlot = slot;
+                    bestVtable = vtable;
+                    bestDist = back;
+                    bestMod = mod;
+                    bestRva = rva;
+                    break;
+                }
+                if (!bestSlot) continue;
 
                 HwndOwner o;
-                o.address = val;
-                ReadProcessMemory(GetCurrentProcess(), (LPCVOID)val, &o.vtable, 4, nullptr);
-                if (o.vtable >= lo && o.vtable < hi) {
-                    o.vtableInModule = true;
-                    o.moduleRva = (uint32_t)(o.vtable - lo);
-                }
+                o.address = bestSlot;
+                o.vtable = bestVtable;
+                o.offset = (uint32_t)bestDist;
+                o.vtableInModule = true;
+                o.moduleRva = (uint32_t)bestRva;
+                if (anyModule) o.vtableModule = bestMod;
                 out.push_back(o);
             }
-            if (got < want) break;
+            if (got < want2) break;
             cur += kChunk;
         }
         addr = regionEnd;
     }
-    if (scannedBytes) *scannedBytes = totalScanned;
+    if (scannedBytes2) *scannedBytes2 = totalScanned;
     if (regions) *regions = regionCount;
     return out;
 }

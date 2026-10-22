@@ -29,7 +29,7 @@ void PrintUsage() {
     wprintf(L"  v8inject memmap  <exe> [--count N]\n");
     wprintf(L"  v8inject heapobjects <exe> [--module <dll>] [--count N]\n");
     wprintf(L"  v8inject findvalue <exe> <hex> [--count N] [--module <dll>]\n");
-    wprintf(L"  v8inject byhwnd  <exe> <hwnd> [--module <dll>] [--offset 0x34]\n");
+    wprintf(L"  v8inject byhwnd  <exe> <hwnd> [--module <dll>] [--offset 0x200]\n");
     wprintf(L"  v8inject around  <exe> <hex-addr> [--count N]\n");
     wprintf(L"  v8inject xref    <exe> <hex-addr|name> [--module <dll>] [--from A --to B] [--count N]\n");
     wprintf(L"  v8inject log     [--clear]\n\n");

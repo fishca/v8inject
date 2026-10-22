@@ -765,16 +765,24 @@ std::string ByHwndToJson(const std::wstring& args) {
     }
     if (!hwndVal) return "{\"status\":\"error\",\"message\":\"hwnd required\"}";
 
-    size_t off = a.haveOffset ? a.offset : 0x34;
+    // The window object from `findvalue` showed the vtable up to ~0x40 bytes
+    // above the handle. Search a generous window so the exact layout of the
+    // current 1C build doesn't matter; the scanner reports the real offset.
+    size_t off = a.haveOffset ? a.offset : 0x200;
 
+    // moduleBase=0 tells the scanner the vtable may live in any loaded module:
+    // window objects in 1C frequently inherit system vtables. If the caller
+    // narrowed the module, the scan stays inside it.
+    uintptr_t base = 0, size = 0;
     ModuleRange m;
     PeImage img;
     if (!ResolveModule(a.module, m, img))
         return "{\"status\":\"error\",\"message\":\"module not found\"}";
+    if (!a.module.empty()) { base = m.base; size = m.size; }
 
     size_t scanned = 0, regions = 0;
     std::vector<HwndOwner> found =
-        FindObjectsByHwnd((HWND)hwndVal, m.base, m.size, off, a.count ? a.count : 16,
+        FindObjectsByHwnd((HWND)hwndVal, base, size, off, a.count ? a.count : 16,
                           &scanned, &regions);
 
     char buf[512];
@@ -790,12 +798,28 @@ std::string ByHwndToJson(const std::wstring& args) {
     for (const HwndOwner& o : found) {
         if (!first) j += ",";
         first = false;
+        // vtableModule comes from EnumModules as UTF-16; JSON is UTF-8.
+        std::string modUtf8;
+        if (!o.vtableModule.empty()) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, o.vtableModule.c_str(),
+                                        (int)o.vtableModule.size(), nullptr, 0, nullptr, nullptr);
+            if (n > 0) {
+                modUtf8.resize((size_t)n);
+                WideCharToMultiByte(CP_UTF8, 0, o.vtableModule.c_str(),
+                                    (int)o.vtableModule.size(), &modUtf8[0], n, nullptr, nullptr);
+            }
+        }
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"addr\":\"0x%llX\",\"vtable\":\"0x%llX\",\"vtableInModule\":%s%s}",
+                    "{\"addr\":\"0x%llX\",\"vtable\":\"0x%llX\",\"vtableInModule\":%s,\"moduleRva\":\"0x%X\",\"offset\":%u",
                     (unsigned long long)o.address, (unsigned long long)o.vtable,
-                    o.vtableInModule ? "true" : "false",
-                    o.vtableInModule ? "" : "");
+                    o.vtableInModule ? "true" : "false", o.moduleRva, o.offset);
         j += buf;
+        if (!o.vtableModule.empty()) {
+            j += ",\"vtableModule\":\"";
+            j += modUtf8;
+            j += "\"";
+        }
+        j += "}";
     }
     j += "]}";
     return j;

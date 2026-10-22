@@ -31,14 +31,19 @@ bool ModuleOfAddress(uintptr_t addr, std::wstring* name, uintptr_t* moduleRva);
 
 // Finds a heap object that owns the given HWND.
 //
-// 1C stores the window handle inside its frame object at +0x34 but keeps no
-// back-pointer in the HWND itself (GWLP_USERDATA is null), so the only reliable
-// way back is to scan committed memory for a pointer into `moduleBase` .. +`moduleSize`
-// and check the field at `hwndOffset` for a match.
+// The HWND has no back-pointer (GWLP_USERDATA is null), so the way back is:
+// scan committed memory for a 4-byte slot whose VALUE equals the handle, then
+// walk backwards up to `hwndOffset` bytes to find the nearest slot whose VALUE
+// is a vtable pointer — that is the object start. `moduleBase`==0 means the
+// vtable may belong to any loaded module (1C window objects often inherit
+// system vtables); otherwise only vtables inside `moduleBase..+moduleSize`
+// are considered.
 struct HwndOwner {
-    uintptr_t address = 0;      // object address
-    uintptr_t vtable = 0;       // first dword of the object
-    uint32_t  moduleRva = 0;    // rva of the vtable inside the module, if any
+    uintptr_t address = 0;      // object address (where the vtable pointer sits)
+    uintptr_t vtable = 0;       // the pointer found at `address`
+    uint32_t  offset = 0;       // distance from the hwnd field back to `address`
+    std::wstring vtableModule;  // module that owns the vtable, if resolved
+    uint32_t  moduleRva = 0;    // rva of the vtable inside that module, if any
     bool      vtableInModule = false;
 };
 
