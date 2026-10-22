@@ -40,6 +40,10 @@ v8inject --help
 v8inject modules 1cv8.exe
 v8inject inject 1cv8.exe --dll bin\x64\v8i_payload.dll
 
+# любой команде можно указать --pid <n>, если процессов с таким именем несколько
+# (две открытые 1С, например):
+v8inject hook 1cv8.exe core83.dll!findMethod --pid 12345
+
 # диалог с загруженным payload — команды идут вторым аргументом после exe:
 v8inject probe   1cv8.exe                  # версия payload, проверка связи
 v8inject objects 1cv8.exe                  # окна/объекты, найденные по vtable
@@ -69,6 +73,13 @@ v8inject unhook  1cv8.exe <id|all>
 v8inject trace   1cv8.exe [--count N] [--since N] [--clear]
 v8inject log [--clear]                                # лог хоста
 ```
+
+Цель для `hook` задаётся адресом (`0x619E9F70`), экспортом модуля
+(`core83.dll!findMethod`) или RVA (`core83.dll+0x39F70`). Имя экспорта
+сначала ищется точно, затем без учёта регистра, затем как подстрока — имена
+движка манглированы (`?findMethod@COMContext@core@@UAGH...`), поэтому подстрока
+и есть рабочий способ. Если подстрока подходит к нескольким экспортам, хук не
+ставится: в ответе перечислены кандидаты с RVA, чтобы выбрать один.
 
 `v8inject-gui.exe` — оконная версия: список процессов с фильтром,
 выбор payload-DLL по разрядности цели, строка команды и живой лог.

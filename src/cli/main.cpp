@@ -14,6 +14,8 @@ namespace {
 
 void PrintUsage() {
     wprintf(L"v8inject - interact with a running process\n\n");
+    wprintf(L"  [--pid <n>] on any command targets that process exactly; otherwise the\n");
+    wprintf(L"  first process with the given image name is used.\n\n");
     wprintf(L"usage:\n");
     wprintf(L"  v8inject --help\n");
     wprintf(L"  v8inject modules <exe>\n");
@@ -121,12 +123,32 @@ void PrintOpenFailure(v8i::Client& client, const Options& o) {
     wprintf(L"log    : %ls\n", v8i::GetLogPath());
 }
 
+// Target selection. A name picks the first process with that image; --pid picks
+// one exactly, which matters when several instances of the same binary run (two
+// 1cv8.exe windows, for instance).
+DWORD ResolvePid(int argc, wchar_t** argv, const wchar_t* exe) {
+    for (int i = 2; i + 1 < argc; ++i) {
+        if (std::wstring(argv[i]) == L"--pid") {
+            DWORD pid = (DWORD)_wtoi(argv[i + 1]);
+            if (!pid) continue;
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (!h) {
+                wprintf(L"cannot open pid %lu (win32 %lu)\n", pid, GetLastError());
+                return 0;
+            }
+            CloseHandle(h);
+            return pid;
+        }
+    }
+    return v8i::FindProcessByName(exe);
+}
+
 // A payload command that just forwards its argument string across the shared
 // memory. The payload (not the CLI) owns the grammar, so the CLI's job is only
 // to build the request line and print whatever JSON comes back.
 int RunPayloadCommand(const wchar_t* cmdName, const wchar_t* exe,
                       int argc, wchar_t** argv, int first, int timeoutMs) {
-    DWORD pid = v8i::FindProcessByName(exe);
+    DWORD pid = ResolvePid(argc, argv, exe);
     if (!pid) { wprintf(L"process not found: %s\n", exe); return 2; }
 
     Options o = ParseOptions(argc, argv, first);
@@ -139,7 +161,7 @@ int RunPayloadCommand(const wchar_t* cmdName, const wchar_t* exe,
     std::wstring request = cmdName;
     for (int i = first; i < argc; ++i) {
         std::wstring a = argv[i];
-        if (a == L"--dll" || a == L"--timeout") { ++i; continue; }
+        if (a == L"--dll" || a == L"--timeout" || a == L"--pid") { ++i; continue; }
         request += L" ";
         request += a;
     }
@@ -174,7 +196,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"objects") {
         if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
 
         Options o = ParseOptions(argc, argv, 3);
@@ -196,14 +218,14 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"find") {
         if (argc < 4) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
 
         Options o = ParseOptions(argc, argv, 4);
         std::wstring request = L"find ";
         for (int i = 3; i < argc; ++i) {
             std::wstring a = argv[i];
-            if (a == L"--dll" || a == L"--timeout") { ++i; continue; }
+            if (a == L"--dll" || a == L"--timeout" || a == L"--pid") { ++i; continue; }
             request += a;
             request += L" ";
         }
@@ -236,7 +258,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"peek" || cmd == L"pe") {
         if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
 
         Options o = ParseOptions(argc, argv, 3);
@@ -276,7 +298,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"attach") {
         if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
 
         Options o = ParseOptions(argc, argv, 3);
@@ -344,7 +366,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"modules") {
         if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
         wprintf(L"pid        : %lu\n", pid);
         wprintf(L"target x64 : %s\n", v8i::IsProcess64(pid) ? L"yes" : L"no");
@@ -354,7 +376,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"inject") {
         if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
 
         Options o = ParseOptions(argc, argv, 3);
@@ -369,7 +391,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"probe") {
         if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
 
         Options o = ParseOptions(argc, argv, 3);
@@ -394,7 +416,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (cmd == L"scan") {
         if (argc < 4) { PrintUsage(); return 1; }
-        DWORD pid = v8i::FindProcessByName(argv[2]);
+        DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
 
         uint64_t addr = 0;

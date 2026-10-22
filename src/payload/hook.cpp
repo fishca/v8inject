@@ -10,10 +10,8 @@
 
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <new>
 #include <string>
-#include <vector>
 
 namespace v8i {
 
@@ -35,6 +33,12 @@ constexpr size_t kPatchLen = 5;
 
 // A prologue longer than this is not a prologue we want to move.
 constexpr size_t kMaxStolen = 24;
+
+// Fixed limits instead of growable containers: the payload is a guest in another
+// process, so its registry must not depend on dynamic initialisation or on the
+// heap working the same way there.
+constexpr int kMaxHooks = 64;
+constexpr int kMaxPlan = 16;      // instructions in one stolen prologue
 
 // One page-sized block per hook: stub at 0, indirect slot at 32, trampoline at
 // 64. Everything the hook needs sits in a single allocation near the target.
@@ -87,9 +91,21 @@ struct HookCtx {
     volatile LONG calls = 0;
 };
 
-std::mutex            g_lock;
-std::vector<HookCtx*> g_hooks;
+// A plain SRW lock, not std::mutex: the payload runs inside a foreign process
+// that may already have loaded its own (older) MSVCP140, and the C++ mutex
+// then faults inside that DLL's _Mtx_lock. SRWLOCK lives in kernel32, needs no
+// constructor, and is zero-initialised by the loader.
+SRWLOCK               g_lock = SRWLOCK_INIT;
+HookCtx*              g_hooks[kMaxHooks];
+int                   g_hookCount = 0;
 uint32_t              g_nextId = 1;
+
+struct LockGuard {
+    LockGuard() { AcquireSRWLockExclusive(&g_lock); }
+    ~LockGuard() { ReleaseSRWLockExclusive(&g_lock); }
+    LockGuard(const LockGuard&) = delete;
+    LockGuard& operator=(const LockGuard&) = delete;
+};
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -169,7 +185,17 @@ public:
                         return false;
                     }
                 }
-                handles_.push_back(h);
+                if (count_ >= kMaxThreads) {
+                    // More threads than we can track: put this one back and fail
+                    // rather than patch with a thread left suspended.
+                    ResumeThread(h);
+                    CloseHandle(h);
+                    CloseHandle(snap);
+                    ResumeAll();
+                    error = "too many threads to suspend safely";
+                    return false;
+                }
+                handles_[count_++] = h;
             } while (Thread32Next(snap, &te));
         }
         CloseHandle(snap);
@@ -177,15 +203,19 @@ public:
     }
 
     void ResumeAll() {
-        for (HANDLE h : handles_) {
-            ResumeThread(h);
-            CloseHandle(h);
+        for (int i = 0; i < count_; ++i) {
+            ResumeThread(handles_[i]);
+            CloseHandle(handles_[i]);
         }
-        handles_.clear();
+        count_ = 0;
     }
 
 private:
-    std::vector<HANDLE> handles_;
+    // A fixed array, not std::vector: push_back would allocate while the other
+    // threads are already suspended, and one of them may hold the heap lock.
+    static constexpr int kMaxThreads = 1024;
+    HANDLE handles_[kMaxThreads] = {};
+    int    count_ = 0;
 };
 
 // Nothing inside this window may allocate or log: the other threads are paused,
@@ -349,6 +379,7 @@ void HookInstallFaultLogger() {
 
 uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
     if (!target) { error = "null target"; return 0; }
+    if (g_hookCount >= kMaxHooks) { error = "hook limit reached"; return 0; }
 
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery((void*)target, &mbi, sizeof(mbi))) { error = "VirtualQuery failed"; return 0; }
@@ -369,10 +400,14 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
     };
 
     uint8_t original[kMaxStolen + 8] = {};
-    std::vector<PlanInsn> plan;
+    PlanInsn plan[kMaxPlan] = {};
+    int planCount = 0;
     size_t stolen = 0;
     while (stolen < kPatchLen) {
-        if (stolen + 16 > sizeof(original)) { error = "prologue is too long"; return 0; }
+        if (stolen + 16 > sizeof(original) || planCount >= kMaxPlan) {
+            error = "prologue is too long";
+            return 0;
+        }
         CopyInsn ci = DecodeForCopy(target + stolen, sizeof(void*) == 8);
         if (!ci.size) {
             char b[128];
@@ -410,7 +445,7 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
         if (ci.isBranch && ci.immSize == 1) {
             newSize = ci.text.compare(0, 3, "jmp") == 0 ? 5 : 6;   // E9 rel32 / 0F 8x rel32
         }
-        plan.push_back({stolen, ci.size, 0, newSize, ci});
+        plan[planCount++] = {stolen, ci.size, 0, newSize, ci};
         stolen += ci.size;
     }
     memcpy(original, (const void*)target, stolen);
@@ -418,9 +453,9 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
     // Lay the trampoline out first: widening an instruction shifts everything
     // that follows it, so no displacement can be computed before this pass.
     size_t trampLen = 0;
-    for (PlanInsn& p : plan) {
-        p.newOffset = trampLen;
-        trampLen += p.newSize;
+    for (int i = 0; i < planCount; ++i) {
+        plan[i].newOffset = trampLen;
+        trampLen += plan[i].newSize;
     }
 
     HookCtx* ctx = new (std::nothrow) HookCtx();
@@ -455,7 +490,8 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
     };
 
     const int32_t ripDelta = (int32_t)((intptr_t)target - (intptr_t)tramp);
-    for (const PlanInsn& p : plan) {
+    for (int i = 0; i < planCount; ++i) {
+        const PlanInsn& p = plan[i];
         const uint8_t* src = original + p.origOffset;
         uint8_t* dst = tramp + p.newOffset;
         const uintptr_t dstAddr = (uintptr_t)dst;
@@ -467,8 +503,8 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
             if (tgt >= target && tgt < target + stolen) {
                 const size_t off = (size_t)(tgt - target);
                 const PlanInsn* moved = nullptr;
-                for (const PlanInsn& q : plan) {
-                    if (q.origOffset == off) { moved = &q; break; }
+                for (int k = 0; k < planCount; ++k) {
+                    if (plan[k].origOffset == off) { moved = &plan[k]; break; }
                 }
                 if (!moved) {
                     return fail("prologue branch lands inside another instruction (" + p.ci.text + ")");
@@ -539,10 +575,12 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
         sus.ResumeAll();
     }
 
-    std::lock_guard<std::mutex> guard(g_lock);
-    ctx->id = g_nextId++;
-    ctx->active = true;
-    g_hooks.push_back(ctx);
+    {
+        LockGuard guard;
+        ctx->id = g_nextId++;
+        ctx->active = true;
+        g_hooks[g_hookCount++] = ctx;
+    }
 
     LogLine("hook %u installed: %p -> stub %p trampoline %p stolen %zu",
             ctx->id, (void*)target, (void*)ctx->stub, ctx->trampoline, stolen);
@@ -552,11 +590,11 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
 bool HookRemove(uint32_t id) {
     HookCtx* ctx = nullptr;
     {
-        std::lock_guard<std::mutex> guard(g_lock);
-        for (size_t i = 0; i < g_hooks.size(); ++i) {
+        LockGuard guard;
+        for (int i = 0; i < g_hookCount; ++i) {
             if (g_hooks[i]->id == id) {
                 ctx = g_hooks[i];
-                g_hooks.erase(g_hooks.begin() + (ptrdiff_t)i);
+                g_hooks[i] = g_hooks[--g_hookCount];
                 break;
             }
         }
@@ -581,14 +619,15 @@ bool HookRemove(uint32_t id) {
 }
 
 size_t HookRemoveAll() {
-    std::vector<uint32_t> ids;
+    uint32_t ids[kMaxHooks];
+    int n = 0;
     {
-        std::lock_guard<std::mutex> guard(g_lock);
-        for (HookCtx* c : g_hooks) ids.push_back(c->id);
+        LockGuard guard;
+        for (int i = 0; i < g_hookCount; ++i) ids[n++] = g_hooks[i]->id;
     }
-    size_t n = 0;
-    for (uint32_t id : ids) if (HookRemove(id)) ++n;
-    return n;
+    size_t removed = 0;
+    for (int i = 0; i < n; ++i) if (HookRemove(ids[i])) ++removed;
+    return removed;
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +658,39 @@ bool ResolveHookTarget(const std::wstring& spec, uintptr_t& addr, std::string& e
             for (auto& c : have) c = (char)tolower((unsigned char)c);
             if (have == want) { addr = m.base + e.rva; return true; }
         }
+
+        // Third pass: substring. MSVC-mangled engine names are unreadable, so
+        // `core83.dll!findMethod` is the practical way to name a function. An
+        // ambiguous substring is reported with its candidates instead of being
+        // guessed at -- hooking the wrong overload would be silent.
+        const PeExport* hits[8] = {};
+        int hitCount = 0;
+        int total = 0;
+        for (const PeExport& e : img.exports) {
+            std::string have = e.name;
+            for (auto& c : have) c = (char)tolower((unsigned char)c);
+            if (have.find(want) == std::string::npos) continue;
+            ++total;
+            if (hitCount < 8) hits[hitCount++] = &e;
+        }
+        if (total == 1) {
+            addr = m.base + hits[0]->rva;
+            return true;
+        }
+        if (total > 1) {
+            std::string list;
+            for (int i = 0; i < hitCount; ++i) {
+                char b[48];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "0x%X", hits[i]->rva);
+                if (i) list += ", ";
+                list += hits[i]->name + std::string(" (") + b + ")";
+            }
+            if (total > hitCount) list += ", ...";
+            error = "export name is ambiguous (" + std::to_string(total) +
+                    " matches): " + list + "; use module+0xRVA to pick one";
+            return false;
+        }
+
         error = "export not found: " + Narrow(sym) + " in " + Narrow(mod);
         return false;
     }
@@ -675,8 +747,9 @@ std::string HookCommandToJson(const std::wstring& args) {
     std::string j = "{\"status\":\"ok\",\"id\":" + std::to_string(id) +
                     ",\"target\":\"" + HexStr(addr) + "\",\"name\":\"" + label + "\"";
     {
-        std::lock_guard<std::mutex> guard(g_lock);
-        for (HookCtx* c : g_hooks) {
+        LockGuard guard;
+        for (int i = 0; i < g_hookCount; ++i) {
+            HookCtx* c = g_hooks[i];
             if (c->id != id) continue;
             j += ",\"stolen\":" + std::to_string(c->stolen);
             j += ",\"stub\":\"" + HexStr(c->stub) + "\"";
@@ -713,10 +786,11 @@ std::string UnhookCommandToJson(const std::wstring& args) {
 }
 
 std::string HooksCommandToJson(const std::wstring&) {
-    std::lock_guard<std::mutex> guard(g_lock);
-    std::string j = "{\"status\":\"ok\",\"count\":" + std::to_string(g_hooks.size()) + ",\"hooks\":[";
+    LockGuard guard;
+    std::string j = "{\"status\":\"ok\",\"count\":" + std::to_string(g_hookCount) + ",\"hooks\":[";
     bool first = true;
-    for (HookCtx* c : g_hooks) {
+    for (int i = 0; i < g_hookCount; ++i) {
+        HookCtx* c = g_hooks[i];
         if (!first) j += ",";
         first = false;
         j += "{\"id\":" + std::to_string(c->id);
