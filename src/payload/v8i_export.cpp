@@ -64,6 +64,42 @@ std::string EscapeW(const std::wstring& w) {
     return out;
 }
 
+// Reads a NUL-terminated UTF-16 string at an address inside this process,
+// bounded. Used to decode paths/names captured in trace args.
+std::string StrToJson(const std::wstring& args) {
+    uintptr_t addr = 0;
+    int max = 256;
+    {
+        wchar_t token[64] = {};
+        int want = 256;
+        if (swscanf_s(args.c_str(), L"%63ls %d", token, (unsigned)_countof(token), &want) < 1) {
+            return "{\"status\":\"error\",\"message\":\"usage: str <hex-addr> [max-chars]\"}";
+        }
+        addr = (uintptr_t)_wcstoui64(token, nullptr, 16);
+        max = want;
+    }
+    if (max <= 0) max = 256;
+    if (max > 8192) max = 8192;
+
+    if (!IsReadable((const void*)addr, 2)) {
+        return "{\"status\":\"error\",\"message\":\"unreadable address\"}";
+    }
+    std::wstring w;
+    w.reserve(max);
+    for (int i = 0; i < max; ++i) {
+        if (!IsReadable((const void*)(addr + (size_t)i * 2), 2)) break;
+        wchar_t ch = *(const wchar_t*)(addr + (size_t)i * 2);
+        if (ch == 0) break;
+        if (ch == 0xFFFE || ch == 0xFFFF) break;  // not really a string
+        w.push_back(ch);
+    }
+    char head[160];
+    _snprintf_s(head, sizeof(head), _TRUNCATE,
+                "{\"status\":\"ok\",\"address\":\"0x%llX\",\"chars\":%d,\"value\":\"",
+                (unsigned long long)addr, (int)w.size());
+    return head + EscapeW(w) + "\"}";
+}
+
 // Reads raw bytes at an address inside this process. Read-only: nothing is
 // executed and no pointers are followed beyond classifying the first qword.
 std::string PeekToJson(const std::wstring& args) {
@@ -1304,6 +1340,12 @@ static int RunPayload(const wchar_t* sharedName) {
                                 std::wstring(g_io->request).size() > 5
                                     ? std::wstring(g_io->request).substr(5)
                                     : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"str ", 4) == 0) {
+            PutResponse(Guarded(L"str", StrToJson,
+                                std::wstring(g_io->request).substr(4)));
             continue;
         }
 
