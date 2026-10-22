@@ -58,6 +58,7 @@ add_library(v8i_payload SHARED
     src/payload/dllmain.cpp
     src/payload/disasm.cpp
     src/payload/hook.cpp
+    src/payload/menu.cpp
     src/payload/memscan.cpp
     src/payload/objects.cpp
     src/payload/v8i_export.cpp

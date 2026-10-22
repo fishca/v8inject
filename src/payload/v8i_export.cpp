@@ -1,6 +1,7 @@
 #include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
 #include "v8inject/hook.h"
+#include "v8inject/menu.h"
 #include "v8inject/objects.h"
 #include "v8inject/disasm.h"
 #include "v8inject/memscan.h"
@@ -1293,6 +1294,23 @@ static int RunPayload(const wchar_t* sharedName) {
             PutResponse(Guarded(L"trace", TraceCommandToJson,
                                 std::wstring(g_io->request).size() > 6
                                     ? std::wstring(g_io->request).substr(6)
+                                    : std::wstring()));
+            continue;
+        }
+
+        if (wcscmp(g_io->request, L"menu") == 0 ||
+            wcsncmp(g_io->request, L"menu ", 5) == 0) {
+            PutResponse(Guarded(L"menu", MenuCommandToJson,
+                                std::wstring(g_io->request).size() > 5
+                                    ? std::wstring(g_io->request).substr(5)
+                                    : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"menucmd", 7) == 0) {
+            PutResponse(Guarded(L"menucmd", MenuCmdToJson,
+                                std::wstring(g_io->request).size() > 8
+                                    ? std::wstring(g_io->request).substr(8)
                                     : std::wstring()));
             continue;
         }
