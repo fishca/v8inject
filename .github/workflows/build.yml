@@ -84,7 +84,14 @@ jobs:
             $keep = @()
             $keep += $short | Where-Object { $_ -match 'FAIL' }
             $keep += $short | Where-Object { $_ -match 'target pid|LINE:|scan failed|"id":|"status":"error"|installed|no records' }
-            $keep | Select-Object -Unique | Select-Object -First 10 |
+            $last = @()
+            # The payload logs every request byte-for-byte as it sees it -- that
+            # shows whether the malformed command is a host or a payload problem.
+            $log = "build/${{ matrix.arch }}/bin/${{ matrix.arch }}/v8inject.log"
+            if (Test-Path $log) {
+              $last += Get-Content $log -Tail 14
+            }
+            ($keep + $last) | Select-Object -Unique | Select-Object -First 14 |
               ForEach-Object { Write-Host "::error::$_" }
             exit 1
           }
