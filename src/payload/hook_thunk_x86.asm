@@ -44,4 +44,10 @@ _V8iThunkX86 PROC
     jmp  edx
 _V8iThunkX86 ENDP
 
+; The linker builds x86 images with /SAFESEH, and an object without an .sxdata
+; entry makes that fatal (LNK2026 -> LNK1281). This thunk never registers itself
+; as an exception handler, but listing it tells the linker the code is accounted
+; for, which is what SAFESEH actually checks.
+.safeseh _V8iThunkX86
+
 END

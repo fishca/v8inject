@@ -11,8 +11,12 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Fail($msg) {
-    Write-Host "FAIL: $msg"
-    if ($script:proc -and -not $script:proc.HasExited) { Stop-Process -Id $script:proc.Id -Force }
+    # Annotations are single-line, so the whole transcript is flattened: the
+    # cause of a CI failure has to fit in one line to be readable at all.
+    $flat = ($msg -replace "`r?`n", " | ")
+    if ($flat.Length -gt 1200) { $flat = $flat.Substring(0, 1200) + " ..." }
+    Write-Host "FAIL: $flat"
+    Get-Process -Name 'v8i_hook_target' -ErrorAction SilentlyContinue | Stop-Process -Force
     exit 1
 }
 
@@ -47,6 +51,15 @@ for ($i = 0; $i -lt 100 -and -not $tick; $i++) {
 }
 if (-not $tick) { Fail "target did not report its function addresses" }
 Write-Host "target pid=$($script:proc.Id) tick=$tick branchy=$branchy tail=$tailAddr stub=$stubAddr"
+
+# An empty address would turn "hook $addr" into a bare "hook", which the payload
+# rejects as an unknown command -- name the missing one instead.
+foreach ($pair in @(@('tick', $tick), @('branchy', $branchy),
+                    @('tail', $tailAddr), @('stub', $stubAddr))) {
+    if (-not $pair[1]) {
+        Fail ("target line has no " + $pair[0] + " address: " + $text)
+    }
+}
 
 # The whole scenario runs inside one attach session: hooks persist there, and
 # `sleep` is handled by the host between commands. A hook installed by a

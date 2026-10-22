@@ -64,6 +64,9 @@ add_library(v8i_payload SHARED
 )
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     target_sources(v8i_payload PRIVATE src/payload/hook_thunk_x86.asm)
+    # ml.exe only emits the .sxdata entry for `.safeseh` when /safeseh is passed,
+    # and without it the x86 link with /SAFESEH fails (LNK2026 -> LNK1281).
+    target_compile_options(v8i_payload PRIVATE $<$<COMPILE_LANGUAGE:ASM_MASM>:/safeseh>)
 else()
     target_sources(v8i_payload PRIVATE src/payload/hook_thunk_x64.asm)
 endif()

@@ -76,7 +76,7 @@ jobs:
           $out = ctest --test-dir build/${{ matrix.arch }} -C Release --output-on-failure 2>&1 | Out-String
           Write-Host $out
           if ($LASTEXITCODE -ne 0) {
-            ($out -split "`r?`n" | Where-Object { $_ -match 'FAIL|Failed|error|Test #' } | Select-Object -First 12) |
+            ($out -split "`r?`n" | Where-Object { $_ -match 'FAIL|Failed|error|status|Test #' } | Select-Object -First 20) |
               ForEach-Object { Write-Host "::error::$_" }
             exit 1
           }
