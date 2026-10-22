@@ -73,7 +73,7 @@ else()
     target_sources(v8i_payload PRIVATE src/payload/hook_thunk_x64.asm)
 endif()
 target_compile_definitions(v8i_payload PRIVATE V8I_PAYLOAD_EXPORTS)
-target_link_libraries(v8i_payload PRIVATE v8i_common capstone)
+target_link_libraries(v8i_payload PRIVATE v8i_common capstone comctl32)
 set_target_properties(v8i_payload PROPERTIES
     OUTPUT_NAME "v8i_payload"
     PREFIX ""
