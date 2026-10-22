@@ -1041,6 +1041,310 @@ std::string ObjectsToJson(const std::wstring& /*unused*/) {
     return j;
 }
 
+// "cmd <num> [sub]" — invoke a designer command of the Config group
+// {F10CBB81-F679-11D4-9DD3-0050BAE2BC79} on the main frame, exactly like
+// Snegopat's sendCommand. Calibrated chain on 8.3.27.1989 (x64):
+//   frame object (heap) -> [0] = ITopLevelFrame vtable (config.dll+0x2EFB50)
+//   frame+8             -> coreMainFrame; ICommandReceiver = core - 0x20
+//   recv->vtbl[3]       -> transmitCommand(Command*, bool)
+// The transmit runs on the 1C UI thread via a frame-window subclass +
+// PostMessage (see EnsureCmdUi); 1C UI code must not be called cross-thread.
+// The frame is located by scanning committed writable memory for the vtable
+// pointer; the result is cached and re-validated for subsequent calls.
+namespace {
+uintptr_t g_cmdFrameCache = 0;
+}
+
+// SEH cannot live in a function that needs C++ unwinding (MSVC C2712); the
+// transmit call is isolated in a POD-only helper.
+typedef int(__fastcall* V8iTransmitFn)(void*, const void*, uint8_t);
+typedef void(__fastcall* V8iRecvFn)(void*, void**);
+
+namespace {
+LONG g_cmdLastExc = 0;
+int TransmitGuarded(void* trFn, void* recv, const void* cmd) {
+    int rc = 0;
+    __try {
+        rc = ((V8iTransmitFn)trFn)(recv, cmd, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_cmdLastExc = GetExceptionCode();
+        return -1;
+    }
+    return rc;
+}
+}  // namespace
+
+// Command { CommandID id; int param; void* object; }, CommandID { Guid; uint }
+// (x64 layout: 16 + 4 + 4 + 8 = 32 bytes)
+struct __declspec(align(8)) V8Cmd {
+    unsigned char group[16];
+    unsigned int cmdNum;
+    int param;
+    void* object;
+};
+static const unsigned char kConfigGroup[16] = {
+    0x81, 0xBB, 0x0C, 0xF1, 0x79, 0xF6, 0xD4, 0x11,
+    0x9D, 0xD3, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79};
+
+// Designer commands must run on the 1C UI thread. The payload subclasses the
+// frame window once; a posting thread fills the pending slot and posts a
+// custom message, the UI thread's WndProc executes transmitCommand and flips
+// the done flag. Pod-only state; no calls from the io thread into 1C UI.
+namespace {
+const UINT kV8iCmdMsg = WM_APP + 0x2F11;
+struct V8iPending {
+    void* recv;
+    void* trFn;
+    V8Cmd cmd;
+    volatile LONG done;
+    int rc;
+    LONG exc;
+};
+V8iPending g_pending = {};
+HWND g_cmdHwnd = NULL;
+bool g_cmdSubclassed = false;
+bool g_cmdViaSubclass = false;
+LONG_PTR g_cmdOldWndProc = 0;
+
+typedef LRESULT(CALLBACK* V8iSubclassProc)(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
+                                UINT_PTR id, DWORD_PTR data) {
+    if (m == kV8iCmdMsg) {
+        V8iPending* p = (V8iPending*)data;
+        p->rc = TransmitGuarded(p->trFn, p->recv, &p->cmd);
+        if (p->rc < 0) p->exc = g_cmdLastExc;
+        InterlockedExchange(&p->done, 1);
+        return 0;
+    }
+    typedef LRESULT(WINAPI* V8iDefSubclassProcFn)(HWND, UINT, WPARAM, LPARAM);
+    static V8iDefSubclassProcFn defFn = []() -> V8iDefSubclassProcFn {
+        HMODULE ctl = GetModuleHandleW(L"comctl32.dll");
+        return ctl ? (V8iDefSubclassProcFn)GetProcAddress(ctl, "DefSubclassProc") : nullptr;
+    }();
+    return defFn ? defFn(h, m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+LRESULT CALLBACK V8iCmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == kV8iCmdMsg) {
+        g_pending.rc = TransmitGuarded(g_pending.trFn, g_pending.recv, &g_pending.cmd);
+        if (g_pending.rc < 0) g_pending.exc = g_cmdLastExc;
+        InterlockedExchange(&g_pending.done, 1);
+        return 0;
+    }
+    return CallWindowProcW((WNDPROC)g_cmdOldWndProc, h, m, w, l);
+}
+
+bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
+    // 1C recreates its top-level windows (toolbar/title changes) and can drop a
+    // replaced WndProc; re-verify and re-install on every call unless the
+    // comctl32 subclass chain is our installation.
+    if (g_cmdSubclassed && g_cmdHwnd && IsWindow(g_cmdHwnd)) {
+        if (!g_cmdViaSubclass) {
+            // Re-assert our WndProc right before every send: 1C re-creates its
+            // toolbar/UI and re-sets the frame WndProc while a config opens.
+            LONG_PTR old = SetWindowLongPtrW(g_cmdHwnd, GWLP_WNDPROC, (LONG_PTR)V8iCmdWndProc);
+            if (!old) return false;
+            if (old != (LONG_PTR)V8iCmdWndProc) g_cmdOldWndProc = old;
+            *outPath = "wndproc";
+        } else {
+            *outPath = "subclass";
+        }
+        *outHwnd = g_cmdHwnd;
+        return true;
+    }
+    std::vector<WindowEntry> wins = EnumProcessWindows();
+    HWND frame = nullptr;
+    for (const WindowEntry& w : wins)
+        if (w.cls == L"V8TopLevelFrame") { frame = w.hwnd; break; }
+    if (!frame) { *outErr = 0xFFFFFF01; return false; }
+
+    // Preferred: comctl32 SetWindowSubclass (chains cleanly with 1C's own).
+    HMODULE ctl = GetModuleHandleW(L"comctl32.dll");
+    if (ctl) {
+        typedef BOOL(WINAPI* V8iSetWindowSubclassFn)(HWND, V8iSubclassProc, UINT_PTR, DWORD_PTR);
+        V8iSetWindowSubclassFn setFn =
+            (V8iSetWindowSubclassFn)GetProcAddress(ctl, "SetWindowSubclass");
+        if (setFn && setFn(frame, V8iCmdSubclass, 1, (DWORD_PTR)&g_pending)) {
+            g_cmdHwnd = frame;
+            g_cmdSubclassed = true;
+            g_cmdViaSubclass = true;
+            *outHwnd = frame;
+            *outPath = "subclass";
+            return true;
+        }
+    }
+
+    // Fallback: classic WndProc replacement, chaining via CallWindowProcW.
+    LONG_PTR old = SetWindowLongPtrW(frame, GWLP_WNDPROC, (LONG_PTR)V8iCmdWndProc);
+    if (!old || old == (LONG_PTR)V8iCmdWndProc) {
+        *outErr = GetLastError();
+        return false;
+    }
+    g_cmdOldWndProc = old;
+    g_cmdHwnd = frame;
+    g_cmdSubclassed = true;
+    g_cmdViaSubclass = false;
+    *outHwnd = frame;
+    *outPath = "wndproc";
+    return true;
+}
+}  // namespace
+
+static std::string CmdCommandToJson(const std::wstring& args) {
+    unsigned int num = 0;
+    int sub = 0;
+    if (swscanf_s(args.c_str(), L"%u %d", &num, &sub) < 1)
+        return "{\"status\":\"error\",\"message\":\"usage: cmd <num> [sub]\"}";
+
+    ModuleRange cfg;
+    if (!FindModule(L"config.dll", cfg))
+        return "{\"status\":\"error\",\"message\":\"config.dll not loaded\"}";
+
+#if defined(_WIN64)
+    const uintptr_t kFrameVtblRva = 0x2EFB50;   // ITopLevelFrame vtable, 8.3.27.1989 x64
+#else
+    const uintptr_t kFrameVtblRva = 0x11E8D8;   // placeholder; calibrate against x64 layout
+#endif
+    const uintptr_t kCoreOffset = sizeof(void*);
+    const int kTransmitSlot = 3;
+    const uintptr_t kRecvBackOffset = 0x20;   // ICommandReceiver sits 0x20 before coreMainFrame
+
+    uintptr_t vtblPtr = cfg.base + kFrameVtblRva;
+    if (kFrameVtblRva == 0)
+        return "{\"status\":\"error\",\"message\":\"frame vtable not calibrated for this build\"}";
+
+    char numBuf[256];
+    std::string j = "{\"status\":\"ok\"";
+    _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"num\":%u,\"sub\":%d,\"vtbl\":\"0x%llX\"",
+                num, sub, (unsigned long long)vtblPtr);
+    j += numBuf;
+
+    uintptr_t frame = g_cmdFrameCache;
+    bool cached = false;
+    std::vector<uintptr_t> candidates;
+    if (frame && IsReadable((void*)frame, sizeof(void*)) &&
+        *(uintptr_t*)frame == vtblPtr) {
+        cached = true;
+        candidates.push_back(frame);
+    } else {
+        frame = 0;
+        // Walk the address space, skip module images, and look for heap objects
+        // whose first word is the ITopLevelFrame vtable. Both the shell frame and
+        // the core frame share this vtable; any of them routes to the receiver.
+        std::vector<ModuleRange> mods;
+        for (const ModuleRange& m : EnumModules()) mods.push_back(m);
+        auto insideModule = [&mods](uintptr_t a) {
+            for (const ModuleRange& m : mods)
+                if (a >= m.base && a < m.base + m.size) return true;
+            return false;
+        };
+        uintptr_t addr = 0x10000;
+        uint64_t scanned = 0;
+        while (addr < 0x00007FFFFFFFFFFFULL) {
+            MEMORY_BASIC_INFORMATION mi = {};
+            if (VirtualQuery((void*)addr, &mi, sizeof(mi)) == 0) break;
+            uintptr_t end = addr + mi.RegionSize;
+            bool usable = mi.State == MEM_COMMIT &&
+                          (mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) &&
+                          !(mi.Protect & PAGE_GUARD) && !insideModule((uintptr_t)mi.BaseAddress);
+            if (usable) {
+                const uintptr_t cap = mi.RegionSize > 64 * 1024 * 1024
+                                          ? 64 * 1024 * 1024 : (uintptr_t)mi.RegionSize;
+                for (uintptr_t p = (uintptr_t)mi.BaseAddress; p < (uintptr_t)mi.BaseAddress + cap;
+                     p += sizeof(void*)) {
+                    ++scanned;
+                    if (*(uintptr_t*)p == vtblPtr) {
+                        uintptr_t core = *(uintptr_t*)(p + kCoreOffset);
+                        if (IsReadable((void*)core, sizeof(void*)) &&
+                            IsReadable((void*)*(uintptr_t*)core, 32 * sizeof(void*))) {
+                            candidates.push_back(p);
+                            if (candidates.size() >= 16) break;
+                        }
+                    }
+                }
+            }
+            if (candidates.size() >= 16) break;
+            addr = end == addr ? addr + sizeof(void*) : end;
+        }
+        _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"scan\":{\"cached\":%s,\"scanned\":%llu,\"candidates\":%zu}",
+                    cached ? "true" : "false", (unsigned long long)scanned, candidates.size());
+        j += numBuf;
+    }
+
+    void* recv = nullptr;
+    void* trFn = nullptr;
+    uintptr_t usedFrame = 0;
+    // For each candidate the receiver is a fixed distance before coreMainFrame
+    // (frame+ptrSize), so no vtable calls are needed to obtain it.
+    for (uintptr_t cand : candidates) {
+        uintptr_t core = *(uintptr_t*)(cand + kCoreOffset);
+        if (!IsReadable((void*)core, sizeof(void*))) continue;
+        uintptr_t candRecv = core - kRecvBackOffset;
+        if (!IsReadable((void*)candRecv, sizeof(void*))) continue;
+        uintptr_t recvVt = *(uintptr_t*)candRecv;
+        if (!IsReadable((void*)(recvVt + 4 * sizeof(void*)), sizeof(void*))) continue;
+        void* candTr = ((void**)recvVt)[kTransmitSlot];
+        if (!IsReadable(candTr, 1)) continue;
+        usedFrame = cand;
+        recv = (void*)candRecv;
+        trFn = candTr;
+        frame = cand;
+        break;
+    }
+
+    if (!trFn)
+        return j + ",\"error\":\"no working receiver chain\"}";
+
+    _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"frame\":\"0x%llX\",\"recv\":\"0x%llX\"",
+                (unsigned long long)usedFrame, (unsigned long long)(uintptr_t)recv);
+    j += numBuf;
+
+    // Marshal onto the 1C UI thread: fill the pending slot, post a message to
+    // the frame window; its WndProc (our subclass) runs on the UI thread and
+    // executes transmitCommand there.
+    HWND cmdHwnd = nullptr;
+    DWORD ensureErr = 0;
+    const char* marshalPath = "";
+    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) {
+        _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE,
+                    ",\"error\":\"marshaling setup failed\",\"code\":\"0x%X\"", (unsigned)ensureErr);
+        return j + numBuf + "}";
+    }
+    j += std::string(",\"marshal\":\"") + marshalPath + "\"";
+
+    g_pending.recv = recv;
+    g_pending.trFn = trFn;
+    memcpy(g_pending.cmd.group, kConfigGroup, 16);
+    g_pending.cmd.cmdNum = num;
+    g_pending.cmd.param = sub;
+    g_pending.cmd.object = nullptr;
+    g_pending.rc = -2;
+    g_pending.exc = 0;
+    InterlockedExchange(&g_pending.done, 0);
+
+    // Synchronous cross-thread dispatch: blocks until the UI thread's WndProc
+    // runs (SMTO_BLOCK) or the target is hung (capped by the timeout).
+    DWORD_PTR smRes = 0;
+    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes)) {
+        _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE,
+                    ",\"error\":\"UI thread did not answer (0x%X)\"", (unsigned)GetLastError());
+        return j + numBuf + "}";
+    }
+    if (!g_pending.done)
+        return j + ",\"error\":\"timeout waiting for UI thread\"}";
+
+    int rc = g_pending.rc;
+    if (rc < 0) {
+        _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"error\":\"transmit exception 0x%X\"",
+                    (unsigned)g_pending.exc);
+        return j + numBuf + "}";
+    }
+    _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"sent\":true,\"rc\":%d", rc);
+    j += numBuf;
+    return j + "}";
+}
+
 void PutResponse(const std::string& json) {
     if (!g_io) return;
     size_t n = json.size();
@@ -1303,6 +1607,13 @@ static int RunPayload(const wchar_t* sharedName) {
         if (wcscmp(g_io->request, L"objects") == 0) {
             LogLine("objects: enumerating windows");
             PutResponse(Guarded(L"objects", ObjectsToJson, std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"cmd ", 4) == 0) {
+            LogLine("cmd: invoking designer command");
+            PutResponse(Guarded(L"cmd", CmdCommandToJson, std::wstring(g_io->request).substr(4)));
+            LogLine("cmd: done");
             continue;
         }
 
