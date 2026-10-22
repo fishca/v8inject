@@ -37,7 +37,17 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build/${{ matrix.arch }} --config Release --parallel
+        shell: pwsh
+        run: |
+          $out = cmake --build build/${{ matrix.arch }} --config Release --parallel 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) {
+            # Logs need a GitHub login; annotations are visible without one, so
+            # the compiler errors are re-emitted here.
+            ($out -split "`r?`n" | Where-Object { $_ -match 'error|fatal' } | Select-Object -First 10) |
+              ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
 
       - name: Verify artifacts
         shell: pwsh
@@ -61,7 +71,15 @@ jobs:
       # v8i_hook_target.exe, hooks a function with known arguments and checks the
       # recorded call.
       - name: Run tests
-        run: ctest --test-dir build/${{ matrix.arch }} -C Release --output-on-failure
+        shell: pwsh
+        run: |
+          $out = ctest --test-dir build/${{ matrix.arch }} -C Release --output-on-failure 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) {
+            ($out -split "`r?`n" | Where-Object { $_ -match 'FAIL|Failed|error|Test #' } | Select-Object -First 12) |
+              ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
