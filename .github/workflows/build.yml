@@ -90,7 +90,9 @@ jobs:
             # These lines go FIRST: GitHub caps a step at ten annotations.
             $log = "build/${{ matrix.arch }}/bin/${{ matrix.arch }}/v8inject.log"
             if (Test-Path $log) {
-              $last += Get-Content $log -Tail 10
+              $last += Get-Content $log |
+                Where-Object { $_ -match 'Call\(hook|command received|hook [0-9]+ installed|scan failed|unknown' } |
+                Select-Object -Last 8
             }
             $fail = $keep | Where-Object { $_ -match 'FAIL' } | Select-Object -Unique -First 2
             ($last + $fail) | Select-Object -Unique | Select-Object -First 12 |
