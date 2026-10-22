@@ -26,6 +26,8 @@ void PrintUsage() {
     wprintf(L"  v8inject find    <exe> <pattern> [--module <dll>] [--wide] [--max N]\n");
     wprintf(L"  v8inject disasm  <exe> [<hex-addr>] [--module <dll>]\n");
     wprintf(L"  v8inject imports <exe> <module> [filter]\n");
+    wprintf(L"  v8inject exports <exe> <module> [filter]\n");
+    wprintf(L"  v8inject mods    <exe> [filter] [--count N]\n");
     wprintf(L"  v8inject memmap  <exe> [--count N]\n");
     wprintf(L"  v8inject heapobjects <exe> [--module <dll>] [--count N]\n");
     wprintf(L"  v8inject findvalue <exe> <hex> [--count N] [--module <dll>]\n");
@@ -216,8 +218,8 @@ int wmain(int argc, wchar_t** argv) {
 
     // Reverse-engineering commands forwarded verbatim to the payload. Each needs
     // at least the target process; the payload enforces its own argument count.
-    if (cmd == L"disasm" || cmd == L"imports" || cmd == L"memmap" ||
-        cmd == L"heapobjects" || cmd == L"findvalue" || cmd == L"byhwnd" ||
+    if (cmd == L"disasm" || cmd == L"imports" || cmd == L"exports" || cmd == L"mods" ||
+        cmd == L"memmap" || cmd == L"heapobjects" || cmd == L"findvalue" || cmd == L"byhwnd" ||
         cmd == L"around" || cmd == L"xref") {
         if (argc < 3) { PrintUsage(); return 1; }
         if (cmd == L"imports" && argc < 4) { PrintUsage(); return 1; }

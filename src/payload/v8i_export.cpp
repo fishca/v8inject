@@ -491,7 +491,127 @@ std::string ImportsToJson(const std::wstring& args) {
     return j;
 }
 
-// xref --addr <target> [--module m] [--from a --to b] [--count N]
+// exports <module> [filter] — the module's export table, matched by name.
+// Used to locate engine entry points (autocomplete, editor, ...) by name.
+std::string ExportsToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    if (a.module.empty() && !a.positional.empty()) {
+        a.module = a.positional[0];
+        if (a.positional.size() > 1 && a.pattern.empty()) a.pattern = a.positional[1];
+    }
+    ModuleRange m;
+    PeImage img;
+    if (!ResolveModule(a.module, m, img)) {
+        return "{\"status\":\"error\",\"message\":\"module not found or not a PE\"}";
+    }
+
+    std::wstring want = a.pattern;
+    for (auto& c : want) c = (wchar_t)towlower(c);
+
+    size_t matched = 0;
+    if (!want.empty()) {
+        for (const PeExport& ex : img.exports) {
+            std::string hay = ex.name;
+            for (auto& c : hay) c = (char)tolower((unsigned char)c);
+            if (hay.find(std::string(want.begin(), want.end())) == std::string::npos) continue;
+            ++matched;
+        }
+    } else {
+        matched = img.exports.size();
+    }
+
+    const wchar_t* modLeaf = wcsrchr(m.path.c_str(), L'\\');
+    std::string j = "{\"status\":\"ok\",\"module\":\"" +
+                    EscapeW(modLeaf ? modLeaf + 1 : m.path) + "\",\"total\":" ;
+    char buf[512];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"matched\":%zu,\"exports\":[",
+                img.exports.size(), matched);
+    j += buf;
+
+    bool first = true;
+    size_t shown = 0;
+    for (const PeExport& ex : img.exports) {
+        if (!want.empty()) {
+            std::string hay = ex.name;
+            for (auto& c : hay) c = (char)tolower((unsigned char)c);
+            if (hay.find(std::string(want.begin(), want.end())) == std::string::npos) continue;
+        }
+        if (shown >= a.count) break;
+        if (!first) j += ",";
+        ++shown;
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"name\":\"%s\",\"rva\":\"0x%X\",\"addr\":\"0x%llX\",\"ordinal\":%u",
+                    ex.name.c_str(), ex.rva, (unsigned long long)(img.base + ex.rva),
+                    ex.ordinal);
+        j += buf;
+        if (ex.forwarded) {
+            j += ",\"forwarded\":true,\"forwarder\":\"";
+            j += ex.forwarder;
+            j += "\"";
+        }
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
+// mods [filter] — loaded modules, with base/size and the bitness-appropriate
+// PE machine. This is the first thing to ask when mapping the engine: it shows
+// every DLL 1C pulled in, so exports/imports/xref can be pointed at the right
+// one (1cv8core, frame, v8baseeditor, ...).
+std::string ModsToJson(const std::wstring& args) {
+    ReArgs a = ParseReArgs(args);
+    // Positional filter: `mods edit`, `mods 1cv8`. --pattern also accepted.
+    if (a.pattern.empty() && !a.positional.empty()) a.pattern = a.positional[0];
+
+    std::wstring want = a.pattern;
+    for (auto& c : want) c = (wchar_t)towlower(c);
+
+    std::vector<ModuleRange> all = EnumModules();
+
+    size_t matched = 0;
+    for (const ModuleRange& m : all) {
+        if (want.empty()) { ++matched; continue; }
+        const wchar_t* leaf = wcsrchr(m.path.c_str(), L'\\');
+        std::wstring leafW = leaf ? leaf + 1 : m.path;
+        std::wstring hay = leafW;
+        for (auto& c : hay) c = (wchar_t)towlower(c);
+        if (hay.find(want) != std::wstring::npos) ++matched;
+    }
+
+    char buf[512];
+    std::string j = "{\"status\":\"ok\",\"total\":";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%zu,\"matched\":%zu,\"modules\":[",
+                all.size(), matched);
+    j += buf;
+
+    bool first = true;
+    size_t shown = 0;
+    for (const ModuleRange& m : all) {
+        if (!want.empty()) {
+            const wchar_t* leaf = wcsrchr(m.path.c_str(), L'\\');
+            std::wstring leafW = leaf ? leaf + 1 : m.path;
+            std::wstring hay = leafW;
+            for (auto& c : hay) c = (wchar_t)towlower(c);
+            if (hay.find(want) == std::wstring::npos) continue;
+        }
+        if (shown >= a.count) break;
+        if (!first) j += ",";
+        ++shown;
+        first = false;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"base\":\"0x%X\",\"size\":\"0x%X\",\"name\":\"",
+                    (unsigned)(m.base & 0xFFFFFFFFul), (unsigned)m.size);
+        j += buf;
+        const wchar_t* leaf = wcsrchr(m.path.c_str(), L'\\');
+        j += EscapeW(leaf ? leaf + 1 : m.path);
+        j += "\"}";
+    }
+    j += "]}";
+    return j;
+}
+
 // Resolves the target through the IAT when it looks like an import slot.
 std::string XrefToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args);
@@ -1055,6 +1175,22 @@ static int RunPayload(const wchar_t* sharedName) {
         if (wcsncmp(g_io->request, L"imports", 7) == 0) {
             PutResponse(Guarded(L"imports", ImportsToJson, std::wstring(g_io->request).size() > 8
                                     ? std::wstring(g_io->request).substr(8)
+                                    : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"exports", 7) == 0) {
+            PutResponse(Guarded(L"exports", ExportsToJson,
+                                std::wstring(g_io->request).size() > 8
+                                    ? std::wstring(g_io->request).substr(8)
+                                    : std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"mods", 4) == 0) {
+            PutResponse(Guarded(L"mods", ModsToJson,
+                                std::wstring(g_io->request).size() > 5
+                                    ? std::wstring(g_io->request).substr(5)
                                     : std::wstring()));
             continue;
         }
