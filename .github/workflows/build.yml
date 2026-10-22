@@ -76,7 +76,15 @@ jobs:
           $out = ctest --test-dir build/${{ matrix.arch }} -C Release --output-on-failure 2>&1 | Out-String
           Write-Host $out
           if ($LASTEXITCODE -ne 0) {
-            ($out -split "`r?`n" | Where-Object { $_ -match 'FAIL|Failed|error|status|Test #' } | Select-Object -First 20) |
+            # Keep the transcript short: GitHub shows at most 10 annotations per
+            # step, and the trace reply is a single huge line. Short lines only,
+            # deduplicated (ctest prints the test output twice), FAIL first.
+            $lines = $out -split "`r?`n"
+            $short = $lines | Where-Object { $_.Length -le 400 }
+            $keep = @()
+            $keep += $short | Where-Object { $_ -match 'FAIL' }
+            $keep += $short | Where-Object { $_ -match 'target pid|LINE:|scan failed|"id":|"status":"error"|installed|no records' }
+            $keep | Select-Object -Unique | Select-Object -First 10 |
               ForEach-Object { Write-Host "::error::$_" }
             exit 1
           }

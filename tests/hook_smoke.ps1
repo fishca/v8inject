@@ -13,8 +13,9 @@ $ErrorActionPreference = 'Stop'
 function Fail($msg) {
     # Annotations are single-line, so the whole transcript is flattened: the
     # cause of a CI failure has to fit in one line to be readable at all.
+    # The end of the transcript (last replies, death note) is what matters.
     $flat = ($msg -replace "`r?`n", " | ")
-    if ($flat.Length -gt 1200) { $flat = $flat.Substring(0, 1200) + " ..." }
+    if ($flat.Length -gt 1200) { $flat = "..." + $flat.Substring($flat.Length - 1200) }
     Write-Host "FAIL: $flat"
     Get-Process -Name 'v8i_hook_target' -ErrorAction SilentlyContinue | Stop-Process -Force
     exit 1
@@ -50,6 +51,7 @@ for ($i = 0; $i -lt 100 -and -not $tick; $i++) {
     }
 }
 if (-not $tick) { Fail "target did not report its function addresses" }
+Write-Host "LINE: $text"
 Write-Host "target pid=$($script:proc.Id) tick=$tick branchy=$branchy tail=$tailAddr stub=$stubAddr"
 
 # An empty address would turn "hook $addr" into a bare "hook", which the payload
