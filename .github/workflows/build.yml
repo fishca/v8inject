@@ -91,8 +91,8 @@ jobs:
             $log = "build/${{ matrix.arch }}/bin/${{ matrix.arch }}/v8inject.log"
             if (Test-Path $log) {
               $last += Get-Content $log |
-                Where-Object { $_ -match 'Call\(hook|command received|hook [0-9]+ installed|scan failed|unknown' } |
-                Select-Object -Last 8
+                Where-Object { $_ -match 'command received: hook|Call\(hook|scan failed' } |
+                Select-Object -Last 9
             }
             $fail = $keep | Where-Object { $_ -match 'FAIL' } | Select-Object -Unique -First 2
             ($last + $fail) | Select-Object -Unique | Select-Object -First 12 |
