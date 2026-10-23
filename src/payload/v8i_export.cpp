@@ -1922,3 +1922,41 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* /*ignored*/) {
     return rc;
 }
 
+// ---------------------------------------------------------------------------
+// GitBar "Выгрузить" button: run the designer's own dump-to-files command
+// (cmd 45, preceded by cmd 2 when the configuration is not open yet). Runs on
+// a worker thread because transmitCommand blocks while the modal dialog is up.
+// ---------------------------------------------------------------------------
+// True when a designer dialog window is already up (the dump dialog is a
+// top-level V8NewLocalFrameBaseWnd).  cmd 45 is accepted (rc=1) even when the
+// configuration is closed, so the return code alone cannot confirm the dialog.
+static bool DumpDialogPresent() {
+    return FindWindowW(L"V8NewLocalFrameBaseWnd", nullptr) != nullptr;
+}
+
+static DWORD WINAPI V8iGitBarDumpThread(LPVOID) {
+    std::string r = CmdCommandToJson(L"45 0");
+    LogLine("gitbar: cmd 45 -> %s", r.c_str());
+    // "UI thread did not answer" means the modal dump dialog took over the UI
+    // thread — that IS the success case.
+    bool ok = r.find("did not answer") != std::string::npos;
+    if (!ok && r.find("\"rc\":1") != std::string::npos) {
+        Sleep(400);
+        ok = DumpDialogPresent();
+        LogLine("gitbar: dialog present=%d", ok ? 1 : 0);
+    }
+    if (!ok) {
+        // Configuration is not open: open it first, then dump.
+        std::string r2 = CmdCommandToJson(L"2 0");
+        LogLine("gitbar: cmd 2 -> %s", r2.c_str());
+        Sleep(800);
+        std::string r3 = CmdCommandToJson(L"45 0");
+        LogLine("gitbar: cmd 45 (after open) -> %s", r3.c_str());
+    }
+    return 0;
+}
+
+extern "C" __declspec(dllexport) void V8iGitBarDump() {
+    HANDLE h = CreateThread(nullptr, 0, V8iGitBarDumpThread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+}

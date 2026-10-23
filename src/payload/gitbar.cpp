@@ -5,6 +5,8 @@
 
 #include "v8inject/diag.h"
 
+extern "C" void V8iGitBarDump();  // v8i_export.cpp
+
 // Git toolbar ("GitBar") for the running 1C configurator.
 //
 // The designer's UI is fully custom-painted (no Win32 menus), so the git
@@ -380,7 +382,11 @@ void ShowSettings(HWND owner) {
 
 void DoAction(int id) {
     switch (id) {
-    case kWinIdDump: ShowTip(L"выгрузить: внутренняя точка выгрузки — реверс в работе"); break;
+    case kWinIdDump: {
+        ShowTip(L"выгрузка конфигурации в файлы…");
+        V8iGitBarDump();
+        break;
+    }
     case kWinIdCommit: RunCommit(); break;
     case kWinIdPush: RunPush(); break;
     case kWinIdSettings: ShowSettings(g_bar.hwnd); break;
@@ -492,7 +498,7 @@ DWORD WINAPI BarThread(LPVOID) {
                                     CW_USEDEFAULT, CW_USEDEFAULT, 0, 0,
                                     g_bar.hwnd, nullptr, hInst, nullptr);
     const wchar_t* texts[] = {
-        L"Выгрузить конфигурацию в файлы (реверс в работе)",
+        L"Выгрузить конфигурацию в файлы (1С сделает выгрузку сама)",
         L"Коммит изменений",
         L"Пуш в удалённый репозиторий",
         L"Настройки: git.exe и папка выгрузки",
