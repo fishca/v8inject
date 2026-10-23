@@ -394,29 +394,33 @@ void DoGitbarHide() {
 
 void DoGitbarSettings() {
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", L"GitBar — настройки",
-                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 430, 160, g_hwnd, nullptr,
+                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 460, 226, g_hwnd, nullptr,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) return;
 
     auto Lbl = [&](int y, const wchar_t* t) {
         CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        12, y, 130, 18, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
+                        12, y, 140, 18, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
     };
     auto Edt = [&](int y) {
         return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                               150, y, 260, 22, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
+                               158, y, 284, 22, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
     };
 
     HWND ed1 = Edt(14);
     HWND ed2 = Edt(44);
+    HWND ed3 = Edt(74);
+    HWND ed4 = Edt(104);
     Lbl(15, L"git.exe");
     Lbl(45, L"папка выгрузки");
+    Lbl(75, L"комментарий к коммиту");
+    Lbl(105, L"remote origin (не обяз.)");
     CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                    150, 84, 80, 26, dlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleW(nullptr), nullptr);
+                    158, 150, 90, 26, dlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleW(nullptr), nullptr);
     CreateWindowExW(0, L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    250, 84, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
+                    258, 150, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
 
     // Prefill: current values, or a sensible git default.
     std::wstring git = GitBarIniGet(L"gitpath");
@@ -426,28 +430,37 @@ void DoGitbarSettings() {
     }
     SetWindowTextW(ed1, git.c_str());
     SetWindowTextW(ed2, GitBarIniGet(L"dumpdir").c_str());
+    SetWindowTextW(ed3, GitBarIniGet(L"commitmsg").c_str());
+    SetWindowTextW(ed4, GitBarIniGet(L"remote").c_str());
 
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
-        if (msg.hwnd == dlg) {
+    for (;;) {
+        if (!GetMessageW(&msg, nullptr, 0, 0)) break;
+        if (!IsWindow(dlg)) break;
+        if (msg.hwnd == dlg || IsChild(dlg, msg.hwnd)) {
             if (msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDOK) {
-                wchar_t b1[1024] = {}, b2[1024] = {};
+                wchar_t b1[1024] = {}, b2[1024] = {}, b3[1024] = {}, b4[1024] = {};
                 GetWindowTextW(ed1, b1, 1024);
                 GetWindowTextW(ed2, b2, 1024);
+                GetWindowTextW(ed3, b3, 1024);
+                GetWindowTextW(ed4, b4, 1024);
                 if (b1[0]) GitBarIniSet(L"gitpath", b1);
                 if (b2[0]) GitBarIniSet(L"dumpdir", b2);
+                GitBarIniSet(L"commitmsg", b3);
+                GitBarIniSet(L"remote", b4);
                 DestroyWindow(dlg);
-                continue;
+                break;
             }
-            if (msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDCANCEL) {
+            if ((msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDCANCEL) ||
+                msg.message == WM_CLOSE) {
                 DestroyWindow(dlg);
-                continue;
+                break;
             }
-            if (msg.message == WM_CLOSE) { DestroyWindow(dlg); continue; }
         }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    if (IsWindow(dlg)) DestroyWindow(dlg);
     Log(L"Настройки GitBar сохранены в " + std::wstring(GitBarIniPath()));
 }
 
