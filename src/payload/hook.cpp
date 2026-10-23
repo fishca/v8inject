@@ -73,6 +73,12 @@ struct TraceSlot {
     uint64_t  tick;
     uintptr_t retAddr;
     uintptr_t args[4];
+    // Return-address chain of the caller frames (frame[0] is normally the
+    // same address as retAddr): maps WHO called the hooked function and their
+    // callers, each attributable to a module. Filled by walking the ebp/rbp
+    // chain from the frame pointer captured at hook entry.
+    uintptr_t frame[24];
+    int       frameCount;
 };
 
 TraceSlot      g_slots[kTraceCapacity];
@@ -85,6 +91,7 @@ struct HookCtx {
     uintptr_t target = 0;
     size_t    stolen = 0;
     uint32_t  id = 0;
+    volatile LONG logged = 0;   // disk-logged hits (capped to avoid flooding)
     bool      active = false;
     uint8_t   original[kMaxStolen + 8] = {};
     char      name[64] = {};
@@ -307,8 +314,9 @@ size_t BuildTrampolineTail(uint8_t* at, uintptr_t resume) {
 // The recording entry point. Called from assembly on every hooked call.
 // ---------------------------------------------------------------------------
 
-extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t a0, uintptr_t a1,
-                             uintptr_t a2, uintptr_t a3) {
+extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
+                             uintptr_t a0, uintptr_t a1, uintptr_t a2,
+                             uintptr_t a3) {
     HookCtx* c = (HookCtx*)ctx;
     if (!c) return;
 
@@ -326,7 +334,34 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t a0, uintptr_t a
     s.args[1] = a1;
     s.args[2] = a2;
     s.args[3] = a3;
+    // Walk the caller chain. The captured frame pointer is the hooked
+    // function's caller frame: [fp] = caller's caller fp, [fp+4] = the return
+    // address into the caller. Stop on unreadable memory or a frame that does
+    // not ascend (a frame-pointer-less caller yields garbage quickly, and one
+    // good frame is better than a crash).
+    int n = 0;
+    uintptr_t fp = entryEb;
+    for (; n < 24; ++n) {
+        if (!fp || !IsReadable((const void*)fp, 8)) break;
+        uintptr_t next = *(const uintptr_t*)fp;
+        if (next <= fp || next > fp + 0x200000) break;  // must ascend, bounded
+        s.frame[n] = *(const uintptr_t*)(fp + sizeof(uintptr_t));
+        fp = next;
+    }
+    s.frameCount = n;
     InterlockedIncrement(&s.seq);                 // even: record complete
+
+    // Disk trace: the target process may die inside the hooked function (a
+    // crash there leaves the in-memory ring unreadable), so persist the first
+    // few hits with their arguments and caller frames. Uncapped logging inside
+    // a hot hook (e.g. CreateWindowExW) floods the log and stalls the payload.
+    if (InterlockedIncrement(&c->logged) > 3) return;
+    LogLine("hit id=%u target=%p ret=%p a0=%p a1=%p a2=%p a3=%p",
+            (unsigned)c->id, (void*)c->target, (void*)retAddr,
+            (void*)a0, (void*)a1, (void*)a2, (void*)a3);
+    LogLine("  frames: %p %p %p %p",
+            (void*)(n > 0 ? s.frame[0] : 0), (void*)(n > 1 ? s.frame[1] : 0),
+            (void*)(n > 2 ? s.frame[2] : 0), (void*)(n > 3 ? s.frame[3] : 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -853,7 +888,15 @@ std::string TraceCommandToJson(const std::wstring& args) {
         j += ",\"tick\":" + std::to_string((unsigned long long)tick);
         j += ",\"ret\":\"" + HexStr(ret) + "\"";
         j += ",\"args\":[\"" + HexStr(a0) + "\",\"" + HexStr(a1) + "\",\"" +
-             HexStr(a2) + "\",\"" + HexStr(a3) + "\"]}";
+             HexStr(a2) + "\",\"" + HexStr(a3) + "\"]";
+        j += ",\"stack\":[";
+        int fc = s.frameCount;
+        if (fc > 24) fc = 24;
+        for (int fi = 0; fi < fc; ++fi) {
+            if (fi) j += ",";
+            j += "\"" + HexStr(s.frame[fi]) + "\"";
+        }
+        j += "]}";
     }
     j += "]}";
 
