@@ -411,6 +411,37 @@ void ShowTip(const std::wstring& text) {
 // One-field modal prompt (commit message). WS_VISIBLE is not decoration: a
 // top-level window created without it is never shown, and the modal loop below
 // would then wait on an invisible dialog.
+// A button notifies its parent with a SENT WM_COMMAND, not a posted one: a bare
+// GetMessage pump never sees it, and the DefDlgProc of a hand-made #32770 just
+// drops it. Every dialog here therefore owns a real window proc that reads its
+// fields and closes itself synchronously; the pump only watches IsWindow().
+struct PromptCtx {
+    std::wstring* out = nullptr;
+    HWND ed = nullptr;
+    bool accepted = false;
+};
+
+LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    PromptCtx* c = (PromptCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND:
+        if (c && LOWORD(wp) == IDOK) {
+            wchar_t b[1024] = {};
+            GetWindowTextW(c->ed, b, 1024);
+            *c->out = b;
+            c->accepted = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (c && LOWORD(wp) == IDCANCEL) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefDlgProcW(h, msg, wp, lp);
+}
+
 bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
                 const std::wstring& initial, std::wstring* out) {
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", title,
@@ -419,12 +450,18 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) return false;
 
+    PromptCtx ctx;
+    ctx.out = out;
+    SetWindowLongPtrW(dlg, GWLP_WNDPROC, (LONG_PTR)PromptDlgProc);
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
+
     CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE | SS_LEFT,
                     12, 12, 430, 18, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
     HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                               12, 34, 430, 24, dlg, (HMENU)1001,
                               GetModuleHandleW(nullptr), nullptr);
+    ctx.ed = ed;
     SetWindowTextW(ed, initial.c_str());
     SendMessageW(ed, EM_SETSEL, 0, -1);
     CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
@@ -436,34 +473,19 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
     SetForegroundWindow(dlg);
     SetFocus(ed);
 
-    bool accepted = false;
+    // IsDialogMessageW gives Tab / Enter (default button) / Esc for free; it
+    // posts nothing into this loop, it drives the dialog proc above directly.
     MSG msg;
     for (;;) {
+        if (!IsWindow(dlg)) break;
         if (!GetMessageW(&msg, nullptr, 0, 0)) break;   // WM_QUIT: the bar is going away
-        if (!IsWindow(dlg)) break;                      // dialog already destroyed
-        bool ours = (msg.hwnd == dlg) || IsChild(dlg, msg.hwnd);
-        if (ours) {
-            if ((msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDOK) ||
-                (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN)) {
-                wchar_t b[1024] = {};
-                GetWindowTextW(ed, b, 1024);
-                *out = b;
-                accepted = true;
-                DestroyWindow(dlg);
-                break;
-            }
-            if ((msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDCANCEL) ||
-                msg.message == WM_CLOSE) {
-                DestroyWindow(dlg);
-                break;
-            }
-        }
+        if (IsDialogMessageW(dlg, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
     if (IsWindow(dlg)) DestroyWindow(dlg);
     Reposition(true);
-    return accepted;
+    return ctx.accepted;
 }
 
 // Commit message: the ini value is only a default — it is asked every time.
@@ -566,12 +588,44 @@ void RunPush() {
 }
 
 // Modal settings dialog: git.exe, dump dir, default commit message, remote.
+struct SettingsCtx {
+    HWND ed[4] = {};
+};
+
+LRESULT CALLBACK SettingsDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    SettingsCtx* c = (SettingsCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND:
+        if (c && LOWORD(wp) == IDOK) {
+            wchar_t b[4][1024] = {};
+            for (int i = 0; i < 4; ++i) GetWindowTextW(c->ed[i], b[i], 1024);
+            if (b[0][0]) IniSet(L"gitpath", b[0]);
+            if (b[1][0]) IniSet(L"dumpdir", b[1]);
+            IniSet(L"commitmsg", b[2]);   // empty = auto "chore: 1c dump <stamp>"
+            IniSet(L"remote", b[3]);
+            LogGit(L"settings saved to", kIniPath());
+            DestroyWindow(h);
+            return 0;
+        }
+        if (c && LOWORD(wp) == IDCANCEL) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefDlgProcW(h, msg, wp, lp);
+}
+
 void ShowSettings(HWND owner) {
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", L"GitBar — настройки",
                                WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
                                CW_USEDEFAULT, CW_USEDEFAULT, 460, 226, owner, nullptr,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) return;
+
+    SettingsCtx ctx;
+    SetWindowLongPtrW(dlg, GWLP_WNDPROC, (LONG_PTR)SettingsDlgProc);
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
 
     auto Lbl = [&](int y, const wchar_t* t) {
         CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -583,10 +637,10 @@ void ShowSettings(HWND owner) {
                                158, y, 284, 22, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
     };
 
-    HWND ed1 = Edt(14);
-    HWND ed2 = Edt(44);
-    HWND ed3 = Edt(74);
-    HWND ed4 = Edt(104);
+    ctx.ed[0] = Edt(14);
+    ctx.ed[1] = Edt(44);
+    ctx.ed[2] = Edt(74);
+    ctx.ed[3] = Edt(104);
     Lbl(15, L"git.exe");
     Lbl(45, L"папка выгрузки");
     Lbl(75, L"комментарий к коммиту");
@@ -602,39 +656,19 @@ void ShowSettings(HWND owner) {
                                  != INVALID_FILE_ATTRIBUTES) {
         git = L"C:\\Program Files\\Git\\cmd\\git.exe";
     }
-    SetWindowTextW(ed1, git.c_str());
-    SetWindowTextW(ed2, IniGet(L"dumpdir").c_str());
-    SetWindowTextW(ed3, IniGet(L"commitmsg").c_str());
-    SetWindowTextW(ed4, IniGet(L"remote").c_str());
+    SetWindowTextW(ctx.ed[0], git.c_str());
+    SetWindowTextW(ctx.ed[1], IniGet(L"dumpdir").c_str());
+    SetWindowTextW(ctx.ed[2], IniGet(L"commitmsg").c_str());
+    SetWindowTextW(ctx.ed[3], IniGet(L"remote").c_str());
 
     SetForegroundWindow(dlg);
-    SetFocus(ed1);
+    SetFocus(ctx.ed[0]);
 
     MSG msg;
     for (;;) {
-        if (!GetMessageW(&msg, nullptr, 0, 0)) break;   // WM_QUIT
         if (!IsWindow(dlg)) break;
-        bool ours = (msg.hwnd == dlg) || IsChild(dlg, msg.hwnd);
-        if (ours) {
-            if (msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDOK) {
-                wchar_t b1[1024] = {}, b2[1024] = {}, b3[1024] = {}, b4[1024] = {};
-                GetWindowTextW(ed1, b1, 1024);
-                GetWindowTextW(ed2, b2, 1024);
-                GetWindowTextW(ed3, b3, 1024);
-                GetWindowTextW(ed4, b4, 1024);
-                if (b1[0]) IniSet(L"gitpath", b1);
-                if (b2[0]) IniSet(L"dumpdir", b2);
-                IniSet(L"commitmsg", b3);   // empty = auto "chore: 1c dump <stamp>"
-                IniSet(L"remote", b4);
-                DestroyWindow(dlg);
-                break;
-            }
-            if ((msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDCANCEL) ||
-                msg.message == WM_CLOSE) {
-                DestroyWindow(dlg);
-                break;
-            }
-        }
+        if (!GetMessageW(&msg, nullptr, 0, 0)) break;   // WM_QUIT
+        if (IsDialogMessageW(dlg, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

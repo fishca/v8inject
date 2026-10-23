@@ -392,12 +392,48 @@ void DoGitbarHide() {
     }
 }
 
+// Buttons notify their parent with a SENT WM_COMMAND, which a GetMessage pump
+// never sees — the settings dialog therefore saves from its own window proc and
+// the pump only waits for it to disappear.
+struct GitBarSettingsCtx {
+    HWND ed[4] = {};
+    bool saved = false;
+};
+
+LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    GitBarSettingsCtx* c = (GitBarSettingsCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND:
+        if (c && LOWORD(wp) == IDOK) {
+            wchar_t b[4][1024] = {};
+            for (int i = 0; i < 4; ++i) GetWindowTextW(c->ed[i], b[i], 1024);
+            if (b[0][0]) GitBarIniSet(L"gitpath", b[0]);
+            if (b[1][0]) GitBarIniSet(L"dumpdir", b[1]);
+            GitBarIniSet(L"commitmsg", b[2]);
+            GitBarIniSet(L"remote", b[3]);
+            c->saved = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (c && LOWORD(wp) == IDCANCEL) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefDlgProcW(h, msg, wp, lp);
+}
+
 void DoGitbarSettings() {
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", L"GitBar — настройки",
                                WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
                                CW_USEDEFAULT, CW_USEDEFAULT, 460, 226, g_hwnd, nullptr,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) return;
+
+    GitBarSettingsCtx ctx;
+    SetWindowLongPtrW(dlg, GWLP_WNDPROC, (LONG_PTR)GitBarSettingsProc);
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
 
     auto Lbl = [&](int y, const wchar_t* t) {
         CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -409,10 +445,10 @@ void DoGitbarSettings() {
                                158, y, 284, 22, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
     };
 
-    HWND ed1 = Edt(14);
-    HWND ed2 = Edt(44);
-    HWND ed3 = Edt(74);
-    HWND ed4 = Edt(104);
+    ctx.ed[0] = Edt(14);
+    ctx.ed[1] = Edt(44);
+    ctx.ed[2] = Edt(74);
+    ctx.ed[3] = Edt(104);
     Lbl(15, L"git.exe");
     Lbl(45, L"папка выгрузки");
     Lbl(75, L"комментарий к коммиту");
@@ -428,40 +464,24 @@ void DoGitbarSettings() {
                            != INVALID_FILE_ATTRIBUTES) {
         git = L"C:\\Program Files\\Git\\cmd\\git.exe";
     }
-    SetWindowTextW(ed1, git.c_str());
-    SetWindowTextW(ed2, GitBarIniGet(L"dumpdir").c_str());
-    SetWindowTextW(ed3, GitBarIniGet(L"commitmsg").c_str());
-    SetWindowTextW(ed4, GitBarIniGet(L"remote").c_str());
+    SetWindowTextW(ctx.ed[0], git.c_str());
+    SetWindowTextW(ctx.ed[1], GitBarIniGet(L"dumpdir").c_str());
+    SetWindowTextW(ctx.ed[2], GitBarIniGet(L"commitmsg").c_str());
+    SetWindowTextW(ctx.ed[3], GitBarIniGet(L"remote").c_str());
+
+    SetForegroundWindow(dlg);
+    SetFocus(ctx.ed[0]);
 
     MSG msg;
     for (;;) {
-        if (!GetMessageW(&msg, nullptr, 0, 0)) break;
         if (!IsWindow(dlg)) break;
-        if (msg.hwnd == dlg || IsChild(dlg, msg.hwnd)) {
-            if (msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDOK) {
-                wchar_t b1[1024] = {}, b2[1024] = {}, b3[1024] = {}, b4[1024] = {};
-                GetWindowTextW(ed1, b1, 1024);
-                GetWindowTextW(ed2, b2, 1024);
-                GetWindowTextW(ed3, b3, 1024);
-                GetWindowTextW(ed4, b4, 1024);
-                if (b1[0]) GitBarIniSet(L"gitpath", b1);
-                if (b2[0]) GitBarIniSet(L"dumpdir", b2);
-                GitBarIniSet(L"commitmsg", b3);
-                GitBarIniSet(L"remote", b4);
-                DestroyWindow(dlg);
-                break;
-            }
-            if ((msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDCANCEL) ||
-                msg.message == WM_CLOSE) {
-                DestroyWindow(dlg);
-                break;
-            }
-        }
+        if (!GetMessageW(&msg, nullptr, 0, 0)) break;
+        if (IsDialogMessageW(dlg, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
     if (IsWindow(dlg)) DestroyWindow(dlg);
-    Log(L"Настройки GitBar сохранены в " + std::wstring(GitBarIniPath()));
+    if (ctx.saved) Log(L"Настройки GitBar сохранены в " + std::wstring(GitBarIniPath()));
 }
 
 void CreateControls(HWND hwnd) {
