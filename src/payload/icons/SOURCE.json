@@ -1,0 +1,27 @@
+{
+ "dump": {
+  "res": "core83_root.res",
+  "off": 146315,
+  "name": "i79"
+ },
+ "init": {
+  "res": "mngcore_root.res",
+  "off": 1971210,
+  "name": "GroupAdd.png"
+ },
+ "commit": {
+  "res": "core83_root.res",
+  "off": 370217,
+  "name": "i104"
+ },
+ "push": {
+  "res": "core83_root.res",
+  "off": 879424,
+  "name": "moveup.png"
+ },
+ "settings": {
+  "res": "mngcore_root.res",
+  "off": 2050734,
+  "name": "GroupService.png"
+ }
+}

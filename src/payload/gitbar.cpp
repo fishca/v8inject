@@ -4,6 +4,9 @@
 #include <vector>
 
 #include "v8inject/diag.h"
+#include "icons.h"
+
+#include <cstring>
 
 extern "C" void V8iGitBarDump();  // v8i_export.cpp
 
@@ -261,72 +264,46 @@ int IdFromPoint(POINT pt) {
     return 0;
 }
 
-// 16x16 glyphs, drawn with visible 1-2px strokes.
-void DrawGlyph(HDC dc, int id, int ox, int oy) {
-    HBRUSH blue = CreateSolidBrush(RGB(0, 96, 160));
-    HBRUSH green = CreateSolidBrush(RGB(0, 140, 60));
-    HPEN dark = CreatePen(PS_SOLID, 1, RGB(40, 50, 60));
-    HPEN thick = CreatePen(PS_SOLID, 2, RGB(40, 50, 60));
-    HPEN bluePen = CreatePen(PS_SOLID, 2, RGB(0, 96, 160));
-    HPEN greenPen = CreatePen(PS_SOLID, 2, RGB(0, 140, 60));
-    HPEN oldPen = (HPEN)SelectObject(dc, dark);
-    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-
+// The five glyphs are 1C's own toolbar pictures, baked to premultiplied BGRA
+// by tools/gen_icons.py: hand-drawn GDI shapes never matched the platform's
+// look, and these do because they come from the same resource bundles.
+const unsigned char* IconFor(int id) {
     switch (id) {
-    case kWinIdDump: {  // diskette: "выгрузить в файлы"
-        SelectObject(dc, blue);
-        POINT body[] = { {ox+2,oy+2},{ox+10,oy+2},{ox+14,oy+6},{ox+14,oy+14},{ox+2,oy+14} };
-        Polygon(dc, body, 5);
-        SelectObject(dc, GetStockObject(WHITE_BRUSH));
-        Rectangle(dc, ox + 4, oy + 3, ox + 10, oy + 8);   // label
-        Rectangle(dc, ox + 9, oy + 10, ox + 13, oy + 14); // shutter
-        break;
+    case kWinIdDump: return icons::kIconDump;
+    case kWinIdInit: return icons::kIconInit;
+    case kWinIdCommit: return icons::kIconCommit;
+    case kWinIdPush: return icons::kIconPush;
+    case kWinIdSettings: return icons::kIconSettings;
     }
-    case kWinIdInit: {  // plus in a ring: create a repository
-        SelectObject(dc, thick);
-        Ellipse(dc, ox + 1, oy + 1, ox + 15, oy + 15);
-        SelectObject(dc, greenPen);
-        MoveToEx(dc, ox + 8, oy + 4, nullptr); LineTo(dc, ox + 8, oy + 12);
-        MoveToEx(dc, ox + 4, oy + 8, nullptr); LineTo(dc, ox + 12, oy + 8);
-        break;
-    }
-    case kWinIdCommit: {  // green check
-        SelectObject(dc, greenPen);
-        POINT mark[] = { {ox+2,oy+8},{ox+6,oy+12},{ox+14,oy+3} };
-        Polyline(dc, mark, 3);
-        break;
-    }
-    case kWinIdPush: {  // blue up arrow over a base bar
-        SelectObject(dc, blue);
-        POINT head[] = { {ox+3,oy+8},{ox+8,oy+2},{ox+13,oy+8} };
-        Polygon(dc, head, 3);
-        SelectObject(dc, bluePen);
-        MoveToEx(dc, ox + 8, oy + 14, nullptr); LineTo(dc, ox + 8, oy + 8);
-        SelectObject(dc, blue);
-        Rectangle(dc, ox + 2, oy + 14, ox + 14, oy + 15);
-        break;
-    }
-    case kWinIdSettings: {  // sliders: settings reads clearer than a 16px gear
-        SelectObject(dc, thick);
-        MoveToEx(dc, ox + 1, oy + 3, nullptr); LineTo(dc, ox + 15, oy + 3);
-        MoveToEx(dc, ox + 1, oy + 8, nullptr); LineTo(dc, ox + 15, oy + 8);
-        MoveToEx(dc, ox + 1, oy + 13, nullptr); LineTo(dc, ox + 15, oy + 13);
-        SelectObject(dc, blue);
-        Rectangle(dc, ox + 3, oy + 1, ox + 7, oy + 5);    // knob, row 1
-        Rectangle(dc, ox + 9, oy + 6, ox + 13, oy + 10);  // knob, row 2
-        Rectangle(dc, ox + 5, oy + 11, ox + 9, oy + 15);  // knob, row 3
-        break;
-    }
-    }
+    return nullptr;
+}
 
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBrush);
-    DeleteObject(blue);
-    DeleteObject(green);
-    DeleteObject(dark);
-    DeleteObject(thick);
-    DeleteObject(bluePen);
-    DeleteObject(greenPen);
+void DrawIcon(HDC dc, const unsigned char* px, int ox, int oy) {
+    if (!px) return;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = icons::kSize;
+    bi.bmiHeader.biHeight = -icons::kSize;  // top-down, same as the array
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) {
+        if (bmp) DeleteObject(bmp);
+        return;
+    }
+    memcpy(bits, px, (size_t)icons::kSize * icons::kSize * 4);
+
+    HDC mem = CreateCompatibleDC(dc);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    AlphaBlend(dc, ox, oy, icons::kSize, icons::kSize, mem, 0, 0,
+               icons::kSize, icons::kSize, bf);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    DeleteObject(bmp);
 }
 
 void Paint(HWND hwnd) {
@@ -359,7 +336,8 @@ void Paint(HWND hwnd) {
             Rectangle(dc, cell.left, cell.top, cell.right, cell.bottom);
             DeleteObject(pen);
         }
-        DrawGlyph(dc, id, x + (kCell - 16) / 2, (kBarH - 16) / 2);
+        DrawIcon(dc, IconFor(id), x + (kCell - icons::kSize) / 2,
+                 (kBarH - icons::kSize) / 2);
     }
     EndPaint(hwnd, &ps);
 }
