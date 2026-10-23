@@ -1053,11 +1053,24 @@ std::string ObjectsToJson(const std::wstring& /*unused*/) {
 // pointer; the result is cached and re-validated for subsequent calls.
 namespace {
 uintptr_t g_cmdFrameCache = 0;
+#if !defined(_WIN64)
+uintptr_t g_x86FrameObj = 0;   // discovered frame object (x86 runtime calibration)
+#endif
 }
 
 // SEH cannot live in a function that needs C++ unwinding (MSVC C2712); the
 // transmit call is isolated in a POD-only helper.
+#if defined(_WIN64)
 typedef int(__fastcall* V8iTransmitFn)(void*, const void*, uint8_t);
+#else
+// x86 vtable methods are __thiscall: this in ECX, remaining args on the stack.
+typedef int(__thiscall* V8iTransmitFn)(void*, const void*, uint8_t);
+#endif
+#if defined(_WIN64)
+typedef int(__fastcall* V8iHasFn)(void*, const void*);
+#else
+typedef int(__thiscall* V8iHasFn)(void*, const void*);
+#endif
 typedef void(__fastcall* V8iRecvFn)(void*, void**);
 
 namespace {
@@ -1065,7 +1078,19 @@ LONG g_cmdLastExc = 0;
 int TransmitGuarded(void* trFn, void* recv, const void* cmd) {
     int rc = 0;
     __try {
-        rc = ((V8iTransmitFn)trFn)(recv, cmd, 0);
+        // deactivate=true mirrors Snegopat's sendCommand default; commands that
+        // open modal dialogs expect the current UI to be deactivated first.
+        rc = ((V8iTransmitFn)trFn)(recv, cmd, 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_cmdLastExc = GetExceptionCode();
+        return -1;
+    }
+    return rc;
+}
+int HasGuarded(void* fn, void* recv, const void* id) {
+    int rc = 0;
+    __try {
+        rc = ((V8iHasFn)fn)(recv, id);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_cmdLastExc = GetExceptionCode();
         return -1;
@@ -1099,6 +1124,7 @@ struct V8iPending {
     volatile LONG done;
     int rc;
     LONG exc;
+    int mode;   // 0 = transmitCommand(recv, &cmd, 0), 1 = hasHandler(recv, &cmd)
 };
 V8iPending g_pending = {};
 HWND g_cmdHwnd = NULL;
@@ -1111,7 +1137,8 @@ LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                 UINT_PTR id, DWORD_PTR data) {
     if (m == kV8iCmdMsg) {
         V8iPending* p = (V8iPending*)data;
-        p->rc = TransmitGuarded(p->trFn, p->recv, &p->cmd);
+        p->rc = p->mode == 1 ? HasGuarded(p->trFn, p->recv, &p->cmd)
+                             : TransmitGuarded(p->trFn, p->recv, &p->cmd);
         if (p->rc < 0) p->exc = g_cmdLastExc;
         InterlockedExchange(&p->done, 1);
         return 0;
@@ -1126,7 +1153,9 @@ LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
 
 LRESULT CALLBACK V8iCmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == kV8iCmdMsg) {
-        g_pending.rc = TransmitGuarded(g_pending.trFn, g_pending.recv, &g_pending.cmd);
+        g_pending.rc = g_pending.mode == 1
+                           ? HasGuarded(g_pending.trFn, g_pending.recv, &g_pending.cmd)
+                           : TransmitGuarded(g_pending.trFn, g_pending.recv, &g_pending.cmd);
         if (g_pending.rc < 0) g_pending.exc = g_cmdLastExc;
         InterlockedExchange(&g_pending.done, 1);
         return 0;
@@ -1190,7 +1219,118 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
 }
 }  // namespace
 
-static std::string CmdCommandToJson(const std::wstring& args) {
+#if !defined(_WIN64)
+// x86 runtime calibration: find the ITopLevelFrame vtable without hardcoded
+// constants. Returns 0 when not found. POD-only reads; no calls into 1C.
+static uintptr_t g_x86RecvOffset = 0x20;
+
+static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
+    PeImage cfgImg = ParsePe(cfg.base);
+    if (!cfgImg.valid) return 0;
+    const PeSection* textSec = nullptr;
+    const PeSection* rdataSec = nullptr;
+    for (const PeSection& s : cfgImg.sections) {
+        if (s.Executable() && s.name == ".text") textSec = &s;
+        if (s.Readable() && !s.Executable() && s.name == ".rdata") rdataSec = &s;
+    }
+    if (!textSec || !rdataSec) return 0;
+    const uintptr_t textLo = cfg.base + textSec->va;
+    const uintptr_t textHi = textLo + textSec->virtualSize;
+    const uintptr_t rdataLo = cfg.base + rdataSec->va;
+    const uintptr_t rdataHi = rdataLo + rdataSec->virtualSize;
+
+    ModuleRange frame;
+    bool haveFrame = FindModule(L"frame.dll", frame);
+    uintptr_t frameRdataLo = 0, frameRdataHi = 0, frameTextLo = 0, frameTextHi = 0;
+    if (haveFrame) {
+        PeImage fImg = ParsePe(frame.base);
+        for (const PeSection& s : fImg.sections) {
+            if (s.Executable() && s.name == ".text") {
+                frameTextLo = frame.base + s.va;
+                frameTextHi = frameTextLo + s.virtualSize;
+            }
+            if (s.Readable() && !s.Executable() && s.name == ".rdata") {
+                frameRdataLo = frame.base + s.va;
+                frameRdataHi = frameRdataLo + s.virtualSize;
+            }
+        }
+    }
+
+    // walk heap once, remember (object -> vtable) where vtable is in config .rdata
+    std::vector<uintptr_t> objs;
+    std::vector<uintptr_t> vts;  // parallel; dedupe vts
+    uintptr_t addr = 0x10000;
+    while (addr < 0x7FFFFFFF) {
+        MEMORY_BASIC_INFORMATION mi = {};
+        if (VirtualQuery((void*)addr, &mi, sizeof(mi)) == 0) break;
+        uintptr_t end = addr + mi.RegionSize;
+        bool usable = mi.State == MEM_COMMIT &&
+                      (mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) &&
+                      !(mi.Protect & PAGE_GUARD);
+        if (usable) {
+            const uintptr_t cap = mi.RegionSize > 64 * 1024 * 1024 ? 64 * 1024 * 1024 : (uintptr_t)mi.RegionSize;
+            for (uintptr_t p = (uintptr_t)mi.BaseAddress; p < (uintptr_t)mi.BaseAddress + cap; p += 4) {
+                uint32_t v = *(uint32_t*)p;
+                if (v < (uint32_t)rdataLo || v >= (uint32_t)rdataHi) continue;
+                // vtable start must satisfy: no header dwords (IUnknown trio) — slots 3..40 in .text
+                bool ok = true;
+                for (int s = 3; s <= 40; ++s) {
+                    uint32_t fn = *(uint32_t*)((uintptr_t)v + s * 4);
+                    if (fn < (uint32_t)textLo || fn >= (uint32_t)textHi) { ok = false; break; }
+                }
+                if (!ok) continue;
+                objs.push_back(p);
+                vts.push_back((uintptr_t)v);
+            }
+        }
+        addr = end == addr ? addr + 4 : end;
+    }
+
+    // try each (object, vtable) — receiver chain must land in frame.dll
+    static const uintptr_t kRecvOffs[] = {0x20, 0x1C, 0x18, 0x14, 0x10, 0x24, 0x28,
+                                          0x0C, 0x08, 0x04, 0x30, 0x34, 0x38, 0x3C, 0x40};
+    for (size_t i = 0; i < objs.size(); ++i) {
+        uintptr_t v = vts[i];
+        uintptr_t core = *(uint32_t*)(objs[i] + 4);
+        if (!IsReadable((void*)core, 4)) continue;
+        for (size_t off = 0; off < sizeof(kRecvOffs) / sizeof(kRecvOffs[0]); ++off) {
+            uintptr_t recv = core - kRecvOffs[off];
+            if (!IsReadable((void*)recv, 4)) continue;
+            uint32_t recvVt = *(uint32_t*)recv;
+            if (!haveFrame) continue;
+            if (recvVt < (uint32_t)frameRdataLo || recvVt >= (uint32_t)frameRdataHi) continue;
+            uint32_t tr = *(uint32_t*)((uintptr_t)recvVt + 3 * 4);
+            if (tr < (uint32_t)frameTextLo || tr >= (uint32_t)frameTextHi) continue;
+            // transmitCommand is a real method (thiscall, 2 stack args -> ret 8),
+            // NOT a 6-byte property getter `mov eax,[ebp+8]; mov eax,[eax+off]; pop ebp; ret 4`
+            // (several interface wrapper vtables near the frame use those).
+            const unsigned char* code = (const unsigned char*)tr;
+            if (!IsReadable((void*)code, 0x60)) continue;
+            static const unsigned char kGetter[] = {0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x8B, 0x40};
+            if (memcmp(code, kGetter, sizeof(kGetter)) == 0) continue;
+            bool sawRet8 = false;
+            for (int b = 0; b < 0x60; ++b) {
+                if (code[b] == 0xC2 && b + 2 < 0x60 && code[b + 1] == 0x08 && code[b + 2] == 0x00) {
+                    sawRet8 = true;
+                    break;
+                }
+            }
+            if (!sawRet8) continue;
+            g_x86RecvOffset = kRecvOffs[off];
+            return objs[i];  // the frame object itself (vtable validated above)
+        }
+    }
+    return 0;
+}
+#endif
+
+static std::string CmdCommandToJson(const std::wstring& args0) {
+    std::wstring args = args0;
+    bool wantHas = false;
+    if (args.rfind(L"has ", 0) == 0) {
+        wantHas = true;
+        args = args.substr(4);
+    }
     unsigned int num = 0;
     int sub = 0;
     if (swscanf_s(args.c_str(), L"%u %d", &num, &sub) < 1)
@@ -1202,16 +1342,26 @@ static std::string CmdCommandToJson(const std::wstring& args) {
 
 #if defined(_WIN64)
     const uintptr_t kFrameVtblRva = 0x2EFB50;   // ITopLevelFrame vtable, 8.3.27.1989 x64
-#else
-    const uintptr_t kFrameVtblRva = 0x11E8D8;   // placeholder; calibrate against x64 layout
-#endif
     const uintptr_t kCoreOffset = sizeof(void*);
     const int kTransmitSlot = 3;
     const uintptr_t kRecvBackOffset = 0x20;   // ICommandReceiver sits 0x20 before coreMainFrame
-
     uintptr_t vtblPtr = cfg.base + kFrameVtblRva;
     if (kFrameVtblRva == 0)
         return "{\"status\":\"error\",\"message\":\"frame vtable not calibrated for this build\"}";
+#else
+    // x86: calibrate at runtime — no hardcoded RVA. A heap object whose first
+    // dword points into config.dll .rdata, whose vtable slots 3..40 all point
+    // into config.dll .text, and whose receiver chain (core = obj+4,
+    // recv = core - off, recv vtable in frame.dll .rdata) is consistent is the
+    // main frame. See CmdDiscoverFrameVtblX86 below.
+    static const uintptr_t kCoreOffset = sizeof(void*);
+    static const int kTransmitSlot = 3;
+    g_x86FrameObj = DiscoverFrameVtblX86(cfg);
+    if (!g_x86FrameObj)
+        return "{\"status\":\"error\",\"message\":\"no frame vtable found on x86\"}";
+    const uintptr_t kRecvBackOffset = g_x86RecvOffset;
+    const uintptr_t vtblPtr = *(uint32_t*)g_x86FrameObj;   // vtable of the discovered frame
+#endif
 
     char numBuf[256];
     std::string j = "{\"status\":\"ok\"";
@@ -1222,6 +1372,17 @@ static std::string CmdCommandToJson(const std::wstring& args) {
     uintptr_t frame = g_cmdFrameCache;
     bool cached = false;
     std::vector<uintptr_t> candidates;
+#if !defined(_WIN64)
+    if (g_x86FrameObj) {
+        // x86: the discovery pass already validated the object and the exact
+        // receiver offset; use it directly instead of re-scanning by vtable
+        // (several sibling classes share the vtable, so a vtable-only scan
+        // would pick objects with a different receiver layout).
+        frame = g_x86FrameObj;
+        cached = true;
+        candidates.push_back(frame);
+    }
+#endif
     if (frame && IsReadable((void*)frame, sizeof(void*)) &&
         *(uintptr_t*)frame == vtblPtr) {
         cached = true;
@@ -1285,6 +1446,11 @@ static std::string CmdCommandToJson(const std::wstring& args) {
         if (!IsReadable((void*)(recvVt + 4 * sizeof(void*)), sizeof(void*))) continue;
         void* candTr = ((void**)recvVt)[kTransmitSlot];
         if (!IsReadable(candTr, 1)) continue;
+        if (wantHas) {
+            // ICommandReceiver::hasHandler is the 5th slot (after queryIface).
+            candTr = ((void**)recvVt)[5];
+            if (!IsReadable(candTr, 1)) continue;
+        }
         usedFrame = cand;
         recv = (void*)candRecv;
         trFn = candTr;
@@ -1314,6 +1480,7 @@ static std::string CmdCommandToJson(const std::wstring& args) {
 
     g_pending.recv = recv;
     g_pending.trFn = trFn;
+    g_pending.mode = wantHas ? 1 : 0;
     memcpy(g_pending.cmd.group, kConfigGroup, 16);
     g_pending.cmd.cmdNum = num;
     g_pending.cmd.param = sub;
@@ -1338,6 +1505,11 @@ static std::string CmdCommandToJson(const std::wstring& args) {
     if (rc < 0) {
         _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"error\":\"transmit exception 0x%X\"",
                     (unsigned)g_pending.exc);
+        return j + numBuf + "}";
+    }
+    if (wantHas) {
+        _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"has\":%s",
+                    rc == 0 ? "false" : "true");
         return j + numBuf + "}";
     }
     _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"sent\":true,\"rc\":%d", rc);
