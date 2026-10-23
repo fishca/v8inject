@@ -27,10 +27,11 @@ _V8iThunkX86 PROC
     push dword ptr [ebp+48]     ; a2
     push dword ptr [ebp+44]     ; a1
     push dword ptr [ebp+40]     ; a0
+    push dword ptr [ebp+8]      ; entry ebp (the one pushad saved at [new+8])
     push dword ptr [ebp+36]     ; caller's return address
     push dword ptr [ebp+32]     ; hook context
     call _V8iHookEnter
-    add  esp, 24                ; cdecl: the caller cleans up
+    add  esp, 28                ; cdecl: the caller cleans up (7 args)
 
     ; The trampoline must be read AFTER popad: popad restores every general
     ; register from the stack, so a trampoline pointer loaded into edx or ecx

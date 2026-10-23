@@ -31,8 +31,9 @@ void HookInstallFaultLogger();
 
 // Called from the assembly thunks. Must stay POD-only, no exceptions, no
 // allocation: it runs inside arbitrary threads of the target process.
-extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t a0, uintptr_t a1,
-                             uintptr_t a2, uintptr_t a3);
+extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
+                             uintptr_t a0, uintptr_t a1, uintptr_t a2,
+                             uintptr_t a3);
 
 // ---- payload commands -----------------------------------------------------
 

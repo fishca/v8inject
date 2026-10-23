@@ -22,31 +22,36 @@ EXTERN V8iHookEnter:PROC
 .code
 
 V8iThunkX64 PROC
-    sub  rsp, 68h               ; shadow space + spills, keeps rsp 16-byte aligned
-    mov  [rsp+30h], rcx
-    mov  [rsp+38h], rdx
-    mov  [rsp+40h], r8
-    mov  [rsp+48h], r9
-    mov  [rsp+50h], rax         ; hook context survives the call here
+    sub  rsp, 88h               ; shadow space + arg slots + spills (16-aligned)
+    ; spills of the ORIGINAL registers (0x30..0x37 hold our 5th..7th args at
+    ; call time, so the originals live above them)
+    mov  [rsp+58h], rbp
+    mov  [rsp+60h], rcx
+    mov  [rsp+68h], rdx
+    mov  [rsp+70h], r8
+    mov  [rsp+78h], r9
+    mov  [rsp+80h], rax         ; hook context survives the call here
 
-    mov  rcx, [rsp+50h]         ; arg 1: context
-    mov  rdx, [rsp+70h]         ; arg 2: the caller's return address
-    mov  r8,  [rsp+30h]         ; arg 3: a0 (original rcx)
-    mov  r9,  [rsp+38h]         ; arg 4: a1 (original rdx)
-    mov  rax, [rsp+40h]
-    mov  [rsp+20h], rax         ; arg 5: a2
-    mov  rax, [rsp+48h]
-    mov  [rsp+28h], rax         ; arg 6: a3
+    mov  rcx, [rsp+80h]         ; arg 1: context
+    mov  rdx, [rsp+90h]         ; arg 2: the caller's return address
+    mov  r8,  [rsp+58h]         ; arg 3: entry rbp (caller chain)
+    mov  r9,  [rsp+60h]         ; arg 4: a0 (original rcx)
+    mov  rax, [rsp+68h]
+    mov  [rsp+20h], rax         ; arg 5: a1 (original rdx)
+    mov  rax, [rsp+70h]
+    mov  [rsp+28h], rax         ; arg 6: a2 (original r8)
+    mov  rax, [rsp+78h]
+    mov  [rsp+30h], rax         ; arg 7: a3 (original r9)
     call V8iHookEnter
 
-    mov  r10, [rsp+50h]
+    mov  r10, [rsp+80h]
     mov  r11, [r10]             ; ctx->trampoline
 
-    mov  rcx, [rsp+30h]
-    mov  rdx, [rsp+38h]
-    mov  r8,  [rsp+40h]
-    mov  r9,  [rsp+48h]
-    add  rsp, 68h
+    mov  rcx, [rsp+60h]
+    mov  rdx, [rsp+68h]
+    mov  r8,  [rsp+70h]
+    mov  r9,  [rsp+78h]
+    add  rsp, 88h
     mov  rax, [rsp]             ; restore the caller's rax
     add  rsp, 8
     jmp  r11
