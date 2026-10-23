@@ -1063,13 +1063,16 @@ uintptr_t g_x86FrameObj = 0;   // discovered frame object (x86 runtime calibrati
 #if defined(_WIN64)
 typedef int(__fastcall* V8iTransmitFn)(void*, const void*, uint8_t);
 #else
-// x86 vtable methods are __thiscall: this in ECX, remaining args on the stack.
-typedef int(__thiscall* V8iTransmitFn)(void*, const void*, uint8_t);
+// 1C x86 interface methods are C-style: self is the FIRST STACK argument and
+// the callee pops it (ret 0xC for transmitCommand) — verified against
+// frame.dll+0x8980A0 (`ret 0xc`, reads [ebp+8]=self, [ebp+0xC]=cmd,
+// [ebp+0x10]=deactivate).
+typedef int(__stdcall* V8iTransmitFn)(void*, const void*, int);
 #endif
 #if defined(_WIN64)
 typedef int(__fastcall* V8iHasFn)(void*, const void*);
 #else
-typedef int(__thiscall* V8iHasFn)(void*, const void*);
+typedef int(__stdcall* V8iHasFn)(void*, const void*);
 #endif
 typedef void(__fastcall* V8iRecvFn)(void*, void**);
 
@@ -1287,7 +1290,7 @@ static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
     }
 
     // try each (object, vtable) — receiver chain must land in frame.dll
-    static const uintptr_t kRecvOffs[] = {0x20, 0x1C, 0x18, 0x14, 0x10, 0x24, 0x28,
+    static const uintptr_t kRecvOffs[] = {0x10, 0x20, 0x1C, 0x18, 0x14, 0x24, 0x28,
                                           0x0C, 0x08, 0x04, 0x30, 0x34, 0x38, 0x3C, 0x40};
     for (size_t i = 0; i < objs.size(); ++i) {
         uintptr_t v = vts[i];
@@ -1308,14 +1311,16 @@ static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
             if (!IsReadable((void*)code, 0x60)) continue;
             static const unsigned char kGetter[] = {0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x8B, 0x40};
             if (memcmp(code, kGetter, sizeof(kGetter)) == 0) continue;
-            bool sawRet8 = false;
-            for (int b = 0; b < 0x60; ++b) {
-                if (code[b] == 0xC2 && b + 2 < 0x60 && code[b + 1] == 0x08 && code[b + 2] == 0x00) {
-                    sawRet8 = true;
+            bool sawRet = false;
+            for (int b = 0; b < 0x100; ++b) {
+                if (code[b] == 0xC2 && b + 2 < 0x100 &&
+                    ((code[b + 1] == 0x08 && code[b + 2] == 0x00) ||   // 2 stack args
+                     (code[b + 1] == 0x0C && code[b + 2] == 0x00))) {  // 3 stack args (self, cmd, deact)
+                    sawRet = true;
                     break;
                 }
             }
-            if (!sawRet8) continue;
+            if (!sawRet) continue;
             g_x86RecvOffset = kRecvOffs[off];
             return objs[i];  // the frame object itself (vtable validated above)
         }
