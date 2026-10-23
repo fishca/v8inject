@@ -1435,27 +1435,52 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     void* recv = nullptr;
     void* trFn = nullptr;
     uintptr_t usedFrame = 0;
+    bool forced = false;
+    // Diagnostic: `cmd <num> [sub] @<hexrecv> #<slot>` overrides the discovered
+    // receiver with an explicit object address + slot (x86 calibration probe).
+    const wchar_t* atP = wcschr(args.c_str(), L'@');
+    const wchar_t* hashP = wcschr(args.c_str(), L'#');
+    if (atP && hashP) {
+        uintptr_t fRecv = wcstoull(atP + 1, nullptr, 16);
+        int fSlot = (int)wcstoul(hashP + 1, nullptr, 10);
+        if (fRecv && fSlot >= 0 && fSlot < 64 && IsReadable((void*)fRecv, sizeof(void*))) {
+            uintptr_t fVt = *(uintptr_t*)fRecv;
+            if (IsReadable((void*)(fVt + fSlot * sizeof(void*)), sizeof(void*))) {
+                void* fFn = ((void**)fVt)[fSlot];
+                if (IsReadable(fFn, 1)) {
+                    recv = (void*)fRecv;
+                    trFn = fFn;
+                    usedFrame = 0;
+                    forced = true;
+                }
+            }
+        }
+        if (!forced)
+            return "{\"status\":\"error\",\"message\":\"probe target unreadable\"}";
+    }
     // For each candidate the receiver is a fixed distance before coreMainFrame
     // (frame+ptrSize), so no vtable calls are needed to obtain it.
-    for (uintptr_t cand : candidates) {
-        uintptr_t core = *(uintptr_t*)(cand + kCoreOffset);
-        if (!IsReadable((void*)core, sizeof(void*))) continue;
-        uintptr_t candRecv = core - kRecvBackOffset;
-        if (!IsReadable((void*)candRecv, sizeof(void*))) continue;
-        uintptr_t recvVt = *(uintptr_t*)candRecv;
-        if (!IsReadable((void*)(recvVt + 4 * sizeof(void*)), sizeof(void*))) continue;
-        void* candTr = ((void**)recvVt)[kTransmitSlot];
-        if (!IsReadable(candTr, 1)) continue;
-        if (wantHas) {
-            // ICommandReceiver::hasHandler is the 5th slot (after queryIface).
-            candTr = ((void**)recvVt)[5];
+    if (!forced) {
+        for (uintptr_t cand : candidates) {
+            uintptr_t core = *(uintptr_t*)(cand + kCoreOffset);
+            if (!IsReadable((void*)core, sizeof(void*))) continue;
+            uintptr_t candRecv = core - kRecvBackOffset;
+            if (!IsReadable((void*)candRecv, sizeof(void*))) continue;
+            uintptr_t recvVt = *(uintptr_t*)candRecv;
+            if (!IsReadable((void*)(recvVt + 4 * sizeof(void*)), sizeof(void*))) continue;
+            void* candTr = ((void**)recvVt)[kTransmitSlot];
             if (!IsReadable(candTr, 1)) continue;
+            if (wantHas) {
+                // ICommandReceiver::hasHandler is the 5th slot (after queryIface).
+                candTr = ((void**)recvVt)[5];
+                if (!IsReadable(candTr, 1)) continue;
+            }
+            usedFrame = cand;
+            recv = (void*)candRecv;
+            trFn = candTr;
+            frame = cand;
+            break;
         }
-        usedFrame = cand;
-        recv = (void*)candRecv;
-        trFn = candTr;
-        frame = cand;
-        break;
     }
 
     if (!trFn)
