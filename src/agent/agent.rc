@@ -1,4 +1,6 @@
-// v8inject-agent: settings dialog.
+#pragma code_page(65001)
+// v8inject-agent: settings dialog. The source is UTF-8; rc.exe otherwise
+// reads it in the system ANSI codepage and Cyrillic turns into mojibake.
 #include <windows.h>
 
 #define IDD_AGENT 200

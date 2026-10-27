@@ -367,12 +367,18 @@ HICON MakeTrayIcon() {
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     g_hinst = hInst;
     CreateMutexW(nullptr, TRUE, L"V8iAgentMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     LoadConfig();
+
+    // --settings opens the dialog at startup (useful for testing and for a
+    // quick manual edit without hunting the tray icon).
+    if (cmdLine && wcsstr(cmdLine, L"--settings")) {
+        DialogBoxW(hInst, MAKEINTRESOURCEW(200), nullptr, SettingsDlgProc);
+    }
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
