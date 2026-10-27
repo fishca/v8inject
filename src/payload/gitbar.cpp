@@ -575,7 +575,8 @@ void RunPush() {
 
 namespace {
 
-const COLORREF kDlgBg      = RGB(238, 234, 222);   // panel cream
+const COLORREF kDlgBg      = RGB(245, 242, 221);   // 1C window cream (measured
+                                                   // from a live designer: #F5F2DD)
 const COLORREF kDlgBorder  = RGB(176, 166, 142);
 const COLORREF kDlgFieldBg = RGB(255, 255, 255);
 const COLORREF kDlgHover   = RGB(250, 244, 214);
