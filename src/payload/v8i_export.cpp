@@ -1329,6 +1329,201 @@ static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
 }
 #endif
 
+// "cmdinfo" — read-only diagnostics: how the command receiver can be located
+// on THIS platform. 8.3 carries config.dll with the calibrated ITopLevelFrame
+// vtable; 8.5 has core85/frame/mngcore instead, so the chain must be
+// discovered: window -> GWLP_USERDATA object -> core (obj+8) ->
+// ICommandReceiver (core - offset). No 1C code is called here.
+static std::string CmdInfoToJsonA() {
+    struct WinRec { HWND h; std::wstring cls; std::wstring title; };
+    std::vector<WinRec> wins;
+    struct Ctx { std::vector<WinRec>* v; DWORD pid; };
+    Ctx ctx{ &wins, GetCurrentProcessId() };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        Ctx* c = (Ctx*)lp;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid != c->pid) return TRUE;
+        wchar_t cls[128] = {}, ttl[128] = {};
+        GetClassNameW(h, cls, 128);
+        GetWindowTextW(h, ttl, 128);
+        if (!ttl[0]) return TRUE;
+        WinRec r;
+        r.h = h;
+        r.cls = cls;
+        r.title = ttl;
+        c->v->push_back(r);
+        return TRUE;
+    }, (LPARAM)&ctx);
+
+    std::vector<ModuleRange> mods;
+    for (const ModuleRange& m : EnumModules()) mods.push_back(m);
+    auto modAt = [&mods](uintptr_t a) -> const ModuleRange* {
+        for (const ModuleRange& m : mods)
+            if (a >= m.base && a < m.base + m.size) return &m;
+        return nullptr;
+    };
+    auto modRva = [&mods](uintptr_t a, std::string& mod) -> unsigned long long {
+        for (const ModuleRange& m : mods) {
+            if (a >= m.base && a < m.base + m.size) {
+                size_t s = m.path.find_last_of(L"\\/");
+                std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
+                mod.assign(n.begin(), n.end());
+                return (unsigned long long)(a - m.base);
+            }
+        }
+        mod = "?";
+        return 0;
+    };
+    auto isFrameMod = [](const std::string& m) {
+        return m == "frame.dll" || m == "mngcore.dll" || m == "mngui.dll" ||
+               m == "config.dll" || m == "frmcore.dll";
+    };
+
+    std::string j = "{\"status\":\"ok\",\"windows\":[";
+    bool first = true;
+    char b[768];
+    int frameCount = 0;
+    for (const WinRec& w : wins) {
+        uintptr_t obj = (uintptr_t)GetWindowLongPtrW(w.h, GWLP_USERDATA);
+        if (!obj || !IsReadable((void*)obj, 16)) continue;
+        uintptr_t vt = *(uintptr_t*)obj;
+        std::string mod;
+        unsigned long long rva = modRva(vt, mod);
+        if (!first) j += ",";
+        first = false;
+        _snprintf_s(b, sizeof(b), _TRUNCATE,
+                    "{\"hwnd\":\"0x%llX\",\"cls\":\"%s\",\"obj\":\"0x%llX\",\"vt\":\"%s+0x%llX\"",
+                    (unsigned long long)(uintptr_t)w.h,
+                    std::string(w.cls.begin(), w.cls.end()).c_str(),
+                    (unsigned long long)obj, mod.c_str(), rva);
+        j += b;
+        if (!isFrameMod(mod)) {
+            j += ",\"frame\":false}";
+            continue;
+        }
+        uintptr_t core = *(uintptr_t*)(obj + 8);
+        std::string cmod;
+        unsigned long long crva = modRva(core, cmod);
+        _snprintf_s(b, sizeof(b), _TRUNCATE,
+                    ",\"frame\":true,\"core\":\"0x%llX %s+0x%llX\",\"recv\":[",
+                    (unsigned long long)core, cmod.c_str(), crva);
+        j += b;
+        bool firstR = true;
+        for (int off = 0x08; off <= 0x60; off += 4) {
+            uintptr_t recv = core - off;
+            if (!IsReadable((void*)recv, 16)) continue;
+            uintptr_t vtr = *(uintptr_t*)recv;
+            std::string rmod;
+            unsigned long long rrva = modRva(vtr, rmod);
+            if (!isFrameMod(rmod)) continue;
+            uintptr_t slot3 = ((uintptr_t*)vtr)[3];
+            std::string smod;
+            unsigned long long srva = modRva(slot3, smod);
+            if (!firstR) j += ",";
+            firstR = false;
+            _snprintf_s(b, sizeof(b), _TRUNCATE,
+                        "{\"off\":\"0x%X\",\"vt\":\"%s+0x%llX\",\"slot3\":\"%s+0x%llX\"}",
+                        off, rmod.c_str(), rrva, smod.c_str(), srva);
+            j += b;
+        }
+        j += "]}";
+        if (isFrameMod(mod)) ++frameCount;
+    }
+    j += "]";
+
+    // 8.5 does not keep the frame object in GWLP_USERDATA: fall back to a heap
+    // scan. Look for objects whose vtable lies in a frame-related module and
+    // whose second word points at a core object (core85/config/mngcore).
+    if (frameCount == 0) {
+        struct MR { uintptr_t base = 0, size = 0; std::string leaf; };
+        std::vector<MR> fam, cores;
+        for (const ModuleRange& m : mods) {
+            size_t s = m.path.find_last_of(L"\\/");
+            std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
+            std::string leaf(n.begin(), n.end());
+            if (leaf == "frame.dll" || leaf == "mngcore.dll" || leaf == "mngui.dll" ||
+                leaf == "frmcore.dll" || leaf == "config.dll")
+                fam.push_back({ m.base, m.size, leaf });
+            if (leaf == "core85.dll" || leaf == "core83.dll" || leaf == "config.dll" ||
+                leaf == "mngcore.dll")
+                cores.push_back({ m.base, m.size, leaf });
+        }
+        auto inSpan = [](const std::vector<MR>& v, uintptr_t a) -> const MR* {
+            for (const MR& r : v)
+                if (a >= r.base && a < r.base + r.size) return &r;
+            return nullptr;
+        };
+        j += ",\"scan\":[";
+        bool firstS = true;
+        int found = 0;
+        uintptr_t addr = 0x10000;
+        while (addr < 0x00007FFFFFFFFFFFULL && found < 40) {
+            MEMORY_BASIC_INFORMATION mi{};
+            if (VirtualQuery((void*)addr, &mi, sizeof(mi)) == 0) break;
+            uintptr_t end = addr + mi.RegionSize;
+            bool usable = mi.State == MEM_COMMIT &&
+                          (mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) &&
+                          !(mi.Protect & PAGE_GUARD) &&
+                          !inSpan(fam, (uintptr_t)mi.BaseAddress) &&
+                          !inSpan(cores, (uintptr_t)mi.BaseAddress);
+            if (usable) {
+                uintptr_t cap = mi.RegionSize > 32 * 1024 * 1024 ? 32 * 1024 * 1024
+                                                                 : (uintptr_t)mi.RegionSize;
+                for (uintptr_t p = (uintptr_t)mi.BaseAddress;
+                     p + 16 < (uintptr_t)mi.BaseAddress + cap; p += 8) {
+                    uintptr_t vt = *(uintptr_t*)p;
+                    const MR* mf = inSpan(fam, vt);
+                    if (!mf) continue;
+                    uintptr_t core = *(uintptr_t*)(p + 8);
+                    const MR* mc = inSpan(cores, core);
+                    if (!mc) continue;
+                    if (!firstS) j += ",";
+                    firstS = false;
+                    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                                "{\"obj\":\"0x%llX\",\"vt\":\"%s+0x%llX\",\"core\":\"%s+0x%llX\"",
+                                (unsigned long long)p, mf->leaf.c_str(),
+                                (unsigned long long)(vt - mf->base), mc->leaf.c_str(),
+                                (unsigned long long)(core - mc->base));
+                    j += b;
+                    if (mc->leaf == "core85.dll" || mc->leaf == "core83.dll" ||
+                        mc->leaf == "config.dll") {
+                        j += ",\"recv\":[";
+                        bool firstR2 = true;
+                        for (int off = 0x08; off <= 0x60; off += 4) {
+                            uintptr_t recv = core - off;
+                            if (!IsReadable((void*)recv, 16)) continue;
+                            uintptr_t vtr = *(uintptr_t*)recv;
+                            const MR* mr = inSpan(fam, vtr);
+                            if (!mr) continue;
+                            uintptr_t slot3 = ((uintptr_t*)vtr)[3];
+                            std::string smod;
+                            unsigned long long srva = modRva(slot3, smod);
+                            if (!firstR2) j += ",";
+                            firstR2 = false;
+                            _snprintf_s(b, sizeof(b), _TRUNCATE,
+                                        "{\"off\":\"0x%X\",\"vt\":\"%s+0x%llX\","
+                                        "\"slot3\":\"%s+0x%llX\"}",
+                                        off, mr->leaf.c_str(),
+                                        (unsigned long long)(vtr - mr->base), smod.c_str(), srva);
+                            j += b;
+                        }
+                        j += "]";
+                    }
+                    j += "}";
+                    if (++found >= 40) break;
+                }
+            }
+            addr = end == addr ? addr + 8 : end;
+        }
+        j += "]";
+    }
+    j += "}";
+    return j;
+}
+
+static std::string CmdInfoToJson(const std::wstring&) { return CmdInfoToJsonA(); }
+
 static std::string CmdCommandToJson(const std::wstring& args0) {
     std::wstring args = args0;
     bool wantHas = false;
@@ -1845,6 +2040,11 @@ static int RunPayload(const wchar_t* sharedName) {
                                 std::wstring(g_io->request).size() > 6
                                     ? std::wstring(g_io->request).substr(6)
                                     : std::wstring()));
+            continue;
+        }
+
+        if (wcscmp(g_io->request, L"cmdinfo") == 0) {
+            PutResponse(Guarded(L"cmdinfo", CmdInfoToJson, std::wstring()));
             continue;
         }
 
