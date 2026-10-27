@@ -252,6 +252,9 @@ struct GitBar {
 };
 
 GitBar g_bar;
+// True on 8.5+: the designer paints its client through DWM, so a child window
+// never shows; the bar is a top-level owned window there instead.
+bool g_topLevelDwm = false;
 
 int CellX(int id) { return 2 + (id - 1) * kCell; }
 
@@ -358,21 +361,34 @@ void Reposition(bool forceDock) {
     RECT cur{};
     GetWindowRect(g_bar.hwnd, &cur);
     POINT tl{ cur.left, cur.top };
-    ScreenToClient(frame, &tl);
-
-    bool frameChanged = (cr.right != g_bar.lastFrame.right ||
-                         cr.bottom != g_bar.lastFrame.bottom);
-    g_bar.lastFrame = cr;
-    if (forceDock || frameChanged) {
-        tl.x = w - kBarW - 4;
-        tl.y = kDockY;
+    bool hiddenMinimized = false;
+    if (g_topLevelDwm) {
+        // 8.5 renders its client through DWM: a child window is reported
+        // visible but never painted. The bar must be a top-level owned window;
+        // follow the frame in screen coordinates and hide with it.
+        POINT origin{ 0, 0 };
+        ClientToScreen(frame, &origin);      // client (0,0) in screen space
+        tl.x = origin.x + (w - kBarW - 4);
+        tl.y = origin.y + kDockY;
+        if (!IsWindowVisible(frame)) { ShowWindow(g_bar.hwnd, SW_HIDE); hiddenMinimized = true; }
+        else if (!IsWindowVisible(g_bar.hwnd)) { ShowWindow(g_bar.hwnd, SW_SHOWNOACTIVATE); }
+    } else {
+        ScreenToClient(frame, &tl);
+        bool frameChanged = (cr.right != g_bar.lastFrame.right ||
+                             cr.bottom != g_bar.lastFrame.bottom);
+        g_bar.lastFrame = cr;
+        if (forceDock || frameChanged) {
+            tl.x = w - kBarW - 4;
+            tl.y = kDockY;
+        }
+        if (tl.x < 0) tl.x = 0;
+        if (tl.y < 0) tl.y = 0;
+        if (tl.x > w - kBarW) tl.x = w - kBarW;
+        if (tl.y > h - kBarH) tl.y = h - kBarH;
     }
-    if (tl.x < 0) tl.x = 0;
-    if (tl.y < 0) tl.y = 0;
-    if (tl.x > w - kBarW) tl.x = w - kBarW;
-    if (tl.y > h - kBarH) tl.y = h - kBarH;
+    if (hiddenMinimized) return;
     SetWindowPos(g_bar.hwnd, HWND_TOP, tl.x, tl.y, 0, 0,
-                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                 SWP_NOSIZE | SWP_NOACTIVATE | (g_topLevelDwm ? 0 : SWP_SHOWWINDOW));
 }
 
 void ShowTip(const std::wstring& text) {
@@ -1029,9 +1045,28 @@ DWORD WINAPI BarThread(LPVOID) {
     RegisterClassW(&wc);
 
     HWND frame = FindFrame();
-    g_bar.hwnd = CreateWindowExW(0, L"V8iGitBar", L"GitBar",
-                                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-                                 0, kDockY, kBarW, kBarH, frame, nullptr, hInst, nullptr);
+    if (!frame) return 0;
+    {
+        wchar_t fcls[64] = {};
+        GetClassNameW(frame, fcls, 64);
+        // 8.3 designer: V8TopLevelFrame (GDI child windows work there).
+        // 8.5 designer: V8Window0.* (DWM-composed client) -- use a top-level
+        // owned window, otherwise the bar is never painted on screen.
+        g_topLevelDwm = (wcsstr(fcls, L"V8Window0") != nullptr);
+    }
+    if (g_topLevelDwm) {
+        g_bar.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                                     L"V8iGitBar", L"GitBar",
+                                     WS_POPUP | WS_VISIBLE,
+                                     0, kDockY, kBarW, kBarH, frame, nullptr, hInst, nullptr);
+        if (g_bar.hwnd) {
+            SetLayeredWindowAttributes(g_bar.hwnd, 0, 255, LWA_ALPHA);
+        }
+    } else {
+        g_bar.hwnd = CreateWindowExW(0, L"V8iGitBar", L"GitBar",
+                                     WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                                     0, kDockY, kBarW, kBarH, frame, nullptr, hInst, nullptr);
+    }
 
     // Tooltips: one tool per cell, hit by rect.
     g_bar.tooltip = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr,
