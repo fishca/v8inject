@@ -107,6 +107,17 @@ add_executable(v8inject-gui WIN32
 target_link_libraries(v8inject-gui PRIVATE v8i_common psapi comctl32 comdlg32)
 v8i_set_output(v8inject-gui)
 
+# ---- agent: tray service that auto-injects into 1C on launch ----
+add_executable(v8inject-agent WIN32
+    src/agent/agent.cpp
+    src/agent/agent.rc
+    src/host/injector.cpp
+    src/host/client.cpp
+    src/host/procs.cpp
+)
+target_link_libraries(v8inject-agent PRIVATE v8i_common psapi comctl32 comdlg32 shlwapi)
+v8i_set_output(v8inject-agent)
+
 # ---- test target: a disposable process for the hook tests ----
 add_executable(v8i_hook_target tests/hook_target.cpp)
 v8i_set_output(v8i_hook_target)
