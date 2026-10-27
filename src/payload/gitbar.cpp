@@ -232,12 +232,12 @@ HWND FindFrame() {
 // ---------------------------------------------------------------------------
 
 const int kCell = 24;       // per-button cell width
-const int kCells = 5;
+const int kCells = 6;
 const int kBarW = 2 + kCells * kCell + 2;
 const int kBarH = 24;
 const int kDockY = 28;      // toolbar row, just under the menu
 const int kWinIdDump = 1, kWinIdInit = 2, kWinIdCommit = 3,
-          kWinIdPush = 4, kWinIdSettings = 5;
+          kWinIdPush = 4, kWinIdSettings = 5, kWinIdLog = 6;
 
 struct GitBar {
     HWND hwnd = nullptr;
@@ -339,8 +339,25 @@ void Paint(HWND hwnd) {
             Rectangle(dc, cell.left, cell.top, cell.right, cell.bottom);
             DeleteObject(pen);
         }
-        DrawIcon(dc, IconFor(id), x + (kCell - icons::kSize) / 2,
-                 (kBarH - icons::kSize) / 2);
+        if (id == kWinIdLog) {
+            // Hand-drawn "log" glyph (three text lines with a leading dot):
+            // there is no suitable picture among the baked 1C icons.
+            int gx = x + 4, gy = 5;
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(96, 96, 96));
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            for (int k = 0; k < 3; ++k) {
+                int yy = gy + k * 5;
+                MoveToEx(dc, gx, yy, nullptr);
+                LineTo(dc, gx + 3, yy);
+                MoveToEx(dc, gx + 5, yy, nullptr);
+                LineTo(dc, gx + 15, yy);
+            }
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        } else {
+            DrawIcon(dc, IconFor(id), x + (kCell - icons::kSize) / 2,
+                     (kBarH - icons::kSize) / 2);
+        }
     }
     EndPaint(hwnd, &ps);
 }
@@ -936,6 +953,356 @@ void ShowSettings(HWND owner) {
     Reposition(true);
 }
 
+// ---------------------------------------------------------------------------
+// Git history viewer: a 1C-style window in the configurator listing recent
+// commits with git's own graph column (git log --graph --decorate).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct LogRow {
+    std::wstring graph;    // "│ * " prefix produced by --graph
+    std::wstring hash;
+    std::wstring author;
+    std::wstring date;
+    std::wstring refs;
+    std::wstring subject;
+};
+
+struct LogCtx {
+    HWND hwnd = nullptr;
+    std::vector<LogRow> rows;
+    int top = 0;           // first visible row index
+    int sel = -1;          // selected row
+    int visible = 1;
+    std::wstring dir;
+    std::wstring detail;   // expanded commit text for the selected row
+    HFONT mono = nullptr;
+    HFONT ui = nullptr;
+    RECT rcClose{};
+    bool hoverClose = false;
+};
+
+const int kLogRowH = 17;
+const COLORREF kLogBg = RGB(245, 242, 221);
+const COLORREF kLogSel = RGB(49, 106, 197);
+const COLORREF kLogBorder = RGB(176, 166, 142);
+const COLORREF kLogGray = RGB(112, 104, 88);
+const COLORREF kLogRefs = RGB(30, 90, 160);
+
+std::wstring TrimWs(const std::wstring& s) {
+    size_t b = s.find_first_not_of(L" \t\r\n");
+    if (b == std::wstring::npos) return L"";
+    size_t e = s.find_last_not_of(L" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
+    // 0x1F (unit separator) between fields: subjects may contain anything.
+    std::wstring out = RunGit({ L"-C", dir, L"log", L"--graph", L"--decorate",
+                                L"-n", L"300", L"--date=short",
+                                L"--pretty=format:%x1f%h%x1f%an%x1f%ad%x1f%d%x1f%s" });
+    if (out.empty()) return false;
+    size_t p = 0;
+    while (p < out.size()) {
+        size_t e = out.find_first_of(L"\r\n", p);
+        if (e == std::wstring::npos) e = out.size();
+        std::wstring line = out.substr(p, e - p);
+        p = e;
+        while (p < out.size() && (out[p] == L'\r' || out[p] == L'\n')) ++p;
+        if (line.empty()) continue;
+        size_t star = line.find(L'*');
+        if (star == std::wstring::npos) {
+            rows.push_back({ line, L"", L"", L"", L"", L"" });   // merge graph line
+            continue;
+        }
+        std::wstring graph = line.substr(0, star + 1);
+        std::wstring rest = line.substr(star + 1);
+        // git prints the graph marker, then our separator: "* \x1fhash..." --
+        // drop the leading separator or every field shifts by one.
+        while (!rest.empty() && (rest[0] == L' ' || rest[0] == L'\t' || rest[0] == L'\x1f'))
+            rest.erase(0, 1);
+        std::vector<std::wstring> f;
+        size_t q = 0;
+        while (true) {
+            size_t d = rest.find(L'\x1f', q);
+            if (d == std::wstring::npos) { f.push_back(rest.substr(q)); break; }
+            f.push_back(rest.substr(q, d - q));
+            q = d + 1;
+        }
+        if (f.size() < 5) continue;
+        rows.push_back({ graph, TrimWs(f[0]), f[1], f[2], TrimWs(f[3]), f[4] });
+    }
+    return !rows.empty();
+}
+
+HFONT LogFont(int points, const wchar_t* face) {
+    HDC dc = GetDC(nullptr);
+    int h = -MulDiv(points, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    ReleaseDC(nullptr, dc);
+    return CreateFontW(h, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                       FIXED_PITCH | FF_MODERN, face);
+}
+
+void LogPaint(LogCtx* c) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(c->hwnd, &ps);
+    RECT rc{};
+    GetClientRect(c->hwnd, &rc);
+    HBRUSH bg = CreateSolidBrush(kLogBg);
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    SetBkMode(dc, TRANSPARENT);
+
+    HPEN border = CreatePen(PS_SOLID, 1, kLogBorder);
+    HPEN obp = (HPEN)SelectObject(dc, border);
+    HBRUSH obb = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, 0, 0, rc.right - 1, rc.bottom - 1);
+    SelectObject(dc, obb);
+    SelectObject(dc, obp);
+    DeleteObject(border);
+
+    HGDIOBJ oldFont = SelectObject(dc, c->ui);
+    SetTextColor(dc, RGB(0, 0, 0));
+    RECT head{ 8, 4, rc.right - 34, 20 };
+    DrawTextW(dc, (L"История: " + c->dir).c_str(), -1, &head,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    // close box [X]
+    HBRUSH cb = CreateSolidBrush(c->hoverClose ? RGB(226, 216, 178) : kLogBg);
+    FillRect(dc, &c->rcClose, cb);
+    DeleteObject(cb);
+    HPEN cp = CreatePen(PS_SOLID, 1, kLogBorder);
+    SelectObject(dc, cp);
+    SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, c->rcClose.left, c->rcClose.top, c->rcClose.right, c->rcClose.bottom);
+    DeleteObject(cp);
+    DrawTextW(dc, L"X", -1, &c->rcClose, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // rows
+    int listTop = 24;
+    int listBottom = rc.bottom - 60;
+    c->visible = (listBottom - listTop) / kLogRowH;
+    if (c->visible < 1) c->visible = 1;
+    HGDIOBJ oldMono = SelectObject(dc, c->mono);
+    for (int i = 0; i < c->visible; ++i) {
+        int idx = c->top + i;
+        if (idx >= (int)c->rows.size()) break;
+        RECT row{ 4, listTop + i * kLogRowH, rc.right - 4, listTop + (i + 1) * kLogRowH - 1 };
+        const LogRow& r = c->rows[idx];
+        bool selected = (idx == c->sel);
+        if (selected) {
+            HBRUSH sb = CreateSolidBrush(kLogSel);
+            FillRect(dc, &row, sb);
+            DeleteObject(sb);
+            SetTextColor(dc, RGB(255, 255, 255));
+        } else {
+            SetTextColor(dc, RGB(0, 0, 0));
+        }
+        int x = row.left + 2;
+        // graph column, then hash, refs, subject, date on the right
+        DrawTextW(dc, r.graph.c_str(), (int)r.graph.size(), &row,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        int gw = 0;
+        {
+            SIZE sz{};
+            GetTextExtentPoint32W(dc, r.graph.c_str(), (int)r.graph.size(), &sz);
+            gw = sz.cx;
+        }
+        x += gw;
+        if (!r.hash.empty()) {
+            RECT hr{ x, row.top, x + 74, row.bottom };
+            SetTextColor(dc, selected ? RGB(255, 255, 255) : kLogGray);
+            DrawTextW(dc, r.hash.c_str(), (int)r.hash.size(), &hr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            x += 74;
+        }
+        if (!r.refs.empty() && !selected) SetTextColor(dc, kLogRefs);
+        if (!r.refs.empty()) {
+            SIZE sz{};
+            GetTextExtentPoint32W(dc, r.refs.c_str(), (int)r.refs.size(), &sz);
+            RECT rr{ x, row.top, x + sz.cx + 8, row.bottom };
+            DrawTextW(dc, r.refs.c_str(), (int)r.refs.size(), &rr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            x += sz.cx + 8;
+        }
+        SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
+        RECT sr{ x, row.top, row.right - 84, row.bottom };
+        DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        RECT dr{ row.right - 84, row.top, row.right - 2, row.bottom };
+        SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
+        DrawTextW(dc, r.date.c_str(), (int)r.date.size(), &dr,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, oldMono);
+
+    // scrollbar hint / status line + details
+    SelectObject(dc, oldFont);
+    SetTextColor(dc, kLogGray);
+    wchar_t st[128] = {};
+    int shown = c->visible;
+    if (shown > (int)c->rows.size() - c->top) shown = (int)c->rows.size() - c->top;
+    _snwprintf_s(st, _TRUNCATE, L"коммитов: %d  ▸ %d…%d   (колесо/↑↓, Enter — закрыть)",
+                 (int)c->rows.size(), c->top + 1, c->top + shown);
+    RECT sr{ 8, rc.bottom - 58, rc.right - 8, rc.bottom - 42 };
+    DrawTextW(dc, st, -1, &sr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    if (!c->detail.empty()) {
+        RECT det{ 8, rc.bottom - 40, rc.right - 8, rc.bottom - 4 };
+        DrawTextW(dc, c->detail.c_str(), -1, &det,
+                  DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    EndPaint(c->hwnd, &ps);
+}
+
+void LogScrollTo(LogCtx* c, int top) {
+    int maxTop = (int)c->rows.size() - c->visible;
+    if (maxTop < 0) maxTop = 0;
+    if (top < 0) top = 0;
+    if (top > maxTop) top = maxTop;
+    if (top != c->top) { c->top = top; InvalidateRect(c->hwnd, nullptr, FALSE); }
+}
+
+void LogSelect(LogCtx* c, int idx) {
+    if (idx < 0) idx = 0;
+    if (idx > (int)c->rows.size() - 1) idx = (int)c->rows.size() - 1;
+    c->sel = idx;
+    if (c->sel < c->top) LogScrollTo(c, c->sel);
+    if (c->sel >= c->top + c->visible) LogScrollTo(c, c->sel - c->visible + 1);
+    const LogRow& r = c->rows[c->sel];
+    c->detail.clear();
+    if (!r.hash.empty()) {
+        std::wstring body = RunGit({ L"-C", c->dir, L"show", L"-s",
+                                     L"--format=%an <%ae>, %ad%n%B", r.hash });
+        c->detail = TrimWs(body);
+        if (c->detail.empty()) c->detail = r.author + L", " + r.date;
+    }
+    InvalidateRect(c->hwnd, nullptr, FALSE);
+}
+
+LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    LogCtx* c = (LogCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case WM_PAINT:
+        if (c) LogPaint(c);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        if (c) {
+            RECT rc{};
+            GetClientRect(h, &rc);
+            SetRect(&c->rcClose, rc.right - 26, 2, rc.right - 2, 22);
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (c) LogScrollTo(c, c->top - GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 3);
+        return 0;
+    case WM_MOUSEMOVE: {
+        if (!c) break;
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        bool hv = PtInRect(&c->rcClose, pt) != 0;
+        if (hv != c->hoverClose) { c->hoverClose = hv; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        if (!c) break;
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        if (PtInRect(&c->rcClose, pt)) { DestroyWindow(h); return 0; }
+        if (pt.y >= 24) {
+            int idx = c->top + (pt.y - 24) / kLogRowH;
+            if (idx >= 0 && idx < (int)c->rows.size()) LogSelect(c, idx);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (!c) break;
+        if (wp == VK_ESCAPE || wp == VK_RETURN) { DestroyWindow(h); return 0; }
+        if (wp == VK_DOWN) LogSelect(c, c->sel + 1);
+        if (wp == VK_UP) LogSelect(c, c->sel - 1);
+        if (wp == VK_NEXT) LogScrollTo(c, c->top + c->visible);
+        if (wp == VK_PRIOR) LogScrollTo(c, c->top - c->visible);
+        if (wp == VK_HOME) LogSelect(c, 0);
+        if (wp == VK_END) LogSelect(c, (int)c->rows.size() - 1);
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+}  // namespace
+
+void ShowGitLog(HWND owner) {
+    std::wstring dir = IniGet(L"dumpdir");
+    if (dir.empty()) {
+        MessageBoxW(owner, L"Сначала укажите папку выгрузки в настройках GitBar.",
+                    L"История Git", MB_ICONINFORMATION);
+        return;
+    }
+    if (GetFileAttributesW((dir + L"\\.git").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(owner, (L"В папке выгрузки нет git-репозитория:\n" + dir).c_str(),
+                    L"История Git", MB_ICONINFORMATION);
+        return;
+    }
+    static bool cls = false;
+    if (!cls) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = LogWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"V8iGitLog";
+        if (!RegisterClassW(&wc)) return;
+        cls = true;
+    }
+    LogCtx* c = new LogCtx();
+    c->dir = dir;
+    if (!LoadLog(dir, c->rows)) {
+        delete c;
+        MessageBoxW(owner, L"Не удалось прочитать историю (git log вернул пусто).",
+                    L"История Git", MB_ICONINFORMATION);
+        return;
+    }
+    c->mono = LogFont(8, L"Consolas");
+    c->ui = LogFont(8, L"Tahoma");
+
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitLog",
+                             L"История Git — v8inject",
+                             WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 430, owner, nullptr,
+                             GetModuleHandleW(nullptr), nullptr);
+    if (!h) { delete c; return; }
+    SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)c);
+    c->hwnd = h;
+    RECT rc{};
+    GetClientRect(h, &rc);
+    SetRect(&c->rcClose, rc.right - 26, 2, rc.right - 2, 22);
+    c->visible = (rc.bottom - 60 - 24) / kLogRowH;
+    if (c->visible < 1) c->visible = 1;
+    SetForegroundWindow(h);
+    LogSelect(c, 0);
+
+    MSG msg;
+    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.hwnd == h || IsChild(h, msg.hwnd)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        } else {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (IsWindow(h)) DestroyWindow(h);
+    if (c->mono) DeleteObject(c->mono);
+    if (c->ui) DeleteObject(c->ui);
+    delete c;
+}
+
 void DoAction(int id) {
     switch (id) {
     case kWinIdDump: {
@@ -947,6 +1314,7 @@ void DoAction(int id) {
     case kWinIdCommit: RunCommit(); break;
     case kWinIdPush: RunPush(); break;
     case kWinIdSettings: ShowSettings(g_bar.hwnd); break;
+    case kWinIdLog: ShowGitLog(g_bar.hwnd); break;
     }
 }
 
@@ -1079,6 +1447,7 @@ DWORD WINAPI BarThread(LPVOID) {
         L"Коммит изменений (спросит комментарий)",
         L"Пуш в удалённый репозиторий",
         L"Настройки: git.exe, папка выгрузки, комментарий, remote",
+        L"История коммитов (git log --graph)",
     };
     for (int i = 0; i < kCells; ++i) {
         TOOLINFOW ti{ sizeof(ti), TTF_SUBCLASS };
