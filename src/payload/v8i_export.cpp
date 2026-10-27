@@ -1329,6 +1329,27 @@ static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
 }
 #endif
 
+typedef HRESULT(__stdcall* V8iQIFn)(void*, const GUID*, void**);
+static int V8iQIProbe(void* obj, const GUID* iid, void** out) {
+    int rc = -1;
+    __try {
+        rc = ((V8iQIFn)(*(void**)obj))(obj, iid, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        rc = -2;
+    }
+    return rc;
+}
+
+static void* V8iCallNoArg(uintptr_t fn) {
+    void* r = nullptr;
+    __try {
+        r = ((void*(__cdecl*)())fn)();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        r = nullptr;
+    }
+    return r;
+}
+
 // "cmdinfo" — read-only diagnostics: how the command receiver can be located
 // on THIS platform. 8.3 carries config.dll with the calibrated ITopLevelFrame
 // vtable; 8.5 has core85/frame/mngcore instead, so the chain must be
@@ -1517,6 +1538,216 @@ static std::string CmdInfoToJsonA() {
             addr = end == addr ? addr + 8 : end;
         }
         j += "]";
+    }
+
+    // QueryInterface pass: objects with real rdata vtables (slots 0..5 point
+    // into the same module's .text) are asked about IID_ICommandReceiver —
+    // the modern way to obtain the receiver on 8.5, where the core-0x20 trick
+    // does not apply. QI is side-effect free; each probe is SEH-guarded.
+    {
+        struct MR2 { uintptr_t base = 0, size = 0, tlo = 0, thi = 0, rlo = 0, rhi = 0; };
+        std::vector<MR2> targets;
+        for (const ModuleRange& m : mods) {
+            size_t s = m.path.find_last_of(L"\\/");
+            std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
+            std::string leaf(n.begin(), n.end());
+            if (leaf != "frame.dll" && leaf != "config.dll" && leaf != "mngcore.dll")
+                continue;
+            PeImage im = ParsePe(m.base);
+            if (!im.valid) continue;
+            MR2 r;
+            r.base = m.base;
+            r.size = m.size;
+            for (const PeSection& sec : im.sections) {
+                if (sec.name == ".text") { r.tlo = m.base + sec.va; r.thi = r.tlo + sec.virtualSize; }
+                if (sec.name == ".rdata") { r.rlo = m.base + sec.va; r.rhi = r.rlo + sec.virtualSize; }
+            }
+            if (r.tlo && r.rlo) targets.push_back(r);
+        }
+        auto inText = [&targets](uintptr_t a) -> bool {
+            for (const MR2& r : targets)
+                if (a >= r.tlo && a < r.thi) return true;
+            return false;
+        };
+        auto inRdata = [&targets](uintptr_t a) -> bool {
+            for (const MR2& r : targets)
+                if (a >= r.rlo && a < r.rhi) return true;
+            return false;
+        };
+        static const GUID kIID_CmdRecv = {0x377A2018, 0xC51B, 0x4cf5,
+                                          {0xAC, 0x03, 0xA1, 0x50, 0x92, 0x66, 0xDF, 0x2D}};
+        j += ",\"qi\":[";
+        bool firstQ = true;
+        int qfound = 0;
+        if (0) {
+        uintptr_t addr = 0x10000;
+        while (addr < 0x00007FFFFFFFFFFFULL && qfound < 12) {
+            MEMORY_BASIC_INFORMATION mi{};
+            if (VirtualQuery((void*)addr, &mi, sizeof(mi)) == 0) break;
+            uintptr_t end = addr + mi.RegionSize;
+            bool usable = mi.State == MEM_COMMIT &&
+                          (mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) &&
+                          !(mi.Protect & PAGE_GUARD) && !inRdata((uintptr_t)mi.BaseAddress) &&
+                          !inText((uintptr_t)mi.BaseAddress);
+            if (usable) {
+                uintptr_t cap = mi.RegionSize > 32 * 1024 * 1024 ? 32 * 1024 * 1024
+                                                                 : (uintptr_t)mi.RegionSize;
+                for (uintptr_t p = (uintptr_t)mi.BaseAddress;
+                     p + 48 < (uintptr_t)mi.BaseAddress + cap; p += 8) {
+                    uintptr_t vt = *(uintptr_t*)p;
+                    if (!inRdata(vt)) continue;
+                    bool vok = true;
+                    for (int sl = 1; sl <= 5; ++sl)
+                        if (!inText(((uintptr_t*)vt)[sl])) { vok = false; break; }
+                    if (!vok) continue;
+                    void* out = nullptr;
+                    int rc = V8iQIProbe((void*)p, &kIID_CmdRecv, &out);
+                    if (rc != 0 || !out) continue;
+                    if (!firstQ) j += ",";
+                    firstQ = false;
+                    std::string vmod;
+                    unsigned long long vrva = modRva(vt, vmod);
+                    uintptr_t trFn = out ? *(uintptr_t*)(*(uintptr_t*)out + 3 * 8) : 0;
+                    std::string tmod;
+                    unsigned long long trva = trFn ? modRva(trFn, tmod) : 0;
+                    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                                "{\"obj\":\"0x%llX\",\"vt\":\"%s+0x%llX\","
+                                "\"recv\":\"0x%llX\",\"trFn\":\"%s+0x%llX\"}",
+                                (unsigned long long)p, vmod.c_str(), vrva,
+                                (unsigned long long)(uintptr_t)out, tmod.c_str(), trva);
+                    j += b;
+                    if (++qfound >= 12) break;
+                }
+            }
+            addr = end == addr ? addr + 8 : end;
+        }
+        }
+        j += "]";
+    }
+
+    // SCOM_Process: core85!current_process() returns the process object; its
+    // service table (slot 11 = getService, per v8api/process.v) is the
+    // documented entry to 1C services. Read-only: dump the object and look for
+    // a frame object (rdata vtable in frame/config) among its fields.
+    {
+        ModuleRange core85;
+        bool haveCore = false;
+        for (const ModuleRange& m : mods) {
+            size_t s = m.path.find_last_of(L"\\/");
+            std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
+            if (_wcsicmp(n.c_str(), L"core85.dll") == 0) { core85 = m; haveCore = true; break; }
+        }
+        if (haveCore) {
+            // 8.5 zeroes core85's in-memory export directory (exportCount:0),
+            // so resolve the export from the on-disk image instead.
+            uintptr_t fn = 0;
+            std::string probeStr;
+            bool fhOk = false;
+            long long szPart = 0;
+            DWORD gotB = 0;
+            uint32_t dbgNNames = 0;
+            uint32_t dbgExpRva = 0;
+            uint32_t dbgFrva = 0;
+            HANDLE fh = CreateFileW(core85.path.c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            fhOk = (fh != INVALID_HANDLE_VALUE);
+            if (fh != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER sz{};
+                GetFileSizeEx(fh, &sz);
+                szPart = sz.QuadPart;
+                if (sz.QuadPart > 0 && sz.QuadPart < 64 * 1024 * 1024LL) {
+                    DWORD got = 0;
+                    std::vector<unsigned char> fbuf((size_t)sz.QuadPart);
+                    BOOL rdOk = ReadFile(fh, fbuf.data(), (DWORD)fbuf.size(), &got, nullptr);
+                    gotB = got;
+                    if (rdOk && got == fbuf.size()) {
+                        const unsigned char* fd = fbuf.data();
+                        auto r32 = [fd](uintptr_t o) -> uint32_t {
+                            return *(const uint32_t*)(fd + o);
+                        };
+                        uintptr_t dos = fd[0x3C] | (fd[0x3D] << 8) | (fd[0x3E] << 16) | ((uintptr_t)fd[0x3F] << 24);
+                        if (dos + 0x100 < fbuf.size()) {
+                            uintptr_t nt = dos + 4;
+                            uint16_t nsec = *(const uint16_t*)(fd + nt + 2);
+                            uint16_t optSize = *(const uint16_t*)(fd + nt + 16);
+                            uintptr_t opt = nt + 20;
+                            uintptr_t secTab = opt + optSize;
+                            // RVA -> file offset via the section table
+                            auto toRaw = [&](uint32_t rva) -> uint32_t {
+                                for (uint16_t i = 0; i < nsec; ++i) {
+                                    uintptr_t sh = secTab + (uintptr_t)i * 40;
+                                    if (sh + 40 > fbuf.size()) break;
+                                    uint32_t va = r32(sh + 12);
+                                    uint32_t vs = r32(sh + 8);
+                                    uint32_t raw = r32(sh + 20);
+                                    if (rva >= va && rva < va + vs)
+                                        return rva - va + raw;
+                                }
+                                return rva;
+                            };
+                            // 1C masks the PE magic in core85 (anti-analysis);
+                            // infer the format from SizeOfOptionalHeader (224=PE32, 240=PE32+).
+                            uintptr_t dd = opt + (optSize != 224 ? 112 : 96);  // export directory
+                            if (dd + 8 <= fbuf.size()) {
+                                uint32_t expRva = r32(dd);
+                                if (expRva && expRva + 40 <= fbuf.size()) {
+                                    uint32_t eo = toRaw(expRva);
+                                    if (eo + 40 <= fbuf.size()) {
+                                        uint32_t names = r32(eo + 32);
+                                        uint32_t funcs = r32(eo + 28);
+                                        uint32_t ords  = r32(eo + 36);
+                                        uint32_t nNames = r32(eo + 24);
+                                        dbgNNames = nNames;
+                                        dbgExpRva = expRva;
+                                        for (uint32_t i = 0; i < nNames && i < 16384; ++i) {
+                                            uint32_t np = toRaw(r32(toRaw(names + i * 4)));
+                                            if (!np || np + 64 > (uint32_t)fbuf.size()) continue;
+                                            const char* nm = (const char*)(fd + np);
+                                            if (memcmp(nm, "?current_process@core@@", 23) == 0) {
+                                                uint16_t idx = *(const uint16_t*)(fd + toRaw(ords + i * 2));
+                                                uint32_t frva = r32(toRaw(funcs + (uint32_t)idx * 4));
+                                                fn = core85.base + frva;
+                                                dbgFrva = frva;
+                                                probeStr.assign(nm, strnlen(nm, 64));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                CloseHandle(fh);
+            }
+            j += ",\"process\":{";
+            {
+                std::string pw;
+                for (wchar_t wc : core85.path) pw.push_back((char)wc);
+                std::string pwj;
+                for (char c : pw) {
+                    if (c == '\\' || c == '"') { pwj.push_back('\\'); pwj.push_back(c); }
+                    else pwj.push_back(c);
+                }
+                char nb[360];
+                _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                            "\"path\":\"%s\",\"fh\":%d,\"sz\":%lld,\"got\":%u,\"expRva\":%u,\"nNames\":%u,\"frva\":%u,\"probe\":\"%s\"",
+                            pwj.c_str(), (int)fhOk, szPart, gotB, dbgExpRva, dbgNNames, dbgFrva, probeStr.c_str());
+                j += nb;
+            }
+            j += ",";
+            if (fn) {
+                // current_process() crashes off the UI thread (0xC0000005);
+                // the resolved RVA is reported in dbgFrva — the call itself
+                // must happen on the 1C UI thread (GitBar's window), where
+                // transmitCommand will live.
+                j += "\"fn\":null";
+            } else {
+                j += "\"fn\":null";
+            }
+            j += "}";
+        }
     }
     j += "}";
     return j;
