@@ -1350,6 +1350,80 @@ static void* V8iCallNoArg(uintptr_t fn) {
     return r;
 }
 
+// --- 8.5 UI-thread bridge ---
+// 1C 8.5 crashes (0xC0000005) when core85 functions are called from a foreign
+// thread. To run them on the UI thread we subclass the main window for a
+// moment and post WM_APP+0x602; the subclass proc executes
+// current_process() -> getService(IID_IEventService) and caches the results.
+static uintptr_t g85_fn = 0;
+static uintptr_t g85_proc = 0;
+static uintptr_t g85_procVt = 0;
+static uintptr_t g85_svc = 0;
+static uintptr_t g85_svcVt = 0;
+static uintptr_t g85_svc2 = 0;
+static uintptr_t g85_svc2Vt = 0;
+static int g85_svcSlot = -1;
+static int g85_svc2Slot = -1;
+static int g85_sawMsg = 0;
+static uintptr_t g85_slots[24] = {};
+
+typedef void* (__cdecl* V8iCurProcFn)();
+typedef void* (__cdecl* V8iGetSvcFn)(void*, const GUID*);
+static WNDPROC g85_origWndProc = nullptr;
+
+static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_APP + 0x602) {
+        g85_sawMsg = 1;
+        void* proc = nullptr;
+        __try {
+            proc = ((V8iCurProcFn)g85_fn)();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            proc = nullptr;
+        }
+        g85_proc = (uintptr_t)proc;
+        g85_procVt = proc ? *(uintptr_t*)proc : 0;
+        for (int i = 0; i < 24; ++i) {
+            g85_slots[i] = 0;
+            __try { g85_slots[i] = ((uintptr_t*)g85_procVt)[i]; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { g85_slots[i] = 0; }
+        }
+        if (proc && g85_procVt) {
+            static const GUID kIID_EventService = {0xEBF766AA, 0xF32C, 0x11D3,
+                                                   {0x98, 0x51, 0x00, 0x80, 0x48, 0xDA, 0x12, 0x52}};
+            static const GUID kIID_CmdService = {0x8F885821, 0xD353, 0x11D3,
+                                                 {0x8A, 0x57, 0x00, 0x80, 0x48, 0xDA, 0x06, 0xDF}};
+            void* svc = nullptr;
+            void* svc2 = nullptr;
+            int svcSlot = -1, svc2Slot = -1;
+            __try {
+                for (int slot = 4; slot <= 16; ++slot) {
+                    uintptr_t f = 0;
+                    __try { f = ((uintptr_t*)g85_procVt)[slot]; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { f = 0; }
+                    if (!f) continue;
+                    void* r1 = nullptr, * r2 = nullptr;
+                    __try { r1 = ((V8iGetSvcFn)f)(proc, &kIID_EventService); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { r1 = (void*)-1; }
+                    __try { r2 = ((V8iGetSvcFn)f)(proc, &kIID_CmdService); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { r2 = (void*)-1; }
+                    if (!svc && r1 && r1 != (void*)-1) { svc = r1; svcSlot = slot; }
+                    if (!svc2 && r2 && r2 != (void*)-1) { svc2 = r2; svc2Slot = slot; }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                svc = nullptr;
+            }
+            g85_svc = (uintptr_t)svc;
+            g85_svcVt = svc ? *(uintptr_t*)svc : 0;
+            g85_svc2 = (uintptr_t)svc2;
+            g85_svc2Vt = svc2 ? *(uintptr_t*)svc2 : 0;
+            g85_svcSlot = svcSlot;
+            g85_svc2Slot = svc2Slot;
+        }
+        return 0;
+    }
+    return g85_origWndProc ? CallWindowProcW(g85_origWndProc, h, m, w, l) : 0;
+}
+
 // "cmdinfo" — read-only diagnostics: how the command receiver can be located
 // on THIS platform. 8.3 carries config.dll with the calibrated ITopLevelFrame
 // vtable; 8.5 has core85/frame/mngcore instead, so the chain must be
@@ -1738,11 +1812,102 @@ static std::string CmdInfoToJsonA() {
             }
             j += ",";
             if (fn) {
-                // current_process() crashes off the UI thread (0xC0000005);
-                // the resolved RVA is reported in dbgFrva — the call itself
-                // must happen on the 1C UI thread (GitBar's window), where
-                // transmitCommand will live.
-                j += "\"fn\":null";
+                // current_process() crashes off the UI thread (0xC0000005),
+                // so run the probe on the UI thread via a momentary subclass
+                // of the main 1C window.
+                g85_fn = fn;
+                g85_proc = g85_procVt = g85_svc = g85_svcVt = 0;
+                g85_sawMsg = 0;
+                HWND uiWin = nullptr;
+                int dbgUiWin = 0, dbgCc = 0, dbgDone = 0;
+                {
+                    struct UiEnum {
+                        static BOOL CALLBACK cb(HWND h, LPARAM lp) {
+                            DWORD pid = 0;
+                            GetWindowThreadProcessId(h, &pid);
+                            if (pid != (DWORD)GetCurrentProcessId()) return TRUE;
+                            wchar_t cls[64] = {};
+                            GetClassNameW(h, cls, 64);
+                            if (wcsncmp(cls, L"V8Window0", 9) == 0) {
+                                *(HWND*)lp = h;
+                                return FALSE;
+                            }
+                            return TRUE;
+                        }
+                    };
+                    EnumWindows(UiEnum::cb, (LPARAM)&uiWin);
+                }
+                if (uiWin) {
+                    dbgUiWin = 1;
+                    g85_origWndProc = (WNDPROC)SetWindowLongPtrW(uiWin, GWLP_WNDPROC,
+                                                                (LONG_PTR)V8iSubclass85);
+                    if (g85_origWndProc) {
+                        dbgCc = 1;
+                        SendMessageW(uiWin, WM_APP + 0x602, 0, 0);
+                        SetWindowLongPtrW(uiWin, GWLP_WNDPROC, (LONG_PTR)g85_origWndProc);
+                    }
+                }
+                dbgDone = g85_proc ? 1 : 0;
+                std::string pm, sm, sm2;
+                unsigned long long prva = 0, srva = 0, s2rva = 0;
+                if (g85_procVt) {
+                    pm.clear();
+                    const ModuleRange* foundM = nullptr;
+                    for (const ModuleRange& m : mods)
+                        if (g85_procVt >= m.base && g85_procVt < m.base + m.size) {
+                            foundM = &m;
+                            break;
+                        }
+                    if (foundM) {
+                        for (wchar_t wc : foundM->path) pm.push_back((char)wc);
+                        size_t bs = pm.rfind('\\');
+                        if (bs != std::string::npos) pm = pm.substr(bs + 1);
+                        prva = g85_procVt - foundM->base;
+                    }
+                }
+                if (g85_svcVt) {
+                    const ModuleRange* foundM = nullptr;
+                    for (const ModuleRange& m : mods)
+                        if (g85_svcVt >= m.base && g85_svcVt < m.base + m.size) {
+                            foundM = &m;
+                            break;
+                        }
+                    if (foundM) {
+                        for (wchar_t wc : foundM->path) sm.push_back((char)wc);
+                        size_t bs = sm.rfind('\\');
+                        if (bs != std::string::npos) sm = sm.substr(bs + 1);
+                        srva = g85_svcVt - foundM->base;
+                    }
+                }
+                if (g85_svc2Vt) {
+                    const ModuleRange* foundM = nullptr;
+                    for (const ModuleRange& m : mods)
+                        if (g85_svc2Vt >= m.base && g85_svc2Vt < m.base + m.size) {
+                            foundM = &m;
+                            break;
+                        }
+                    if (foundM) {
+                        for (wchar_t wc : foundM->path) sm2.push_back((char)wc);
+                        size_t bs = sm2.rfind('\\');
+                        if (bs != std::string::npos) sm2 = sm2.substr(bs + 1);
+                        s2rva = g85_svc2Vt - foundM->base;
+                    }
+                }
+                _snprintf_s(b, sizeof(b), _TRUNCATE,
+                            "\"uiWin\":%d,\"cc\":%d,\"saw\":%d,\"done\":%d,\"proc\":\"0x%llX\",\"vt\":\"%s+0x%llX\",\"svc\":\"0x%llX\",\"svt\":\"%s+0x%llX\",\"svcSlot\":%d,\"svc2\":\"0x%llX\",\"svt2\":\"%s+0x%llX\",\"svc2Slot\":%d",
+                            dbgUiWin, dbgCc, g85_sawMsg, dbgDone,
+                            (unsigned long long)g85_proc, pm.c_str(), prva,
+                            (unsigned long long)g85_svc, sm.c_str(), srva, g85_svcSlot,
+                            (unsigned long long)g85_svc2, sm2.c_str(), s2rva, g85_svc2Slot);
+                j += b;
+                j += ",\"slots\":[";
+                for (int i = 0; i < 12; ++i) {
+                    char sb[28];
+                    _snprintf_s(sb, sizeof(sb), _TRUNCATE, "%s\"0x%llX\"",
+                                i ? "," : "", (unsigned long long)g85_slots[i]);
+                    j += sb;
+                }
+                j += "]";
             } else {
                 j += "\"fn\":null";
             }
