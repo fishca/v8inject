@@ -565,92 +565,357 @@ void RunPush() {
     ShowTip(tip);
 }
 
-// Modal settings dialog: git.exe, dump dir, default commit message, remote.
+// ---------------------------------------------------------------------------
+// GitBar settings dialog in the 1C classic look.
+// Everything is drawn by hand (cream background, white input fields, thin
+// borders, flat buttons) the same way the GitBar itself is drawn: child
+// controls of a foreign frame render unreliably, and the user wants the box
+// to look like a native 1C window.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const COLORREF kDlgBg      = RGB(238, 234, 222);   // panel cream
+const COLORREF kDlgBorder  = RGB(176, 166, 142);
+const COLORREF kDlgFieldBg = RGB(255, 255, 255);
+const COLORREF kDlgHover   = RGB(250, 244, 214);
+const COLORREF kDlgPress   = RGB(226, 216, 178);
+const COLORREF kDlgText    = RGB(0, 0, 0);
+
+const wchar_t* kFieldLabels[4] = { L"git.exe", L"папка выгрузки",
+                                   L"комментарий к коммиту", L"remote origin (не обяз.)" };
+const wchar_t* kFieldIni[4]    = { L"gitpath", L"dumpdir", L"commitmsg", L"remote" };
+
 struct SettingsCtx {
-    HWND ed[4] = {};
+    std::wstring fields[4];
+    size_t caret[4] = {};
+    int    active = 0;
+    RECT   fieldRects[4];
+    RECT   okRect, cancelRect;
+    int    hoverBtn = -1;   // 0 = OK, 1 = Отмена, -1 = none
+    int    pressBtn = -1;
+    HFONT  font = nullptr;
+    bool   trackedLeave = false;
 };
 
-LRESULT CALLBACK SettingsDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+HFONT CreateDlgFont() {
+    HDC dc = GetDC(nullptr);
+    int h = -MulDiv(8, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    ReleaseDC(nullptr, dc);
+    return CreateFontW(h, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Tahoma");
+}
+
+void SettingsLayout(HWND h, SettingsCtx* c) {
+    RECT rc;
+    GetClientRect(h, &rc);
+    const int fx = 150, fw = rc.right - fx - 14, fh = 22;
+    for (int i = 0; i < 4; ++i)
+        SetRect(&c->fieldRects[i], fx, 20 + i * 34, fx + fw, 20 + i * 34 + fh);
+    SetRect(&c->okRect,     fx, 166, fx + 84, 190);
+    SetRect(&c->cancelRect, fx + 94, 166, fx + 178, 190);
+}
+
+int TextWidthTo(HDC dc, HFONT f, const std::wstring& s, size_t n) {
+    if (n > s.size()) n = s.size();
+    HGDIOBJ old = SelectObject(dc, f);
+    SIZE sz{};
+    ::GetTextExtentPoint32W(dc, s.c_str(), (int)n, &sz);
+    SelectObject(dc, old);
+    return sz.cx;
+}
+
+size_t CaretFromX(SettingsCtx* c, HWND h, int x) {
+    HDC dc = GetDC(h);
+    HGDIOBJ old = SelectObject(dc, c->font);
+    SIZE sz{};
+    size_t best = 0;
+    for (size_t i = 0; i <= c->fields[c->active].size(); ++i) {
+        ::GetTextExtentPoint32W(dc, c->fields[c->active].c_str(), (int)i, &sz);
+        if (c->fieldRects[c->active].left + 4 + sz.cx >= x) { best = i; break; }
+        best = i;
+    }
+    SelectObject(dc, old);
+    ReleaseDC(h, dc);
+    return best;
+}
+
+void UpdateCaretPix(HWND h, SettingsCtx* c) {
+    RECT& r = c->fieldRects[c->active];
+    HDC dc = GetDC(h);
+    int x = r.left + 4 + TextWidthTo(dc, c->font, c->fields[c->active], c->caret[c->active]);
+    ReleaseDC(h, dc);
+    ::SetCaretPos(x, r.top + 3);
+}
+
+void SettingsInvalidateField(HWND h, SettingsCtx* c, int i) {
+    InvalidateRect(h, &c->fieldRects[i], FALSE);
+}
+
+int SettingsHitButton(SettingsCtx* c, POINT pt) {
+    if (PtInRect(&c->okRect, pt)) return 0;
+    if (PtInRect(&c->cancelRect, pt)) return 1;
+    return -1;
+}
+
+void SettingsSave(HWND h, SettingsCtx* c) {
+    if (!c->fields[0].empty()) IniSet(L"gitpath", c->fields[0].c_str());
+    if (!c->fields[1].empty()) IniSet(L"dumpdir", c->fields[1].c_str());
+    IniSet(L"commitmsg", c->fields[2].c_str());   // empty = auto "chore: 1c dump <stamp>"
+    IniSet(L"remote", c->fields[3].c_str());
+    LogGit(L"settings saved to", kIniPath());
+    DestroyWindow(h);
+}
+
+LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     SettingsCtx* c = (SettingsCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
     switch (msg) {
-    case WM_COMMAND:
-        if (c && LOWORD(wp) == IDOK) {
-            wchar_t b[4][1024] = {};
-            for (int i = 0; i < 4; ++i) GetWindowTextW(c->ed[i], b[i], 1024);
-            if (b[0][0]) IniSet(L"gitpath", b[0]);
-            if (b[1][0]) IniSet(L"dumpdir", b[1]);
-            IniSet(L"commitmsg", b[2]);   // empty = auto "chore: 1c dump <stamp>"
-            IniSet(L"remote", b[3]);
-            LogGit(L"settings saved to", kIniPath());
-            DestroyWindow(h);
-            return 0;
+    case WM_PAINT: {
+        if (!c) break;
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        HideCaret(h);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH bg = CreateSolidBrush(kDlgBg);
+        FillRect(dc, &rc, bg);
+        DeleteObject(bg);
+        HGDIOBJ oldFont = SelectObject(dc, c->font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, kDlgText);
+        // outer frame (1px)
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        HPEN border = CreatePen(PS_SOLID, 1, kDlgBorder);
+        HGDIOBJ oldPen = SelectObject(dc, border);
+        Rectangle(dc, 0, 0, rc.right - 1, rc.bottom - 1);
+        SelectObject(dc, oldPen);
+        DeleteObject(border);
+        SelectObject(dc, oldBrush);
+        // fields + labels
+        for (int i = 0; i < 4; ++i) {
+            RECT& fr = c->fieldRects[i];
+            HBRUSH fb = CreateSolidBrush(kDlgFieldBg);
+            FillRect(dc, &fr, fb);
+            DeleteObject(fb);
+            HPEN fp = CreatePen(PS_SOLID, 1, kDlgBorder);
+            HPEN ofp = (HPEN)SelectObject(dc, fp);
+            HBRUSH ofb = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, fr.left, fr.top, fr.right, fr.bottom);
+            SelectObject(dc, ofb);
+            SelectObject(dc, ofp);
+            DeleteObject(fp);
+            RECT tr = fr;
+            tr.left += 4;
+            tr.right -= 2;
+            DrawTextW(dc, c->fields[i].c_str(), (int)c->fields[i].size(), &tr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            RECT lr = { 12, fr.top, 146, fr.bottom };
+            DrawTextW(dc, kFieldLabels[i], -1, &lr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
-        if (c && LOWORD(wp) == IDCANCEL) { DestroyWindow(h); return 0; }
-        break;
+        // buttons
+        for (int b = 0; b < 2; ++b) {
+            RECT& br = b ? c->cancelRect : c->okRect;
+            HBRUSH bf = CreateSolidBrush(c->pressBtn == b ? kDlgPress
+                                       : c->hoverBtn == b ? kDlgHover : kDlgBg);
+            FillRect(dc, &br, bf);
+            DeleteObject(bf);
+            HPEN bp = CreatePen(PS_SOLID, 1, kDlgBorder);
+            HPEN obp = (HPEN)SelectObject(dc, bp);
+            HBRUSH obr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, br.left, br.top, br.right, br.bottom);
+            SelectObject(dc, obr);
+            SelectObject(dc, obp);
+            DeleteObject(bp);
+            DrawTextW(dc, b ? L"Отмена" : L"OK", -1, &br,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        SelectObject(dc, oldFont);
+        ShowCaret(h);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;                             // painted fully in WM_PAINT
+    case WM_SETFOCUS:
+        if (c) {
+            CreateCaret(h, nullptr, 2, 16);
+            UpdateCaretPix(h, c);
+            ShowCaret(h);
+        }
+        return 0;
+    case WM_KILLFOCUS:
+        HideCaret(h);
+        DestroyCaret();
+        return 0;
+    case WM_CHAR:
+        if (c && wp >= 32 && c->fields[c->active].size() < 9000) {
+            std::wstring& s = c->fields[c->active];
+            size_t at = c->caret[c->active];
+            s.insert(at, 1, (wchar_t)wp);
+            c->caret[c->active] = at + 1;
+            UpdateCaretPix(h, c);
+            SettingsInvalidateField(h, c, c->active);
+            InvalidateRect(h, &c->okRect, FALSE);   // redraw 'OK' in case of
+            InvalidateRect(h, &c->cancelRect, FALSE);
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (!c) break;
+        if (wp == VK_RETURN) { SettingsSave(h, c); return 0; }
+        if (wp == VK_ESCAPE) { DestroyWindow(h); return 0; }
+        {
+            std::wstring& s = c->fields[c->active];
+            size_t& at = c->caret[c->active];
+            switch (wp) {
+            case VK_BACK:
+                if (at > 0) { s.erase(at - 1, 1); --at; }
+                break;
+            case VK_DELETE:
+                if (at < s.size()) s.erase(at, 1);
+                break;
+            case VK_LEFT:  if (at > 0) --at; break;
+            case VK_RIGHT: if (at < s.size()) ++at; break;
+            case VK_HOME:  at = 0; break;
+            case VK_END:   at = s.size(); break;
+            case VK_TAB: {
+                int dir = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
+                c->active = (c->active + dir + 4) % 4;
+                UpdateCaretPix(h, c);
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            case 'A':
+                if (GetKeyState(VK_CONTROL) & 0x8000) at = s.size();
+                break;
+            case 'V':
+                if (GetKeyState(VK_CONTROL) & 0x8000) {
+                    if (OpenClipboard(h)) {
+                        HANDLE g = GetClipboardData(CF_UNICODETEXT);
+                        if (g) {
+                            const wchar_t* t = (const wchar_t*)GlobalLock(g);
+                            if (t) {
+                                std::wstring p(t);
+                                size_t gl = GlobalSize(g) / sizeof(wchar_t);
+                                size_t took = wcslen(t);
+                                if (gl > 0 && took > gl - 1) took = gl - 1;
+                                p = std::wstring(t, took);
+                                if (!p.empty()) {
+                                    s.insert(at, p);
+                                    at += p.size();
+                                }
+                                GlobalUnlock(g);
+                            }
+                        }
+                        CloseClipboard();
+                    }
+                }
+                break;
+            default:
+                return 0;
+            }
+            UpdateCaretPix(h, c);
+            SettingsInvalidateField(h, c, c->active);
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        if (!c) break;
+        SetFocus(h);
+        POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+        for (int i = 0; i < 4; ++i) {
+            if (PtInRect(&c->fieldRects[i], pt)) {
+                if (c->active != i) {
+                    c->active = i;
+                    InvalidateRect(h, nullptr, FALSE);
+                }
+                c->caret[i] = CaretFromX(c, h, pt.x);
+                UpdateCaretPix(h, c);
+                return 0;
+            }
+        }
+        int b = SettingsHitButton(c, pt);
+        if (b >= 0) { c->pressBtn = b; c->hoverBtn = b; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (!c || c->pressBtn < 0) break;
+        POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+        int b = SettingsHitButton(c, pt);
+        if (b == c->pressBtn && b == 0) { c->pressBtn = -1; SettingsSave(h, c); return 0; }
+        if (b == c->pressBtn && b == 1) { c->pressBtn = -1; DestroyWindow(h); return 0; }
+        c->pressBtn = -1;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!c) break;
+        if (!c->trackedLeave) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            c->trackedLeave = true;
+        }
+        POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+        int b = SettingsHitButton(c, pt);
+        if (b != c->hoverBtn) { c->hoverBtn = b; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (c) { c->hoverBtn = -1; c->trackedLeave = false; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;
     }
-    return DefDlgProcW(h, msg, wp, lp);
+    return DefWindowProcW(h, msg, wp, lp);
 }
 
+}  // namespace
+
+bool g_settingsClassRegistered = false;
+
 void ShowSettings(HWND owner) {
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", L"GitBar — настройки",
-                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 460, 226, owner, nullptr,
-                               GetModuleHandleW(nullptr), nullptr);
-    if (!dlg) return;
+    if (!g_settingsClassRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = SettingsWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"V8iGitBarSettings";
+        if (!RegisterClassW(&wc)) return;
+        g_settingsClassRegistered = true;
+    }
 
     SettingsCtx ctx;
-    SetWindowLongPtrW(dlg, GWLP_WNDPROC, (LONG_PTR)SettingsDlgProc);
-    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
-
-    auto Lbl = [&](int y, const wchar_t* t) {
-        CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        12, y, 140, 18, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
-    };
-    auto Edt = [&](int y) {
-        return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                               158, y, 284, 22, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
-    };
-
-    ctx.ed[0] = Edt(14);
-    ctx.ed[1] = Edt(44);
-    ctx.ed[2] = Edt(74);
-    ctx.ed[3] = Edt(104);
-    Lbl(15, L"git.exe");
-    Lbl(45, L"папка выгрузки");
-    Lbl(75, L"комментарий к коммиту");
-    Lbl(105, L"remote origin (не обяз.)");
-    CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                    158, 150, 90, 26, dlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleW(nullptr), nullptr);
-    CreateWindowExW(0, L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    258, 150, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL,
-                    GetModuleHandleW(nullptr), nullptr);
-
-    std::wstring git = GitExe();
-    if (git == L"git.exe" && GetFileAttributesW(L"C:\\Program Files\\Git\\cmd\\git.exe")
-                                 != INVALID_FILE_ATTRIBUTES) {
-        git = L"C:\\Program Files\\Git\\cmd\\git.exe";
+    ctx.font = CreateDlgFont();
+    ctx.fields[0] = GitExe();
+    if (ctx.fields[0] == L"git.exe" && GetFileAttributesW(L"C:\\Program Files\\Git\\cmd\\git.exe")
+                                         != INVALID_FILE_ATTRIBUTES) {
+        ctx.fields[0] = L"C:\\Program Files\\Git\\cmd\\git.exe";
     }
-    SetWindowTextW(ctx.ed[0], git.c_str());
-    SetWindowTextW(ctx.ed[1], IniGet(L"dumpdir").c_str());
-    SetWindowTextW(ctx.ed[2], IniGet(L"commitmsg").c_str());
-    SetWindowTextW(ctx.ed[3], IniGet(L"remote").c_str());
+    ctx.fields[1] = IniGet(L"dumpdir");
+    ctx.fields[2] = IniGet(L"commitmsg");
+    ctx.fields[3] = IniGet(L"remote");
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitBarSettings", L"GitBar — настройки",
+                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 460, 232, owner, nullptr,
+                               GetModuleHandleW(nullptr), nullptr);
+    if (!dlg) { DeleteObject(ctx.font); return; }
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
+    SettingsLayout(dlg, &ctx);
 
     SetForegroundWindow(dlg);
-    SetFocus(ctx.ed[0]);
+    SetFocus(dlg);
 
     MSG msg;
     for (;;) {
         if (!IsWindow(dlg)) break;
         if (!GetMessageW(&msg, nullptr, 0, 0)) break;   // WM_QUIT
-        if (IsDialogMessageW(dlg, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
     if (IsWindow(dlg)) DestroyWindow(dlg);
+    DeleteObject(ctx.font);
     Reposition(true);
 }
 
