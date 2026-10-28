@@ -1574,6 +1574,9 @@ void V8iStartStartupWatch() {
 // Subscribes to eventCreateFrame so the next frame creation hands us an
 // ITopLevelFrame; a recipient object with a 4-slot vtable lives here.
 static uintptr_t g85_evFrame = 0;
+static unsigned char g85_frameDump[64] = {};
+static char g85_frameMod[40] = {};
+static uint32_t g85_frameRva = 0;
 static volatile long g85_evCount = 0;
 static HRESULT __stdcall V8iRecipQI(void* self, const GUID*, void** out) {
     if (out) *out = self;
@@ -1583,7 +1586,29 @@ static ULONG __stdcall V8iRecipAddRef(void*) { return 1; }
 static ULONG __stdcall V8iRecipRelease(void*) { return 1; }
 static HRESULT __stdcall V8iRecipOnEvent(void*, const GUID*, long, void* obj) {
     ++g85_evCount;
-    if (obj) g85_evFrame = (uintptr_t)obj;
+    if (obj) {
+        g85_evFrame = (uintptr_t)obj;
+        // Capture enough to identify the object later: its vtable, the module
+        // that vtable lives in, and the first 64 bytes of the object itself.
+        if (IsReadable(obj, 16)) {
+            g85_frameVt = *(uintptr_t*)obj;
+            if (IsReadable(obj, 64)) memcpy(g85_frameDump, obj, 64);
+            if (g85_frameVt) {
+                for (const ModuleRange& m : EnumModules()) {
+                    if (g85_frameVt >= m.base && g85_frameVt < m.base + m.size) {
+                        g85_frameRva = (uint32_t)(g85_frameVt - m.base);
+                        size_t s = m.path.find_last_of(L"\\/");
+                        std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
+                        size_t k = 0;
+                        for (; k < n.size() && k < sizeof(g85_frameMod) - 1; ++k)
+                            g85_frameMod[k] = (char)n[k];
+                        g85_frameMod[k] = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     return 0;
 }
 static void* g85_recipVt[4] = {(void*)V8iRecipQI, (void*)V8iRecipAddRef,
@@ -2481,6 +2506,27 @@ static std::string CmdExports85ToJson(const std::wstring& arg) {
     return j;
 }
 
+// "frames" — what eventCreateFrame handed us: pointer, vtable, module, dump.
+static std::string CmdFramesToJson(const std::wstring&) {
+    if (!g85_evFrame)
+        return "{\"status\":\"ok\",\"count\":0,\"frames\":[]}";
+    std::string j = "{\"status\":\"ok\",\"count\":1,\"evCount\":";
+    char b[512];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, "%ld,\"frames\":[{", g85_evCount);
+    j += b;
+    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                "\"ptr\":\"0x%llX\",\"vtable\":\"0x%llX\",\"module\":\"%s\",\"rva\":\"0x%X\",\"dump\":\"",
+                (unsigned long long)g85_evFrame, (unsigned long long)g85_frameVt,
+                g85_frameMod, g85_frameRva);
+    j += b;
+    for (int i = 0; i < 64; ++i) {
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "%s%02X", i ? " " : "", g85_frameDump[i]);
+        j += b;
+    }
+    j += "\"}]}";
+    return j;
+}
+
 static std::string CmdInfoToJson(const std::wstring&) { return CmdInfoToJsonA(); }
 
 static std::string CmdCommandToJson(const std::wstring& args0) {
@@ -3005,6 +3051,11 @@ static int RunPayload(const wchar_t* sharedName) {
 
         if (wcscmp(g_io->request, L"cmdinfo") == 0) {
             PutResponse(Guarded(L"cmdinfo", CmdInfoToJson, std::wstring()));
+            continue;
+        }
+
+        if (wcscmp(g_io->request, L"frames") == 0) {
+            PutResponse(Guarded(L"frames", CmdFramesToJson, std::wstring()));
             continue;
         }
 
