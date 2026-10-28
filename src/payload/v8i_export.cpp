@@ -1560,6 +1560,69 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     return 0;
 }
 
+// --- early subscribe (plan_inj_ext P0-2) -----------------------------------
+// Snegopat catches window creation with a WH_CBT hook and subscribes while the
+// platform DLLs are loaded but the main window does not exist yet. Subscribing
+// inside the hook itself crashes 1C (the core is not ready at that point), so
+// the hook only remembers the window and starts a worker that retries the
+// subscribe chain on that window's UI thread until the core answers.
+static HHOOK g_cbtHook = nullptr;
+static DWORD g_ownerPid = 0;
+static volatile int g_cbtFired = 0;
+
+static DWORD WINAPI V8iEarlySubscribeThread(LPVOID);
+
+static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (GetCurrentProcessId() != g_ownerPid)
+        return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
+    if (nCode == HCBT_CREATEWND && !g_cbtFired) {
+        HWND hwnd = (HWND)wParam;
+        CBT_CREATEWNDW* cw = (CBT_CREATEWNDW*)lParam;
+        const wchar_t* cls = (cw && cw->lpcs) ? cw->lpcs->lpszClass : nullptr;
+        if (cls && (wcsncmp(cls, L"V8Window0", 9) == 0 ||
+                    wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)) {
+            g_cbtFired = 1;
+            g85_uiWin = (uintptr_t)hwnd;
+            LogLine("cbt: window %ls hwnd=%p — starting early subscribe", cls, (void*)hwnd);
+            CreateThread(nullptr, 0, V8iEarlySubscribeThread, (LPVOID)hwnd, 0, nullptr);
+        }
+    }
+    return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
+}
+
+// Installs the hook; called from v8i_probe before the session starts, so the
+// splash screen is still ahead.
+static bool V8iArmEarlySubscribe() {
+    if (g_cbtHook) return true;
+    g_ownerPid = GetCurrentProcessId();
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)&V8iCbtProc, &self)) return false;
+    g_cbtHook = SetWindowsHookExW(WH_CBT, (HOOKPROC)&V8iCbtProc, self, 0);
+    return g_cbtHook != nullptr;
+}
+
+static DWORD WINAPI V8iEarlySubscribeThread(LPVOID param) {
+    HWND h = (HWND)param;
+    for (int i = 0; i < 200 && !g85_subscribed; ++i) {
+        Sleep(50);
+        if (!IsWindow(h)) break;
+        DWORD tid = GetWindowThreadProcessId(h, nullptr);
+        if (tid && tid != GetCurrentThreadId()) {
+            WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)V8iSubclass85);
+            if (old) {
+                g85_origWndProc = old;
+                SendMessageW(h, WM_APP + 0x602, 0, 0);
+                SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
+            }
+        }
+        if (g85_subscribed) break;
+    }
+    LogLine("early subscribe: done, subscribed=%d", g85_subscribed);
+    return 0;
+}
+
 static bool V8iInstallCreateWindowHook();
 
 void V8iStartStartupWatch() {
@@ -3131,9 +3194,12 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* /*ignored*/) {
     LogLine("v8i_probe entered, pid=%lu block=%ls",
             GetCurrentProcessId(), name);
 
-    // Run the session inline on this thread. The host owns and closes the
-    // remote thread, and keeping the work here means no second thread has to
-    // be created inside a process we do not control.
+    // Arm the WH_CBT hook before the session: on 8.5 the splash screen is the
+    // last moment when eventCreateFrame can still be caught (see plan_inj_ext
+    // P0-2). The hook itself only records the window; the actual subscribe is
+    // retried from a worker once the core is ready.
+    V8iArmEarlySubscribe();
+
     int rc = RunPayload(name);
     LogLine("v8i_probe leaving, rc=%d", rc);
     return rc;

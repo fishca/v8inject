@@ -638,6 +638,43 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
 
+    if (cmd == L"launch") {
+        // v8inject launch <exe> [args...] [--dll <path>]
+        // Starts the target and injects the payload immediately, before 1C
+        // creates its main window — the payload arms a WH_CBT hook in
+        // v8i_probe, so the splash screen is still ahead.
+        if (argc < 3) { PrintUsage(); return 1; }
+        Options o = ParseOptions(argc, argv, 3);
+        std::wstring exe = argv[2];
+        std::wstring cmdline = L"\"" + exe + L"\"";
+        for (int i = 3; i < argc; ++i) {
+            std::wstring a = argv[i];
+            if (a == L"--dll") { ++i; continue; }
+            cmdline += L" ";
+            cmdline += a;
+        }
+        wprintf(L"cmdline=[%s]\n", cmdline.c_str());
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, FALSE,
+                            0, nullptr, nullptr, &si, &pi)) {
+            wprintf(L"launch failed: %lu\n", GetLastError());
+            return 3;
+        }
+        // Injection goes through the Client (shared block + v8i_probe), the
+        // only path that works on 8.5. Open() blocks until the payload answers,
+        // which may not happen while 1C is still starting — the CBT hook is
+        // armed before that, so the wait is harmless for the frame capture.
+        v8i::Client client;
+        bool ok = client.Open(pi.dwProcessId, o.dll, ExeDir(), o.timeoutMs);
+        wprintf(L"launched pid=%lu inject=%s\n", pi.dwProcessId, ok ? L"ok" : L"FAILED");
+        if (ok) client.Close();
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return ok ? 0 : 4;
+    }
+
     if (cmd == L"inject") {
         if (argc < 3) { PrintUsage(); return 1; }
         DWORD pid = ResolvePid(argc, argv, argv[2]);
