@@ -180,10 +180,35 @@ frame (ITopLevelFrame*)
 
 ---
 
-## 7. Дизасм Снегопата: как core_as.dll ловит окно (дополнение к P0-2)
+## 7. Дизасм Снегопата: как ставится WH_CBT (дополнение к P0-2)
 
-Инструмент: `tools/recon_coreas_cbt.py` (pefile + capstone, без дизасма всего
-движка). Подтверждено на `core_as.dll` из v8snack:
+Инструменты: `tools/recon_coreas_cbt.py` (обращения к хукам в `core_as.dll`),
+`tools/recon_snegopat_hooks.py` (то же для `snegopat.dll`). Без дизасма всего
+движка — только точечный разбор.
+
+Уточнение (после первого прохода): **WH_CBT-хук ставит сам `snegopat.dll`**
+(модуль Снегопата), не `core_as`:
+
+- импорты `USER32` в `snegopat.dll`: `SetWindowsHookExW`, `CallNextHookEx`,
+  `UnhookWindowsHookEx`, **`CreateWindowExW`** — хуки окон стоят в модуле, и
+  модуль же создаёт свои нативные окна;
+- импорты `core_as.dll`: только движковые API (`asRegisterProp`,
+  `CScriptArray`, …) — `SetWindowsHookExW` в `core_as` отсутствует;
+- экспорты `snegopat.dll`: `moduleInit` (точка входа модуля, вызывается
+  ядром `core_as`) и вспомогательный;
+- вызовы в `.text` `snegopat.dll`: `SetWindowsHookExW` @ `0x2399` и `0x7A93`,
+  рядом пары `CallNextHookEx`/`UnhookWindowsHookEx` (процедуры ~0x1900,
+  ~0x7700 — см. `--rva` в скрипте для контекста).
+
+То есть в цепочке Снегопата хук создания окна — это часть модуля: core_as
+загружает `snegopat.dll`, вызывает `moduleInit`, а тот регистрирует свой API и
+ставит `WH_CBT` (и `CreateWindowExW` для своих окон).
+
+Следствия для v8inject:
+- повторять приём `WH_CBT` без патчей кода можно — хуки ставятся штатно;
+- но требования к контексту (поток 1С, готовность ядра) — те же, что мы
+  видели: у Снегопата работает, потому что весь доступ к ядру идёт через
+  обёртки `core_as`; прямой вызов `current_process` в этот момент у нас падал;
 
 ```
 0x13E040  sub  rsp, 0x28
