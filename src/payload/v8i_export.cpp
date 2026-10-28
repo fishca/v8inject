@@ -1537,6 +1537,10 @@ static BOOL CALLBACK V8iFindMainWindow(HWND w, LPARAM lp) {
     return TRUE;
 }
 
+static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam);
+static HHOOK g_cbtThreadHook;
+static volatile long g_cbtThreadTid;
+
 static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     for (int i = 0; i < 4000 && !g85_subscribed; ++i) {
         HWND h = nullptr;
@@ -1548,6 +1552,20 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
             if (g85_origWndProc) {
                 SendMessageW(h, WM_APP + 0x602, 0, 0);
                 SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)g85_origWndProc);
+            }
+            // The global CBT hook never fires in 8.5 (cbtCalls stays 0 even for
+            // newly opened windows), so try a thread-scoped one on the UI thread.
+            if (!g_cbtThreadHook) {
+                DWORD tid = GetWindowThreadProcessId(h, nullptr);
+                HINSTANCE self = nullptr;
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)&V8iCbtProc, &self);
+                HHOOK th = SetWindowsHookExW(WH_CBT, (HOOKPROC)&V8iCbtProc, self, tid);
+                if (th) {
+                    g_cbtThreadHook = th;
+                    g_cbtThreadTid = (long)tid;
+                }
             }
             // The core is not ready the instant the window appears, so keep
             // retrying until the subscribe chain actually succeeds.
@@ -1579,13 +1597,29 @@ static volatile int g_cbtFired = 0;
 
 static DWORD WINAPI V8iEarlySubscribeThread(LPVOID);
 
+// True when the current process is a 1C:Enterprise Configurator. The hook is
+// loaded into every GUI process by the global WH_CBT, but only 1C is worth
+// arming. Works even before the session sets g_ownerPid (the hook fires while
+// the payload is still being loaded by Windows itself).
+static bool V8iIsTargetProcess() {
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+    const wchar_t* leaf = wcsrchr(path, L'\\');
+    leaf = leaf ? leaf + 1 : path;
+    return _wcsicmp(leaf, L"1cv8.exe") == 0 ||
+           _wcsicmp(leaf, L"1cv8c.exe") == 0;
+}
+
 static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
     // A fault inside a hook callback terminates the whole process
     // (0xC000041D), and during 1C start-up almost nothing is safe to call, so
     // the whole body sits under SEH: a failure must not kill the Configurator.
     __try {
         InterlockedIncrement(&g_cbtCalls);
-        if (GetCurrentProcessId() != g_ownerPid)
+        // Ignore non-1C processes the global hook is also delivered to
+        // (Explorer etc). The pid filter alone is wrong: when the payload is
+        // pulled in by the hook itself g_ownerPid is still 0.
+        if (!V8iIsTargetProcess())
             return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
         if (nCode == HCBT_CREATEWND) {
             InterlockedIncrement(&g_cbtCreateCount);
@@ -1602,6 +1636,14 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_cbtLastClass[k] = 0;
                 if (InterlockedIncrement(&g_cbtStrCreates) == 1 && k)
                     memcpy(g_cbtFirstClass, g_cbtLastClass, sizeof(g_cbtFirstClass));
+                // Dump every string class that reaches the hook, so we can see
+                // whether the main window "V8Window0.xxx" passes through here
+                // at all.
+                FILE* cf = nullptr;
+                if (_wfopen_s(&cf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cbt_classes.txt", L"a") == 0 && cf) {
+                    fprintf(cf, "%s\n", g_cbtLastClass);
+                    fclose(cf);
+                }
             } else {
                 g_cbtLastClass[0] = 0;
             }
@@ -1640,8 +1682,21 @@ static bool V8iArmEarlySubscribe() {
 // C linkage: the host installs this as a *global* WH_CBT hook (hMod = payload),
 // so Windows loads the payload into the target before 1C creates its main
 // window, and DllMain then arms the in-process hook as well.
+static volatile long g_cbtExportCalls = 0;
 extern "C" __declspec(dllexport) LRESULT CALLBACK V8iCbtProcExport(
     int nCode, WPARAM wParam, LPARAM lParam) {
+    // Marker: does the global hook actually reach a 1C process?
+    if (InterlockedIncrement(&g_cbtExportCalls) == 1) {
+        wchar_t p[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, p, MAX_PATH);
+        const wchar_t* leaf = wcsrchr(p, L'\\');
+        leaf = leaf ? leaf + 1 : p;
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cbt_hit.txt", L"w+") == 0 && f) {
+            fprintf(f, "%lu %ls nCode=%d\n", GetCurrentProcessId(), p, nCode);
+            fclose(f);
+        }
+    }
     return V8iCbtProc(nCode, wParam, lParam);
 }
 
@@ -2623,11 +2678,12 @@ static std::string CmdFramesToJson(const std::wstring&) {
     _snprintf_s(b, sizeof(b), _TRUNCATE,
                 "{\"status\":\"ok\",\"count\":%d,\"evCount\":%ld,"
                 "\"cbtFired\":%d,\"cbtCalls\":%ld,\"cbtCreates\":%ld,"
-                "\"cbtFault\":\"0x%08X\",\"cbtHook\":\"0x%llX\",\"cbtStr\":%ld,"
+                "\"cbtFault\":\"0x%08X\",\"cbtHook\":\"0x%llX\",\"cbtThreadHook\":\"0x%llX\",\"cbtThreadTid\":\"0x%lX\",\"cbtStr\":%ld,"
                 "\"cbtFirstClass\":\"%s\",\"cbtLastClass\":\"%s\","
                 "\"subscribed\":%d,\"frames\":[",
                 g85_evFrame ? 1 : 0, g85_evCount, g_cbtFired, g_cbtCalls, g_cbtCreateCount,
-                (unsigned)g_cbtFault, (unsigned long long)(uintptr_t)g_cbtHook, g_cbtStrCreates,
+                (unsigned)g_cbtFault, (unsigned long long)(uintptr_t)g_cbtHook,
+                (unsigned long long)(uintptr_t)g_cbtThreadHook, g_cbtThreadTid, g_cbtStrCreates,
                 g_cbtFirstClass, g_cbtLastClass, g85_subscribed);
     std::string j = b;
     if (!g85_evFrame) {
