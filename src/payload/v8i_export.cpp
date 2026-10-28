@@ -1564,10 +1564,10 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
 static bool V8iInstallCreateWindowHook();
 
 void V8iStartStartupWatch() {
-    // NOTE: the inline hook on CreateWindowExW is disabled — the current
-    // trampoline crashes 1C when the window is created. Re-enable after the
-    // trampoline is fixed (see V8iInstallCreateWindowHook).
-    V8iInstallCreateWindowHook();
+    // The window-creation hooks (user32!CreateWindowExW, wbase85!V8CreateWindowEx)
+    // never fire on 8.5 — the main window is created deeper (win32u), so they
+    // are left disabled; the watcher stays as a fallback.
+    // V8iInstallCreateWindowHook();
     CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
 }
 
