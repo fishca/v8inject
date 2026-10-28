@@ -638,6 +638,56 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
 
+    if (cmd == L"launch") {
+        // v8inject launch <exe> [args...] [--dll <path>]
+        // Starts the target suspended, resumes it and injects the payload
+        // immediately — early enough for the payload's win32u window hook to
+        // catch the main window creation on 8.5.
+        if (argc < 3) { PrintUsage(); return 1; }
+        Options o = ParseOptions(argc, argv, 3);
+        std::wstring exe = argv[2];
+        std::wstring cmdline = L"\"" + exe + L"\"";
+        for (int i = 3; i < argc; ++i) {
+            std::wstring a = argv[i];
+            if (a == L"--dll") { ++i; continue; }
+            cmdline += L" ";
+            cmdline += a;
+        }
+        wprintf(L"cmdline=[%s]\n", cmdline.c_str());
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, FALSE,
+                            0, nullptr, nullptr, &si, &pi)) {
+            wprintf(L"launch failed: %lu\n", GetLastError());
+            return 3;
+        }
+        // Inject right away: the loader lock is released during start-up, so
+        // the remote LoadLibraryW completes well before the main window.
+        // Inject the same way the agent does: through the Client (shared block
+        // + v8i_probe), not via LoadLibraryW — that path is what works on 8.5.
+        v8i::Client client;
+        bool ok = client.Open(pi.dwProcessId, o.dll, ExeDir(), o.timeoutMs);
+        if (ok) {
+            std::string resp;
+            bool armed = client.Call(L"cmdinfo", resp, o.timeoutMs);
+            wprintf(L"armed: %ls\n", armed ? Utf8ToWide(resp).c_str() : L"<no reply>");
+            client.Close();
+        }
+        wprintf(L"launched pid=%lu inject=%s\n", pi.dwProcessId, ok ? L"ok" : L"FAILED");
+        DWORD wait = WaitForSingleObject(pi.hProcess, 3000);
+        if (wait == WAIT_OBJECT_0) {
+            DWORD ec = 0;
+            GetExitCodeProcess(pi.hProcess, &ec);
+            wprintf(L"exited code=0x%08X\n", ec);
+        } else {
+            wprintf(L"alive after 3s\n");
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return ok ? 0 : 4;
+    }
+
     if (cmd == L"inject") {
         if (argc < 3) { PrintUsage(); return 1; }
         DWORD pid = ResolvePid(argc, argv, argv[2]);

@@ -1537,12 +1537,14 @@ static BOOL CALLBACK V8iFindMainWindow(HWND w, LPARAM lp) {
     return TRUE;
 }
 
+static bool V8iInstallCbtHook(DWORD tid);
 static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     for (int i = 0; i < 4000 && !g85_subscribed; ++i) {
         HWND h = nullptr;
         EnumWindows(V8iFindMainWindow, (LPARAM)&h);
         if (h) {
             g85_uiWin = (uintptr_t)h;
+            V8iInstallCbtHook(GetWindowThreadProcessId(h, nullptr));
             g85_origWndProc = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC,
                                                          (LONG_PTR)V8iSubclass85);
             if (g85_origWndProc) {
@@ -1561,6 +1563,49 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
 }
 
 static bool V8iInstallCreateWindowHook();
+
+// WH_CBT hook — the mechanism Snegopat uses: it fires when 1C creates a
+// window, while the core is already loaded but the main window does not exist
+// yet, which is exactly when eventCreateFrame can still be caught.
+static HHOOK g_cbtHook = nullptr;
+static DWORD g_ownerPid = 0;
+static volatile long g_cbtFault = 0;
+static void V8iSubscribeNow();
+
+static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (GetCurrentProcessId() != g_ownerPid)
+        return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
+    if (nCode == HCBT_CREATEWND) {
+        HWND hwnd = (HWND)wParam;
+        CBT_CREATEWNDW* cw = (CBT_CREATEWNDW*)lParam;
+        const wchar_t* cls = (cw && cw->lpcs) ? cw->lpcs->lpszClass : nullptr;
+        if (cls && (wcsncmp(cls, L"V8Window0", 9) == 0 ||
+                    wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)) {
+            g85_uiWin = (uintptr_t)hwnd;
+            // A fault inside a hook callback kills the process (0xC000041D),
+            // so the subscribe chain is always guarded.
+            __try {
+                V8iSubscribeNow();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                g_cbtFault = GetExceptionCode();
+            }
+        }
+    }
+    return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
+}
+
+static bool V8iInstallCbtHook(DWORD tid) {
+    if (g_cbtHook) return true;
+    g_ownerPid = GetCurrentProcessId();
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)&V8iCbtProc, &self)) return false;
+    // tid 0 = global hook: catches the splash screen too, which is what
+    // Snegopat relies on (its native DLL hooks WH_CBT before the main window).
+    g_cbtHook = SetWindowsHookExW(WH_CBT, (HOOKPROC)&V8iCbtProc, self, tid);
+    return g_cbtHook != nullptr;
+}
 
 void V8iStartStartupWatch() {
     // NOTE: the inline hook on CreateWindowExW is disabled — the current
@@ -2946,6 +2991,11 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* /*ignored*/) {
                  GetCurrentProcessId());
     LogLine("v8i_probe entered, pid=%lu block=%ls",
             GetCurrentProcessId(), name);
+
+    // Arm the WH_CBT hook before the session: on 8.5 this is the only window
+    // in which eventCreateFrame can still be caught (the hook fires while the
+    // core is loaded but the main window does not exist yet).
+    V8iInstallCbtHook(0);
 
     // Run the session inline on this thread. The host owns and closes the
     // remote thread, and keeping the work here means no second thread has to
