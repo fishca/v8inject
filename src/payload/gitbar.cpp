@@ -967,6 +967,7 @@ struct LogRow {
     std::wstring date;
     std::wstring refs;
     std::wstring subject;
+    int col = 0;           // graph column: 0 for a linear history
 };
 
 struct LogCtx {
@@ -1016,7 +1017,7 @@ bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
         if (line.empty()) continue;
         size_t star = line.find(L'*');
         if (star == std::wstring::npos) {
-            rows.push_back({ line, L"", L"", L"", L"", L"" });   // merge graph line
+            rows.push_back({ line, L"", L"", L"", L"", L"", 0 });   // merge graph line
             continue;
         }
         std::wstring graph = line.substr(0, star + 1);
@@ -1034,7 +1035,7 @@ bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
             q = d + 1;
         }
         if (f.size() < 5) continue;
-        rows.push_back({ graph, TrimWs(f[0]), f[1], f[2], TrimWs(f[3]), f[4] });
+        rows.push_back({ graph, TrimWs(f[0]), f[1], f[2], TrimWs(f[3]), f[4], (int)(star / 2) });
     }
     return !rows.empty();
 }
@@ -1137,34 +1138,10 @@ void LogPaint(LogCtx* c) {
     int listBottom = 36 + (rc.bottom - 36) * 45 / 100;
     c->visible = (listBottom - listTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
-    // Gantt scale for the graph column (diamond on each commit date)
-    int minDays = 0;
-    for (size_t ri = 0; ri < c->rows.size(); ++ri) {
-        const LogRow& r2 = c->rows[ri];
-        if (r2.date.empty()) continue;
-        int dd = DaysFromYmd(r2.date);
-        if (dd && (!minDays || dd < minDays)) minDays = dd;
-    }
-    SYSTEMTIME stNow{};
-    GetLocalTime(&stNow);
-    int todayDays = stNow.wYear * 366 + stNow.wMonth * 31 + stNow.wDay;
-    int maxDays = (todayDays > minDays) ? todayDays : minDays + 5;
-    int span = maxDays - minDays;
-    if (span < 1) span = 1;
+    // graph column: diamonds at the commit's column, vertical line for a
+    // linear history, slanted joins where branches diverge
     const int kGraphW = 100;
-    // "today" line, clamped to the column
-    {
-        int tx = 4 + (todayDays - minDays) * (kGraphW - 10) / span;
-        if (tx < 4) tx = 4;
-        if (tx > 4 + kGraphW - 2) tx = 4 + kGraphW - 2;
-        HPEN lp = CreatePen(PS_DOT, 1, RGB(190, 60, 60));
-        HPEN olp = (HPEN)SelectObject(dc, lp);
-        SetBkMode(dc, TRANSPARENT);
-        MoveToEx(dc, tx, listTop, nullptr);
-        LineTo(dc, tx, listBottom);
-        SelectObject(dc, olp);
-        DeleteObject(lp);
-    }
+    const int kColW = 18;
 
     HGDIOBJ oldMono = SelectObject(dc, c->mono);
     std::vector<POINT> ganttPts;  // diamond centres, joined by a polyline
@@ -1187,18 +1164,15 @@ void LogPaint(LogCtx* c) {
         const int kDateW2 = 84;
         const int kAuthorW2 = 210;
         int right = row.right - 2;
-        // diamond on the commit date (Gantt)
-        if (!r.date.empty()) {
-            int dd = DaysFromYmd(r.date);
-            if (dd) {
-                int dx = 8 + (dd - minDays) * (kGraphW - 16) / span;
-                if (dx >= 4 && dx <= 4 + kGraphW) {
-                    int cy = (row.top + row.bottom) / 2;
-                    ganttPts.push_back({ dx, cy });
-                    DrawDiamond(dc, dx, cy,
-                                selected ? 3 : 4, selected ? RGB(255, 255, 255)
-                                                           : RGB(49, 106, 197));
-                }
+        // diamond at the commit's graph column
+        if (!r.hash.empty()) {
+            int dx = 4 + r.col * kColW + kColW / 2;
+            if (dx >= 4 && dx <= 4 + kGraphW) {
+                int cy = (row.top + row.bottom) / 2;
+                ganttPts.push_back({ dx, cy });
+                DrawDiamond(dc, dx, cy,
+                            selected ? 3 : 4, selected ? RGB(255, 255, 255)
+                                                       : RGB(49, 106, 197));
             }
         }
         SetTextColor(dc, selected ? RGB(255, 255, 255) : kLogGray);
