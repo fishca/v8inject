@@ -232,12 +232,14 @@ HWND FindFrame() {
 // ---------------------------------------------------------------------------
 
 const int kCell = 24;       // per-button cell width
-const int kCells = 6;
+const int kCells = 12;
 const int kBarW = 2 + kCells * kCell + 2;
 const int kBarH = 24;
 const int kDockY = 28;      // toolbar row, just under the menu
 const int kWinIdDump = 1, kWinIdInit = 2, kWinIdCommit = 3,
-          kWinIdPush = 4, kWinIdSettings = 5, kWinIdLog = 6;
+          kWinIdPush = 4, kWinIdSettings = 5, kWinIdLog = 6,
+          kWinIdPull = 7, kWinIdFetch = 8, kWinIdBranches = 9,
+          kWinIdStash = 10, kWinIdTags = 11, kWinIdStatus = 12;
 
 struct GitBar {
     HWND hwnd = nullptr;
@@ -352,6 +354,77 @@ void Paint(HWND hwnd) {
                 MoveToEx(dc, gx + 5, yy, nullptr);
                 LineTo(dc, gx + 15, yy);
             }
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        } else if (id == kWinIdPull || id == kWinIdFetch) {
+            // down arrow (fetch: two of them)
+            HPEN pen = CreatePen(PS_SOLID, 2, RGB(50, 110, 50));
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            int ax = x + 8;
+            for (int k = 0; k < (id == kWinIdFetch ? 2 : 1); ++k) {
+                int gx = ax + k * 6, gy = 4;
+                MoveToEx(dc, gx, gy, nullptr);
+                LineTo(dc, gx, gy + 13);
+                MoveToEx(dc, gx - 3, gy + 9, nullptr);
+                LineTo(dc, gx, gy + 13);
+                MoveToEx(dc, gx + 3, gy + 9, nullptr);
+                LineTo(dc, gx, gy + 13);
+            }
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        } else if (id == kWinIdBranches) {
+            // fork: trunk with a branch leaving it
+            HPEN pen = CreatePen(PS_SOLID, 2, RGB(70, 90, 160));
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            MoveToEx(dc, x + 7, 3, nullptr);
+            LineTo(dc, x + 7, 17);
+            MoveToEx(dc, x + 7, 8, nullptr);
+            LineTo(dc, x + 15, 4);
+            MoveToEx(dc, x + 15, 4, nullptr);
+            LineTo(dc, x + 15, 10);
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        } else if (id == kWinIdStash) {
+            // box with a lid
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 100, 60));
+            HBRUSH br = CreateSolidBrush(RGB(232, 214, 168));
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+            Rectangle(dc, x + 4, 7, x + 18, 17);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(br);
+            DeleteObject(pen);
+            HPEN lp = CreatePen(PS_SOLID, 1, RGB(120, 100, 60));
+            HPEN olp = (HPEN)SelectObject(dc, lp);
+            MoveToEx(dc, x + 4, 11, nullptr);
+            LineTo(dc, x + 18, 11);
+            SelectObject(dc, olp);
+            DeleteObject(lp);
+        } else if (id == kWinIdTags) {
+            // tag: diamond
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(150, 90, 40));
+            HBRUSH br = CreateSolidBrush(RGB(238, 200, 140));
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+            POINT pts[4] = { { x + 11, 3 }, { x + 18, 10 }, { x + 11, 18 }, { x + 4, 10 } };
+            Polygon(dc, pts, 4);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(br);
+            DeleteObject(pen);
+        } else if (id == kWinIdStatus) {
+            // working copy: three lines with a check mark
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(96, 96, 96));
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            for (int k = 0; k < 3; ++k) {
+                int yy = 6 + k * 5;
+                MoveToEx(dc, x + 4, yy, nullptr);
+                LineTo(dc, x + 13, yy);
+            }
+            MoveToEx(dc, x + 14, 15, nullptr);
+            LineTo(dc, x + 16, 18);
+            LineTo(dc, x + 21, 11);
             SelectObject(dc, op);
             DeleteObject(pen);
         } else {
@@ -1483,6 +1556,257 @@ void ShowGitLog(HWND owner) {
     delete c;
 }
 
+void RunPull() {
+    std::wstring dir = IniGet(L"dumpdir");
+    if (dir.empty()) {
+        MessageBoxW(g_bar.hwnd, L"Сначала укажите папку выгрузки в настройках GitBar.",
+                    L"Git pull", MB_ICONINFORMATION);
+        return;
+    }
+    ShowTip(L"git pull…");
+    std::wstring out = TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit" }));
+    MessageBoxW(g_bar.hwnd, out.empty() ? L"Уже актуально." : out.c_str(),
+                L"Git pull", MB_ICONINFORMATION);
+    Reposition(false);
+}
+
+void RunFetch() {
+    std::wstring dir = IniGet(L"dumpdir");
+    if (dir.empty()) {
+        MessageBoxW(g_bar.hwnd, L"Сначала укажите папку выгрузки в настройках GitBar.",
+                    L"Git fetch", MB_ICONINFORMATION);
+        return;
+    }
+    ShowTip(L"git fetch…");
+    std::wstring out = TrimWs(RunGit({ L"-C", dir, L"fetch", L"--all", L"--prune" }));
+    MessageBoxW(g_bar.hwnd, out.empty() ? L"Обновлено (без изменений)." : out.c_str(),
+                L"Git fetch", MB_ICONINFORMATION);
+    Reposition(false);
+}
+
+// ---------------------------------------------------------------------------
+// Generic list window: working copy, branches, stashes, tags.
+// ---------------------------------------------------------------------------
+
+struct ListDlg {
+    HWND h = nullptr;
+    HWND list = nullptr;
+    std::wstring dir;
+    int kind = 0;                 // 0=status 1=branches 2=stash 3=tags
+    std::vector<std::wstring> items;
+    int btnIds[5] = {};
+    int btnCount = 0;
+};
+
+static void SplitLines(const std::wstring& s, std::vector<std::wstring>& out) {
+    out.clear();
+    size_t p = 0;
+    while (p < s.size()) {
+        size_t e = s.find_first_of(L"\r\n", p);
+        if (e == std::wstring::npos) e = s.size();
+        std::wstring line = s.substr(p, e - p);
+        p = e;
+        while (p < s.size() && (s[p] == L'\r' || s[p] == L'\n')) ++p;
+        if (!line.empty()) out.push_back(line);
+    }
+}
+
+static void ListDlgFill(ListDlg* d) {
+    std::wstring out;
+    switch (d->kind) {
+    case 0: out = RunGit({ L"-C", d->dir, L"status", L"--porcelain" }); break;
+    case 1: out = RunGit({ L"-C", d->dir, L"branch", L"-a" }); break;
+    case 2: out = RunGit({ L"-C", d->dir, L"stash", L"list" }); break;
+    default: out = RunGit({ L"-C", d->dir, L"tag", L"-n1" }); break;
+    }
+    SplitLines(out, d->items);
+    SendMessageW(d->list, LB_RESETCONTENT, 0, 0);
+    for (const std::wstring& line : d->items)
+        SendMessageW(d->list, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    if (!d->items.empty()) SendMessageW(d->list, LB_SETCURSEL, 0, 0);
+}
+
+// Selected item with the porcelain status prefix stripped (for file paths).
+static std::wstring ListDlgSel(ListDlg* d) {
+    int sel = (int)SendMessageW(d->list, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= (int)d->items.size()) return L"";
+    std::wstring line = d->items[sel];
+    if (d->kind == 0) {
+        // " M path", "?? path", "R  old -> new"
+        size_t sp = line.find(L' ');
+        if (sp != std::wstring::npos) {
+            std::wstring path = TrimWs(line.substr(sp + 1));
+            size_t arrow = path.find(L" -> ");
+            if (arrow != std::wstring::npos) path = path.substr(arrow + 4);
+            return path;
+        }
+        return L"";
+    }
+    if (d->kind == 1) {
+        std::wstring b = TrimWs(line);
+        if (b.rfind(L"* ", 0) == 0) b = TrimWs(b.substr(2));
+        return b;
+    }
+    if (d->kind == 2) {
+        // "stash@{0}: WIP on main: ..."
+        size_t colon = line.find(L':');
+        return colon == std::wstring::npos ? line : TrimWs(line.substr(0, colon));
+    }
+    // tag: "v1.0  message"
+    size_t sp = line.find(L' ');
+    return sp == std::wstring::npos ? line : line.substr(0, sp);
+}
+
+static void ListDlgAct(ListDlg* d, int btn) {
+    std::wstring sel = ListDlgSel(d);
+    std::wstring out;
+    switch (d->kind) {
+    case 0:  // working copy
+        if (btn == 0) out = RunGit({ L"-C", d->dir, L"add", L"--", sel });
+        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"reset", L"HEAD", L"--", sel });
+        else if (btn == 2) out = RunGit({ L"-C", d->dir, L"checkout", L"--", sel });
+        break;
+    case 1:  // branches
+        if (btn == 0) out = RunGit({ L"-C", d->dir, L"checkout", sel });
+        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"branch", L"-d", sel });
+        break;
+    case 2:  // stashes
+        if (btn == 0) out = RunGit({ L"-C", d->dir, L"stash", L"pop", sel });
+        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"stash", L"drop", sel });
+        break;
+    default:  // tags
+        if (btn == 0) out = RunGit({ L"-C", d->dir, L"tag", L"-d", sel });
+        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"push", L"origin", sel });
+        break;
+    }
+    out = TrimWs(out);
+    if (!out.empty() && out.find(L"fatal") != std::wstring::npos)
+        MessageBoxW(d->h, out.c_str(), L"Git", MB_ICONWARNING);
+    ListDlgFill(d);
+    Reposition(false);
+}
+
+static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    ListDlg* d = (ListDlg*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND: {
+        if (!d) break;
+        int id = LOWORD(wp);
+        if (id == 900) { DestroyWindow(h); return 0; }
+        if (id >= 901 && id <= 905) {
+            int idx = id - 901;
+            if (d->kind == 0) {
+                if (idx == 3) { RunCommit(); ListDlgFill(d); }
+                else if (idx == 4) {
+                    std::wstring out = RunGit({ L"-C", d->dir, L"commit", L"--amend", L"--no-edit" });
+                    MessageBoxW(h, TrimWs(out).c_str(), L"Amend", MB_ICONINFORMATION);
+                    ListDlgFill(d);
+                } else ListDlgAct(d, idx);
+            } else {
+                ListDlgAct(d, idx);
+            }
+        }
+        return 0;
+    }
+    case WM_SIZE: {
+        if (!d) break;
+        RECT rc{};
+        GetClientRect(h, &rc);
+        MoveWindow(d->list, 8, 8, rc.right - 16, rc.bottom - 48, TRUE);
+        int bx = 8;
+        for (int i = 0; i < d->btnCount; ++i) {
+            MoveWindow(GetDlgItem(h, d->btnIds[i]), bx, rc.bottom - 34, 110, 26, TRUE);
+            bx += 116;
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowList(int kind) {
+    std::wstring dir = IniGet(L"dumpdir");
+    if (dir.empty()) {
+        MessageBoxW(g_bar.hwnd, L"Сначала укажите папку выгрузки в настройках GitBar.",
+                    L"Git", MB_ICONINFORMATION);
+        return;
+    }
+    if (GetFileAttributesW((dir + L"\\.git").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(g_bar.hwnd, (L"В папке выгрузки нет git-репозитория:\n" + dir).c_str(),
+                    L"Git", MB_ICONINFORMATION);
+        return;
+    }
+    static bool cls = false;
+    if (!cls) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = ListDlgProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"V8iGitList";
+        if (!RegisterClassW(&wc)) return;
+        cls = true;
+    }
+    const wchar_t* title = kind == 0 ? L"Рабочая копия — v8inject"
+                         : kind == 1 ? L"Ветки — v8inject"
+                         : kind == 2 ? L"Stash — v8inject"
+                                     : L"Теги — v8inject";
+    ListDlg* d = new ListDlg();
+    d->dir = dir;
+    d->kind = kind;
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitList", title,
+                             WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
+                             g_bar.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!h) { delete d; return; }
+    d->h = h;
+    SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)d);
+    d->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                              WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
+                              8, 8, 740, 420, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(d->list, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
+    struct { const wchar_t* text; } defs[5] = {};
+    if (kind == 0) {
+        defs[0] = { L"Индексировать" }; defs[1] = { L"Снять" };
+        defs[2] = { L"Отменить" }; defs[3] = { L"Коммит" }; defs[4] = { L"Amend" };
+        d->btnCount = 5;
+    } else if (kind == 1) {
+        defs[0] = { L"Переключить" }; defs[1] = { L"Удалить" };
+        d->btnCount = 2;
+    } else if (kind == 2) {
+        defs[0] = { L"Применить" }; defs[1] = { L"Удалить" };
+        d->btnCount = 2;
+    } else {
+        defs[0] = { L"Удалить" }; defs[1] = { L"Отправить" };
+        d->btnCount = 2;
+    }
+    for (int i = 0; i < d->btnCount; ++i) {
+        d->btnIds[i] = 901 + i;
+        CreateWindowExW(0, L"BUTTON", defs[i].text,
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        8 + i * 116, 430, 110, 26, h, (HMENU)(INT_PTR)(901 + i),
+                        GetModuleHandleW(nullptr), nullptr);
+    }
+    CreateWindowExW(0, L"BUTTON", L"Закрыть", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    8 + d->btnCount * 116, 430, 110, 26, h,
+                    (HMENU)(INT_PTR)900, GetModuleHandleW(nullptr), nullptr);
+    ListDlgFill(d);
+    SetForegroundWindow(h);
+
+    MSG msg;
+    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (IsWindow(h)) DestroyWindow(h);
+    delete d;
+    Reposition(false);
+}
+
 void DoAction(int id) {
     switch (id) {
     case kWinIdDump: {
@@ -1493,6 +1817,12 @@ void DoAction(int id) {
     case kWinIdInit: RunInit(); break;
     case kWinIdCommit: RunCommit(); break;
     case kWinIdPush: RunPush(); break;
+    case kWinIdPull: RunPull(); break;
+    case kWinIdFetch: RunFetch(); break;
+    case kWinIdBranches: ShowList(1); break;
+    case kWinIdStash: ShowList(2); break;
+    case kWinIdTags: ShowList(3); break;
+    case kWinIdStatus: ShowList(0); break;
     case kWinIdSettings: ShowSettings(g_bar.hwnd); break;
     case kWinIdLog: ShowGitLog(g_bar.hwnd); break;
     }
