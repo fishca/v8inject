@@ -1004,7 +1004,7 @@ bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
     // 0x1F (unit separator) between fields: subjects may contain anything.
     std::wstring out = RunGit({ L"-C", dir, L"log", L"--graph", L"--decorate",
                                 L"-n", L"300", L"--date=short",
-                                L"--pretty=format:%x1f%h%x1f%an%x1f%ad%x1f%d%x1f%s" });
+                                L"--pretty=format:%x1f%h%x1f%an <%ae>%x1f%ad%x1f%d%x1f%s" });
     if (out.empty()) return false;
     size_t p = 0;
     while (p < out.size()) {
@@ -1072,13 +1072,19 @@ void LogPaint(LogCtx* c) {
     DrawTextW(dc, (L"История: " + c->dir).c_str(), -1, &head,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-    // column headers: graph | subject | date | author
+    // column headers: graph | commit | subject | date | author
     {
+        const int kGraphW = 64;
+        const int kHashW = 78;
         const int kDateW = 84;
-        const int kAuthorW = 150;
+        const int kAuthorW = 210;
         int right = rc.right - 4;
         SetTextColor(dc, kLogGray);
-        RECT hSubj{ 40, 20, right - kDateW - kAuthorW, 34 };
+        RECT hG{ 4, 20, 4 + kGraphW, 34 };
+        DrawTextW(dc, L"Граф", -1, &hG, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RECT hH{ 4 + kGraphW, 20, 4 + kGraphW + kHashW, 34 };
+        DrawTextW(dc, L"Коммит", -1, &hH, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RECT hSubj{ 4 + kGraphW + kHashW, 20, right - kDateW - kAuthorW, 34 };
         DrawTextW(dc, L"Комментарий", -1, &hSubj,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         RECT hDate{ right - kDateW - kAuthorW, 20, right - kAuthorW, 34 };
@@ -1126,22 +1132,23 @@ void LogPaint(LogCtx* c) {
         } else {
             SetTextColor(dc, RGB(0, 0, 0));
         }
-        int x = row.left + 2;
-        // graph column, then hash, refs, subject, date on the right
-        DrawTextW(dc, r.graph.c_str(), (int)r.graph.size(), &row,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        int gw = 0;
-        {
-            SIZE sz{};
-            GetTextExtentPoint32W(dc, r.graph.c_str(), (int)r.graph.size(), &sz);
-            gw = sz.cx;
-        }
-        x += gw;
-        // Columns, as requested: graph | subject | date | author
+        // columns: graph | commit | subject | date | author
+        const int kGraphW = 64;
+        const int kHashW = 78;
         const int kDateW = 84;
-        const int kAuthorW = 150;
-        int subjRight = row.right - kDateW - kAuthorW;
-        RECT sr{ x, row.top, subjRight, row.bottom };
+        const int kAuthorW = 210;
+        int right = row.right - 2;
+        SetTextColor(dc, selected ? RGB(255, 255, 255) : kLogGray);
+        RECT gr{ 4, row.top, 4 + kGraphW, row.bottom };
+        DrawTextW(dc, r.graph.c_str(), (int)r.graph.size(), &gr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (!r.hash.empty()) {
+            RECT hr{ 4 + kGraphW, row.top, 4 + kGraphW + kHashW, row.bottom };
+            DrawTextW(dc, r.hash.c_str(), (int)r.hash.size(), &hr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        int subjRight = right - kDateW - kAuthorW;
+        RECT sr{ 4 + kGraphW + kHashW, row.top, subjRight, row.bottom };
         SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
         DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -1149,7 +1156,7 @@ void LogPaint(LogCtx* c) {
         SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
         DrawTextW(dc, r.date.c_str(), (int)r.date.size(), &dr,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        RECT ar{ subjRight + kDateW, row.top, row.right - 2, row.bottom };
+        RECT ar{ subjRight + kDateW, row.top, right, row.bottom };
         SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
         DrawTextW(dc, r.author.c_str(), (int)r.author.size(), &ar,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
