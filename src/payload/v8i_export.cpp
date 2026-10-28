@@ -1691,6 +1691,85 @@ static uintptr_t V8iResolveExportFromFile(const std::wstring& modulePath,
     return result;  // RVA
 }
 
+// ---------------------------------------------------------------------------
+// exports85: dump every export of a module straight from the file on disk.
+// 8.5 zeroes the export directory in memory, so this is the only reliable
+// source of names and RVAs.
+// ---------------------------------------------------------------------------
+
+struct V8iExportEntry {
+    char name[256];
+    uint32_t ordinal;
+    uint32_t rva;
+};
+
+static int V8iDumpExportsFromFile(const std::wstring& modulePath,
+                                  V8iExportEntry* out, int maxEntries) {
+    if (!out || maxEntries <= 0) return 0;
+    HANDLE fh = CreateFileW(modulePath.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(fh, &sz);
+    int count = 0;
+    if (sz.QuadPart > 0 && sz.QuadPart < 128 * 1024 * 1024LL) {
+        std::vector<unsigned char> fbuf((size_t)sz.QuadPart);
+        DWORD got = 0;
+        if (ReadFile(fh, fbuf.data(), (DWORD)fbuf.size(), &got, nullptr) && got == fbuf.size()) {
+            const unsigned char* fd = fbuf.data();
+            auto r32 = [fd](uintptr_t o) -> uint32_t { return *(const uint32_t*)(fd + o); };
+            uintptr_t dos = fd[0x3C] | (fd[0x3D] << 8) | (fd[0x3E] << 16) | ((uintptr_t)fd[0x3F] << 24);
+            if (dos + 0x100 < fbuf.size()) {
+                uintptr_t nt = dos + 4;
+                uint16_t nsec = *(const uint16_t*)(fd + nt + 2);
+                uint16_t optSize = *(const uint16_t*)(fd + nt + 16);
+                uintptr_t opt = nt + 20;
+                uintptr_t secTab = opt + optSize;
+                auto toRaw = [&](uint32_t rva) -> uint32_t {
+                    for (uint16_t i = 0; i < nsec; ++i) {
+                        uintptr_t sh = secTab + (uintptr_t)i * 40;
+                        if (sh + 40 > fbuf.size()) break;
+                        uint32_t va = r32(sh + 12);
+                        uint32_t vs = r32(sh + 8);
+                        uint32_t raw = r32(sh + 20);
+                        if (rva >= va && rva < va + vs) return rva - va + raw;
+                    }
+                    return rva;
+                };
+                uintptr_t dd = opt + (optSize != 224 ? 112 : 96);
+                uint32_t expRva = (dd + 8 <= fbuf.size()) ? r32(dd) : 0;
+                if (expRva && expRva + 40 <= fbuf.size()) {
+                    uint32_t eo = toRaw(expRva);
+                    if (eo + 40 <= fbuf.size()) {
+                        uint32_t names = r32(eo + 32);
+                        uint32_t funcs = r32(eo + 28);
+                        uint32_t ords = r32(eo + 36);
+                        uint32_t nNames = r32(eo + 24);
+                        for (uint32_t i = 0; i < nNames && count < maxEntries; ++i) {
+                            uint32_t nameRva = r32(toRaw(names + i * 4));
+                            if (!nameRva) continue;
+                            uint32_t np = toRaw(nameRva);
+                            if (np + 2 >= (uint32_t)fbuf.size()) continue;
+                            const char* nm = (const char*)(fd + np);
+                            size_t len = strnlen_s(nm, 255);
+                            if (len == 0) continue;
+                            uint16_t idx = *(const uint16_t*)(fd + toRaw(ords + i * 2));
+                            V8iExportEntry& e = out[count++];
+                            memcpy(e.name, nm, len);
+                            e.name[len] = 0;
+                            e.ordinal = idx;
+                            e.rva = r32(toRaw(funcs + (uint32_t)idx * 4));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CloseHandle(fh);
+    return count;
+}
+
 static ModuleRange V8iFindModuleByName(const wchar_t* leaf) {
     for (const ModuleRange& m : EnumModules()) {
         size_t s = m.path.find_last_of(L"\\/");
@@ -2355,6 +2434,53 @@ static std::string CmdInfoToJsonA() {
     return j;
 }
 
+// "exports85 <module> [--count N]" — all exports of a module, read from disk.
+static std::string CmdExports85ToJson(const std::wstring& arg) {
+    std::wstring mod = arg;
+    int limit = 8192;
+    size_t sp = arg.find(L" --count ");
+    if (sp != std::wstring::npos) {
+        mod = arg.substr(0, sp);
+        limit = _wtoi(arg.c_str() + sp + 9);
+        if (limit <= 0) limit = 8192;
+    }
+    while (!mod.empty() && (mod.front() == L' ' || mod.front() == L'\t')) mod.erase(0, 1);
+    while (!mod.empty() && (mod.back() == L' ' || mod.back() == L'\t' || mod.back() == L'\r' || mod.back() == L'\n'))
+        mod.pop_back();
+    if (mod.empty())
+        return "{\"status\":\"error\",\"message\":\"usage: exports85 <module> [--count N]\"}";
+
+    ModuleRange m = V8iFindModuleByName(mod.c_str());
+    if (!m.base) return "{\"status\":\"error\",\"message\":\"module not loaded in the target process\"}";
+
+    static V8iExportEntry entries[8192];
+    int cap = (limit < 8192) ? limit : 8192;
+    int n = V8iDumpExportsFromFile(m.path, entries, cap);
+
+    std::string j = "{\"status\":\"ok\",\"module\":\"";
+    for (wchar_t c : mod) j += (c < 128) ? (char)c : '?';
+    char b[512];
+    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                "\",\"count\":%d,\"base\":\"0x%llX\",\"exports\":[", n,
+                (unsigned long long)m.base);
+    j += b;
+    for (int i = 0; i < n; ++i) {
+        const V8iExportEntry& e = entries[i];
+        if (i) j += ",";
+        j += "{\"name\":\"";
+        for (const char* p = e.name; *p; ++p) {
+            if (*p == '"' || *p == '\\') j += '\\';
+            j += *p;
+        }
+        _snprintf_s(b, sizeof(b), _TRUNCATE,
+                    "\",\"ordinal\":%u,\"rva\":\"0x%X\",\"va\":\"0x%llX\"}",
+                    e.ordinal, e.rva, (unsigned long long)(m.base + e.rva));
+        j += b;
+    }
+    j += "]}";
+    return j;
+}
+
 static std::string CmdInfoToJson(const std::wstring&) { return CmdInfoToJsonA(); }
 
 static std::string CmdCommandToJson(const std::wstring& args0) {
@@ -2753,7 +2879,8 @@ static int RunPayload(const wchar_t* sharedName) {
             continue;
         }
 
-        if (wcsncmp(g_io->request, L"exports", 7) == 0) {
+        if (wcscmp(g_io->request, L"exports") == 0 ||
+            wcsncmp(g_io->request, L"exports ", 8) == 0) {
             PutResponse(Guarded(L"exports", ExportsToJson,
                                 std::wstring(g_io->request).size() > 8
                                     ? std::wstring(g_io->request).substr(8)
@@ -2878,6 +3005,12 @@ static int RunPayload(const wchar_t* sharedName) {
 
         if (wcscmp(g_io->request, L"cmdinfo") == 0) {
             PutResponse(Guarded(L"cmdinfo", CmdInfoToJson, std::wstring()));
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"exports85", 9) == 0) {
+            std::wstring rest = g_io->request + 9;
+            PutResponse(Guarded(L"exports85", CmdExports85ToJson, rest));
             continue;
         }
 
