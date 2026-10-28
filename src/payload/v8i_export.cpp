@@ -1379,6 +1379,7 @@ static uintptr_t g85_qCmdFrame = 0, g85_qCmdRecv = 0;
 static uintptr_t g85_qEvFrame = 0, g85_qEvRecv = 0;
 static int g85_sawMsg = 0;
 static volatile int g85_subscribed = 0;
+static volatile int g_subStage = 0;
 static uintptr_t g85_slots[24] = {};
 static uintptr_t g85_uiWin = 0;
 
@@ -1566,7 +1567,7 @@ void V8iStartStartupWatch() {
     // NOTE: the inline hook on CreateWindowExW is disabled — the current
     // trampoline crashes 1C when the window is created. Re-enable after the
     // trampoline is fixed (see V8iInstallCreateWindowHook).
-    // V8iInstallCreateWindowHook();
+    V8iInstallCreateWindowHook();
     CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
 }
 
@@ -1728,6 +1729,7 @@ static void V8iSubscribeNow() {
         proc = nullptr;
     }
     if (!proc) return;
+    g_subStage = 1;
     uintptr_t vt = 0;
     __try { vt = *(uintptr_t*)proc; }
     __except (EXCEPTION_EXECUTE_HANDLER) { vt = 0; }
@@ -1743,6 +1745,7 @@ static void V8iSubscribeNow() {
         svc = nullptr;
     }
     if (!svc) return;
+    g_subStage = 2;
     uintptr_t svt = 0;
     __try { svt = *(uintptr_t*)svc; }
     __except (EXCEPTION_EXECUTE_HANDLER) { svt = 0; }
@@ -1751,6 +1754,7 @@ static void V8iSubscribeNow() {
     __try {
         ((SubFn)((uintptr_t*)svt)[4])(svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
         g85_subscribed = 1;
+        g_subStage = 3;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -1759,37 +1763,36 @@ static void* g_cwTrampoline = nullptr;
 static BYTE g_cwOrig[24] = {};
 static volatile int g_cwHookOk = 0;
 static volatile long g_cwHits = 0;
+static volatile int g_cwEnableSubscribe = 1;  // 1 = run the subscribe chain
 
 static HWND WINAPI V8iDetourCreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name,
                                             DWORD style, int x, int y, int w, int h,
                                             HWND parent, HMENU menu, HINSTANCE inst,
-                                            LPVOID param) {
+                                            LPVOID param, LPVOID info) {
     ++g_cwHits;
-    if (cls && !g85_subscribed &&
+    if (cls && !g85_subscribed && g_cwEnableSubscribe &&
         (wcsncmp(cls, L"V8Window0", 9) == 0 || wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)) {
         V8iSubscribeNow();
     }
     typedef HWND(WINAPI* Fn)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int,
-                             HWND, HMENU, HINSTANCE, LPVOID);
-    return ((Fn)g_cwTrampoline)(exStyle, cls, name, style, x, y, w, h, parent, menu, inst, param);
+                             HWND, HMENU, HINSTANCE, LPVOID, LPVOID);
+    return ((Fn)g_cwTrampoline)(exStyle, cls, name, style, x, y, w, h, parent, menu, inst, param, info);
 }
 
 // Installs the inline hook (mov rax, detour; jmp rax = 12 bytes + NOPs).
 static bool V8iInstallCreateWindowHook() {
     if (g_cwTrampoline) return true;
-    HMODULE u32 = GetModuleHandleW(L"user32.dll");
-    if (!u32) u32 = LoadLibraryW(L"user32.dll");
-    if (!u32) return false;
-    void* target = (void*)GetProcAddress(u32, "CreateWindowExW");
-    if (!target) return false;
-    // Prologue of user32!CreateWindowExW on this build:
-    //   4C 8B DC              mov  r11, rsp
-    //   48 81 EC 88 00 00 00  sub  rsp, 0x88
-    //   33 C0                 xor  eax, eax
-    //   66 89 44 24 78        mov  [rsp+78h], ax
-    const BYTE expect[8] = {0x4C, 0x8B, 0xDC, 0x48, 0x81, 0xEC, 0x88, 0x00};
+    // 1C creates its windows through its own wrapper, not user32 directly.
+    ModuleRange wbase = V8iFindModuleByName(L"wbase85.dll");
+    if (!wbase.base) return false;
+    uint32_t expRva = (uint32_t)V8iResolveExportFromFile(wbase.path, "?V8CreateWindowEx@@", 19);
+    if (!expRva) return false;
+    void* target = (void*)(wbase.base + expRva);
+    // Prologue: 40 53 (push rbx) 48 83 EC 60 (sub rsp,60h)
+    //           48 8B 84 24 C8 00 00 00 (mov rax,[rsp+C8h])
+    const BYTE expect[8] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x60, 0x48, 0x8B};
     if (memcmp(target, expect, sizeof(expect)) != 0) return false;
-    const int len = 17;  // whole instructions: 3 + 7 + 2 + 5
+    const int len = 14;  // 2 + 4 + 8
     memcpy(g_cwOrig, target, len);
     BYTE* tr = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!tr) return false;
@@ -1800,7 +1803,7 @@ static bool V8iInstallCreateWindowHook() {
     g_cwTrampoline = tr;
     DWORD oldProt = 0;
     if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
-    BYTE patch[20];
+    BYTE patch[14];
     memset(patch, 0x90, sizeof(patch));
     patch[0] = 0x48; patch[1] = 0xB8;
     *(uintptr_t*)(patch + 2) = (uintptr_t)&V8iDetourCreateWindowExW;
@@ -2334,12 +2337,12 @@ static std::string CmdInfoToJsonA() {
                 {
                     char nb2[520];
                     _snprintf_s(nb2, sizeof(nb2), _TRUNCATE,
-                                ",\"evCount\":%ld,\"evFrame\":\"0x%llX\",\"hookOk\":%d,\"cwHits\":%ld,\"subscribed\":%d"
+                                ",\"evCount\":%ld,\"evFrame\":\"0x%llX\",\"hookOk\":%d,\"cwHits\":%ld,\"subscribed\":%d,\"stage\":%d"
                                 "\"qProcFrame\":\"0x%llX\",\"qProcRecv\":\"0x%llX\","
                                 "\"qCmdFrame\":\"0x%llX\",\"qCmdRecv\":\"0x%llX\","
                                 "\"qEvFrame\":\"0x%llX\",\"qEvRecv\":\"0x%llX\"",
                                 g85_evCount, (unsigned long long)g85_evFrame,
-                                g_cwHookOk, g_cwHits, g85_subscribed,
+                                g_cwHookOk, g_cwHits, g85_subscribed, g_subStage,
                                 (unsigned long long)g85_qProcFrame, (unsigned long long)g85_qProcRecv,
                                 (unsigned long long)g85_qCmdFrame, (unsigned long long)g85_qCmdRecv,
                                 (unsigned long long)g85_qEvFrame, (unsigned long long)g85_qEvRecv);
