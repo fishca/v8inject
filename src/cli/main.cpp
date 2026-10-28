@@ -664,7 +664,16 @@ int wmain(int argc, wchar_t** argv) {
         }
         // Inject right away: the loader lock is released during start-up, so
         // the remote LoadLibraryW completes well before the main window.
-        bool ok = v8i::InjectLibrary(pi.dwProcessId, o.dll);
+        // Inject the same way the agent does: through the Client (shared block
+        // + v8i_probe), not via LoadLibraryW — that path is what works on 8.5.
+        v8i::Client client;
+        bool ok = client.Open(pi.dwProcessId, o.dll, ExeDir(), o.timeoutMs);
+        if (ok) {
+            std::string resp;
+            bool armed = client.Call(L"cmdinfo", resp, o.timeoutMs);
+            wprintf(L"armed: %ls\n", armed ? Utf8ToWide(resp).c_str() : L"<no reply>");
+            client.Close();
+        }
         wprintf(L"launched pid=%lu inject=%s\n", pi.dwProcessId, ok ? L"ok" : L"FAILED");
         DWORD wait = WaitForSingleObject(pi.hProcess, 3000);
         if (wait == WAIT_OBJECT_0) {
