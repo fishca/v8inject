@@ -1647,11 +1647,14 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
             } else {
                 g_cbtLastClass[0] = 0;
             }
-            // Snegopat compares against "V8Window0." (the main window class
-            // carries a hash suffix) and unhooks before doing anything else,
-            // so the subscribe chain cannot re-enter the hook.
-            if (cls && cls > (const wchar_t*)0x10000 && IsReadable(cls, 64) &&
-                wcsncmp(cls, L"V8Window0.", 10) == 0) {
+            // On 8.5 the main window is created with a numeric class in
+            // CREATESTRUCT.lpszClass, so "V8Window0.xxx" never shows up here
+            // (it is only visible via GetClassName on the finished window).
+            // Exactly why Snegopat is force-patched on 8.5 to take the first
+            // window. Only the first window of the Configurator is needed to
+            // arm the subscribe chain — take it and unhook so nothing can
+            // re-enter.
+            if (!g_cbtFired) {
                 g_cbtFired = 1;
                 g85_uiWin = (uintptr_t)hwnd;
                 HHOOK h = g_cbtHook;
@@ -1702,7 +1705,11 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK V8iCbtProcExport(
 
 static DWORD WINAPI V8iEarlySubscribeThread(LPVOID param) {
     HWND h = (HWND)param;
-    for (int i = 0; i < 200 && !g85_subscribed; ++i) {
+    // The hook fires on the very first 1C window, but the core (and its
+    // services) are not initialized that early — subscribing immediately
+    // crashes 1C. Wait for the platform to settle before the first attempt.
+    Sleep(3000);
+    for (int i = 0; i < 300 && !g85_subscribed; ++i) {
         Sleep(50);
         if (!IsWindow(h)) break;
         DWORD tid = GetWindowThreadProcessId(h, nullptr);
