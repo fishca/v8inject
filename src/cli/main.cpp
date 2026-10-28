@@ -628,6 +628,37 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
 
+    if (cmd == L"hookcbt") {
+        // Global WH_CBT with hMod = payload: Windows then loads the payload into
+        // the target on its first window (the splash), DllMain arms the
+        // in-process hook, and the main window "V8Window0." is finally caught.
+        // The host process must stay alive while the hook is installed.
+        Options o = ParseOptions(argc, argv, 2);
+        std::wstring dll = o.dll.empty() ? (ExeDir() + L"\\v8i_payload.dll") : o.dll;
+        HMODULE local = LoadLibraryW(dll.c_str());
+        if (!local) { wprintf(L"load failed: %lu\n", GetLastError()); return 4; }
+        FARPROC proc = GetProcAddress(local, "V8iCbtProcExport");
+        if (!proc) { wprintf(L"V8iCbtProcExport not found in %ls\n", dll.c_str()); return 4; }
+        HHOOK h = SetWindowsHookExW(WH_CBT, (HOOKPROC)proc, local, 0);
+        if (!h) { wprintf(L"SetWindowsHookEx failed: %lu\n", GetLastError()); return 5; }
+        int seconds = 300;
+        if (argc > 2 && argv[2][0] != L'-') seconds = _wtoi(argv[2]);
+        wprintf(L"global WH_CBT installed (hook=0x%p), keeping %d s\n", (void*)h, seconds);
+        fflush(stdout);
+        MSG msg;
+        DWORD end = GetTickCount() + (DWORD)seconds * 1000;
+        while (GetTickCount() < end) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(100);
+        }
+        UnhookWindowsHookEx(h);
+        wprintf(L"hook removed\n");
+        return 0;
+    }
+
     if (cmd == L"modules") {
         if (argc < 3) { PrintUsage(); return 1; }
         DWORD pid = ResolvePid(argc, argv, argv[2]);

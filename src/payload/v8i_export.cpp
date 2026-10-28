@@ -1637,6 +1637,14 @@ static bool V8iArmEarlySubscribe() {
     return g_cbtHook != nullptr;
 }
 
+// C linkage: the host installs this as a *global* WH_CBT hook (hMod = payload),
+// so Windows loads the payload into the target before 1C creates its main
+// window, and DllMain then arms the in-process hook as well.
+extern "C" __declspec(dllexport) LRESULT CALLBACK V8iCbtProcExport(
+    int nCode, WPARAM wParam, LPARAM lParam) {
+    return V8iCbtProc(nCode, wParam, lParam);
+}
+
 static DWORD WINAPI V8iEarlySubscribeThread(LPVOID param) {
     HWND h = (HWND)param;
     for (int i = 0; i < 200 && !g85_subscribed; ++i) {
