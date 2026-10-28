@@ -1048,6 +1048,26 @@ HFONT LogFont(int points, const wchar_t* face) {
                        FIXED_PITCH | FF_MODERN, face);
 }
 
+// Gantt-style graph column: a diamond on the commit's date and a "today" line.
+static int DaysFromYmd(const std::wstring& s) {
+    int y = 0, m = 0, d = 0;
+    if (swscanf_s(s.c_str(), L"%d-%d-%d", &y, &m, &d) != 3) return 0;
+    return y * 366 + m * 31 + d;  // coarse linear day number, fine for a week span
+}
+
+static void DrawDiamond(HDC dc, int cx, int cy, int r, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HBRUSH br = CreateSolidBrush(color);
+    HPEN op = (HPEN)SelectObject(dc, pen);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    POINT pts[4] = { { cx, cy - r }, { cx + r, cy }, { cx, cy + r }, { cx - r, cy } };
+    Polygon(dc, pts, 4);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
 void LogPaint(LogCtx* c) {
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(c->hwnd, &ps);
@@ -1074,7 +1094,7 @@ void LogPaint(LogCtx* c) {
 
     // column headers: graph | commit | subject | date | author
     {
-        const int kGraphW = 64;
+        const int kGraphW = 170;
         const int kHashW = 78;
         const int kDateW = 84;
         const int kAuthorW = 210;
@@ -1117,6 +1137,35 @@ void LogPaint(LogCtx* c) {
     int listBottom = 36 + (rc.bottom - 36) * 45 / 100;
     c->visible = (listBottom - listTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
+    // Gantt scale for the graph column (diamond on each commit date)
+    int minDays = 0;
+    for (size_t ri = 0; ri < c->rows.size(); ++ri) {
+        const LogRow& r2 = c->rows[ri];
+        if (r2.date.empty()) continue;
+        int dd = DaysFromYmd(r2.date);
+        if (dd && (!minDays || dd < minDays)) minDays = dd;
+    }
+    SYSTEMTIME stNow{};
+    GetLocalTime(&stNow);
+    int todayDays = stNow.wYear * 366 + stNow.wMonth * 31 + stNow.wDay;
+    int maxDays = (todayDays > minDays) ? todayDays : minDays + 5;
+    int span = maxDays - minDays;
+    if (span < 1) span = 1;
+    const int kGraphW = 170;
+    // "today" line, clamped to the column
+    {
+        int tx = 4 + (todayDays - minDays) * (kGraphW - 10) / span;
+        if (tx < 4) tx = 4;
+        if (tx > 4 + kGraphW - 2) tx = 4 + kGraphW - 2;
+        HPEN lp = CreatePen(PS_DOT, 1, RGB(190, 60, 60));
+        HPEN olp = (HPEN)SelectObject(dc, lp);
+        SetBkMode(dc, TRANSPARENT);
+        MoveToEx(dc, tx, listTop, nullptr);
+        LineTo(dc, tx, listBottom);
+        SelectObject(dc, olp);
+        DeleteObject(lp);
+    }
+
     HGDIOBJ oldMono = SelectObject(dc, c->mono);
     for (int i = 0; i < c->visible; ++i) {
         int idx = c->top + i;
@@ -1133,30 +1182,38 @@ void LogPaint(LogCtx* c) {
             SetTextColor(dc, RGB(0, 0, 0));
         }
         // columns: graph | commit | subject | date | author
-        const int kGraphW = 64;
-        const int kHashW = 78;
-        const int kDateW = 84;
-        const int kAuthorW = 210;
+        const int kHashW2 = 78;
+        const int kDateW2 = 84;
+        const int kAuthorW2 = 210;
         int right = row.right - 2;
+        // diamond on the commit date (Gantt)
+        if (!r.date.empty()) {
+            int dd = DaysFromYmd(r.date);
+            if (dd) {
+                int dx = 8 + (dd - minDays) * (kGraphW - 16) / span;
+                if (dx >= 4 && dx <= 4 + kGraphW) {
+                    DrawDiamond(dc, dx, (row.top + row.bottom) / 2,
+                                selected ? 3 : 4, selected ? RGB(255, 255, 255)
+                                                           : RGB(49, 106, 197));
+                }
+            }
+        }
         SetTextColor(dc, selected ? RGB(255, 255, 255) : kLogGray);
-        RECT gr{ 4, row.top, 4 + kGraphW, row.bottom };
-        DrawTextW(dc, r.graph.c_str(), (int)r.graph.size(), &gr,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         if (!r.hash.empty()) {
-            RECT hr{ 4 + kGraphW, row.top, 4 + kGraphW + kHashW, row.bottom };
+            RECT hr{ 4 + kGraphW, row.top, 4 + kGraphW + kHashW2, row.bottom };
             DrawTextW(dc, r.hash.c_str(), (int)r.hash.size(), &hr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
-        int subjRight = right - kDateW - kAuthorW;
-        RECT sr{ 4 + kGraphW + kHashW, row.top, subjRight, row.bottom };
+        int subjRight = right - kDateW2 - kAuthorW2;
+        RECT sr{ 4 + kGraphW + kHashW2, row.top, subjRight, row.bottom };
         SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
         DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        RECT dr{ subjRight, row.top, subjRight + kDateW, row.bottom };
+        RECT dr{ subjRight, row.top, subjRight + kDateW2, row.bottom };
         SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
         DrawTextW(dc, r.date.c_str(), (int)r.date.size(), &dr,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        RECT ar{ subjRight + kDateW, row.top, right, row.bottom };
+        RECT ar{ subjRight + kDateW2, row.top, right, row.bottom };
         SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
         DrawTextW(dc, r.author.c_str(), (int)r.author.size(), &ar,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
