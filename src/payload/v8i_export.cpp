@@ -1379,6 +1379,7 @@ static uintptr_t g85_qCmdFrame = 0, g85_qCmdRecv = 0;
 static uintptr_t g85_qEvFrame = 0, g85_qEvRecv = 0;
 static int g85_sawMsg = 0;
 static uintptr_t g85_slots[24] = {};
+static uintptr_t g85_uiWin = 0;
 
 typedef void* (__cdecl* V8iCurProcFn)();
 typedef void* (__cdecl* V8iGetSvcFn)(void*, const GUID*);
@@ -1528,6 +1529,9 @@ static void V8iScanFrame85() {
     static const GUID kEvCreateFrame = {0x3573FFE0, 0x2FFF, 0x11D5,
                                         {0xBF, 0x5E, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79}};
     if (!g85_svc || !g85_svcVt) return;
+    // Ask 1C to open a window; the resulting frame arrives via onEvent.
+    if (g85_uiWin)
+        PostMessageW((HWND)g85_uiWin, WM_COMMAND, 601, 0);
     uintptr_t f1 = 0;
     __try { f1 = ((uintptr_t*)g85_svcVt)[1]; }
     __except (EXCEPTION_EXECUTE_HANDLER) { f1 = 0; }
@@ -1975,6 +1979,7 @@ static std::string CmdInfoToJsonA() {
                 }
                 if (uiWin) {
                     dbgUiWin = 1;
+                    g85_uiWin = (uintptr_t)uiWin;
                     g85_origWndProc = (WNDPROC)SetWindowLongPtrW(uiWin, GWLP_WNDPROC,
                                                                 (LONG_PTR)V8iSubclass85);
                     if (g85_origWndProc) {
