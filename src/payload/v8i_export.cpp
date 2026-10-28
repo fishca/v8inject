@@ -1538,8 +1538,17 @@ static BOOL CALLBACK V8iFindMainWindow(HWND w, LPARAM lp) {
     return TRUE;
 }
 
+static bool V8iInstallCreateWindowHook();
+
+static void V8iWriteDiagFile();
+
 static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
+    // Install the window-creation hook first (win32u may not even be loaded
+    // when DllMain runs, so this cannot happen inside the loader lock).
+    V8iInstallCreateWindowHook();
+    V8iWriteDiagFile();
     for (int i = 0; i < 4000 && !g85_subscribed; ++i) {
+        if ((i % 50) == 0) V8iWriteDiagFile();
         HWND h = nullptr;
         EnumWindows(V8iFindMainWindow, (LPARAM)&h);
         if (h) {
@@ -1561,13 +1570,13 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     return 0;
 }
 
-static bool V8iInstallCreateWindowHook();
-
 void V8iStartStartupWatch() {
-    // Window-creation hook: 8.5 creates its main window through
-    // win32u!NtUserCreateWindowEx; the watcher stays as a fallback.
-    V8iInstallCreateWindowHook();
     CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
+}
+
+// C linkage so DllMain can arm the watcher/hook right after injection.
+extern "C" __declspec(dllexport) void V8iArmStartup() {
+    V8iStartStartupWatch();
 }
 
 // Runs on the 1C UI thread (called from the subclass proc).
@@ -1762,7 +1771,7 @@ static void* g_cwTrampoline = nullptr;
 static BYTE g_cwOrig[24] = {};
 static volatile int g_cwHookOk = 0;
 static volatile long g_cwHits = 0;
-static volatile int g_cwEnableSubscribe = 0;  // подписка в детуре опасна до готовности ядра
+static volatile int g_cwEnableSubscribe = 0;  // подписка в детуре падает: ядро ещё не готово
 
 // NtUserCreateWindowEx takes the class as LARGE_STRING, not LPCWSTR.
 struct V8iLargeString { USHORT len; USHORT max; ULONG pad; PWSTR buf; };
@@ -1821,6 +1830,27 @@ static bool V8iInstallCreateWindowHook() {
     FlushInstructionCache(GetCurrentProcess(), target, len);
     g_cwHookOk = 1;
     return true;
+}
+
+// Diagnostics for the launch mode: cmdinfo cannot attach to a process that
+// already has the payload, so the payload reports its own state here.
+static void V8iWriteDiagFile() {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, path);
+    if (!n) return;
+    lstrcatW(path, L"v8i_diag85.txt");
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[512];
+    int len = wsprintfA(buf,
+                        "hookOk=%d cwHits=%ld subscribed=%d stage=%d evCount=%ld evFrame=0x%llX proc=0x%llX\n",
+                        g_cwHookOk, g_cwHits, g85_subscribed, g_subStage,
+                        g85_evCount, (unsigned long long)g85_evFrame,
+                        (unsigned long long)g85_proc);
+    DWORD wr = 0;
+    WriteFile(h, buf, (DWORD)len, &wr, nullptr);
+    CloseHandle(h);
 }
 
 // "cmdinfo" — read-only diagnostics: how the command receiver can be located
