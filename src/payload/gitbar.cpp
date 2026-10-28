@@ -1094,7 +1094,7 @@ void LogPaint(LogCtx* c) {
 
     // column headers: graph | commit | subject | date | author
     {
-        const int kGraphW = 170;
+        const int kGraphW = 100;
         const int kHashW = 78;
         const int kDateW = 84;
         const int kAuthorW = 210;
@@ -1151,7 +1151,7 @@ void LogPaint(LogCtx* c) {
     int maxDays = (todayDays > minDays) ? todayDays : minDays + 5;
     int span = maxDays - minDays;
     if (span < 1) span = 1;
-    const int kGraphW = 170;
+    const int kGraphW = 100;
     // "today" line, clamped to the column
     {
         int tx = 4 + (todayDays - minDays) * (kGraphW - 10) / span;
@@ -1167,6 +1167,7 @@ void LogPaint(LogCtx* c) {
     }
 
     HGDIOBJ oldMono = SelectObject(dc, c->mono);
+    std::vector<POINT> ganttPts;  // diamond centres, joined by a polyline
     for (int i = 0; i < c->visible; ++i) {
         int idx = c->top + i;
         if (idx >= (int)c->rows.size()) break;
@@ -1192,7 +1193,9 @@ void LogPaint(LogCtx* c) {
             if (dd) {
                 int dx = 8 + (dd - minDays) * (kGraphW - 16) / span;
                 if (dx >= 4 && dx <= 4 + kGraphW) {
-                    DrawDiamond(dc, dx, (row.top + row.bottom) / 2,
+                    int cy = (row.top + row.bottom) / 2;
+                    ganttPts.push_back({ dx, cy });
+                    DrawDiamond(dc, dx, cy,
                                 selected ? 3 : 4, selected ? RGB(255, 255, 255)
                                                            : RGB(49, 106, 197));
                 }
@@ -1217,6 +1220,16 @@ void LogPaint(LogCtx* c) {
         SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
         DrawTextW(dc, r.author.c_str(), (int)r.author.size(), &ar,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    // connecting line through the commit diamonds
+    if (ganttPts.size() >= 2) {
+        HPEN gp = CreatePen(PS_SOLID, 1, RGB(49, 106, 197));
+        HPEN ogp = (HPEN)SelectObject(dc, gp);
+        HGDIOBJ obrp = (HGDIOBJ)SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Polyline(dc, ganttPts.data(), (int)ganttPts.size());
+        SelectObject(dc, obrp);
+        SelectObject(dc, ogp);
+        DeleteObject(gp);
     }
     SelectObject(dc, oldMono);
 
