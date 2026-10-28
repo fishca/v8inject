@@ -1362,8 +1362,16 @@ static uintptr_t g85_svc = 0;
 static uintptr_t g85_svcVt = 0;
 static uintptr_t g85_svc2 = 0;
 static uintptr_t g85_svc2Vt = 0;
+static uintptr_t g85_svc3 = 0;
+static uintptr_t g85_svc3Vt = 0;
+static uintptr_t g85_svc4 = 0;
+static uintptr_t g85_svc4Vt = 0;
 static int g85_svcSlot = -1;
 static int g85_svc2Slot = -1;
+static uintptr_t g85_frame = 0;
+static uintptr_t g85_frameVt = 0;
+static uintptr_t g85_recv = 0;
+static uintptr_t g85_recvVt = 0;
 static int g85_sawMsg = 0;
 static uintptr_t g85_slots[24] = {};
 
@@ -1394,9 +1402,11 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
                                                  {0x8A, 0x57, 0x00, 0x80, 0x48, 0xDA, 0x06, 0xDF}};
             void* svc = nullptr;
             void* svc2 = nullptr;
+            void* svc3 = nullptr;
+            void* svc4 = nullptr;
             int svcSlot = -1, svc2Slot = -1;
             __try {
-                for (int slot = 4; slot <= 16; ++slot) {
+                for (int slot : {14, 15}) {
                     uintptr_t f = 0;
                     __try { f = ((uintptr_t*)g85_procVt)[slot]; }
                     __except (EXCEPTION_EXECUTE_HANDLER) { f = 0; }
@@ -1406,18 +1416,55 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
                     __except (EXCEPTION_EXECUTE_HANDLER) { r1 = (void*)-1; }
                     __try { r2 = ((V8iGetSvcFn)f)(proc, &kIID_CmdService); }
                     __except (EXCEPTION_EXECUTE_HANDLER) { r2 = (void*)-1; }
-                    if (!svc && r1 && r1 != (void*)-1) { svc = r1; svcSlot = slot; }
-                    if (!svc2 && r2 && r2 != (void*)-1) { svc2 = r2; svc2Slot = slot; }
+                    if (slot == 14) { svc = r1; svc2 = r2; svcSlot = (r1 && r1 != (void*)-1) ? 14 : -1; svc2Slot = (r2 && r2 != (void*)-1) ? 14 : -1; }
+                    else { svc3 = r1; svc4 = r2; }
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 svc = nullptr;
             }
             g85_svc = (uintptr_t)svc;
-            g85_svcVt = svc ? *(uintptr_t*)svc : 0;
+            g85_svcVt = svc && svc != (void*)-1 ? *(uintptr_t*)svc : 0;
             g85_svc2 = (uintptr_t)svc2;
-            g85_svc2Vt = svc2 ? *(uintptr_t*)svc2 : 0;
+            g85_svc2Vt = svc2 && svc2 != (void*)-1 ? *(uintptr_t*)svc2 : 0;
+            g85_svc3 = (uintptr_t)svc3;
+            g85_svc3Vt = svc3 && svc3 != (void*)-1 ? *(uintptr_t*)svc3 : 0;
+            g85_svc4 = (uintptr_t)svc4;
+            g85_svc4Vt = svc4 && svc4 != (void*)-1 ? *(uintptr_t*)svc4 : 0;
             g85_svcSlot = svcSlot;
             g85_svc2Slot = svc2Slot;
+
+            // Slot 27 copies {ptr, refcount} from [rcx+0x148] — looks like a
+            // getTopLevelFrame-style getter. Try it, then QI the result for
+            // ICommandReceiver.
+            if (proc) {
+                struct { void* p; void* rc; } fr{};
+                __try {
+                    uintptr_t f27 = ((uintptr_t*)g85_procVt)[27];
+                    if (f27)
+                        ((void(__cdecl*)(void*, void*))f27)(proc, &fr);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    fr.p = nullptr;
+                }
+                g85_frame = (uintptr_t)fr.p;
+                g85_frameVt = fr.p ? *(uintptr_t*)fr.p : 0;
+                if (fr.p) {
+                    static const GUID kIID_CmdRecv = {0x377A2018, 0xC51B, 0x4cf5,
+                                                      {0xAC, 0x03, 0xA1, 0x50, 0x92, 0x66, 0xDF, 0x2D}};
+                    void* recv = nullptr;
+                    __try {
+                        uintptr_t qi = 0;
+                        __try { qi = ((uintptr_t*)*(uintptr_t*)fr.p)[0]; }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { qi = 0; }
+                        if (qi)
+                            ((HRESULT(__stdcall*)(void*, const GUID*, void**))qi)(
+                                fr.p, &kIID_CmdRecv, &recv);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        recv = nullptr;
+                    }
+                    g85_recv = (uintptr_t)recv;
+                    g85_recvVt = recv ? *(uintptr_t*)recv : 0;
+                }
+            }
         }
         return 0;
     }
@@ -1848,8 +1895,8 @@ static std::string CmdInfoToJsonA() {
                     }
                 }
                 dbgDone = g85_proc ? 1 : 0;
-                std::string pm, sm, sm2;
-                unsigned long long prva = 0, srva = 0, s2rva = 0;
+                std::string pm, sm, sm2, sm3, sm4;
+                unsigned long long prva = 0, srva = 0, s2rva = 0, s3rva = 0, s4rva = 0;
                 if (g85_procVt) {
                     pm.clear();
                     const ModuleRange* foundM = nullptr;
@@ -1893,12 +1940,27 @@ static std::string CmdInfoToJsonA() {
                         s2rva = g85_svc2Vt - foundM->base;
                     }
                 }
+                auto attrib = [&](uintptr_t vt, std::string& out, unsigned long long& rva) {
+                    const ModuleRange* fm = nullptr;
+                    for (const ModuleRange& m : mods)
+                        if (vt >= m.base && vt < m.base + m.size) { fm = &m; break; }
+                    if (fm) {
+                        for (wchar_t wc : fm->path) out.push_back((char)wc);
+                        size_t bs = out.rfind('\\');
+                        if (bs != std::string::npos) out = out.substr(bs + 1);
+                        rva = vt - fm->base;
+                    }
+                };
+                attrib(g85_svc3Vt, sm3, s3rva);
+                attrib(g85_svc4Vt, sm4, s4rva);
                 _snprintf_s(b, sizeof(b), _TRUNCATE,
-                            "\"uiWin\":%d,\"cc\":%d,\"saw\":%d,\"done\":%d,\"proc\":\"0x%llX\",\"vt\":\"%s+0x%llX\",\"svc\":\"0x%llX\",\"svt\":\"%s+0x%llX\",\"svcSlot\":%d,\"svc2\":\"0x%llX\",\"svt2\":\"%s+0x%llX\",\"svc2Slot\":%d",
+                            "\"uiWin\":%d,\"cc\":%d,\"saw\":%d,\"done\":%d,\"proc\":\"0x%llX\",\"vt\":\"%s+0x%llX\",\"s14ev\":\"0x%llX\",\"svt\":\"%s+0x%llX\",\"s14cmd\":\"0x%llX\",\"svt2\":\"%s+0x%llX\",\"s15ev\":\"0x%llX\",\"svt3\":\"%s+0x%llX\",\"s15cmd\":\"0x%llX\",\"svt4\":\"%s+0x%llX\"",
                             dbgUiWin, dbgCc, g85_sawMsg, dbgDone,
                             (unsigned long long)g85_proc, pm.c_str(), prva,
-                            (unsigned long long)g85_svc, sm.c_str(), srva, g85_svcSlot,
-                            (unsigned long long)g85_svc2, sm2.c_str(), s2rva, g85_svc2Slot);
+                            (unsigned long long)g85_svc, sm.c_str(), srva,
+                            (unsigned long long)g85_svc2, sm2.c_str(), s2rva,
+                            (unsigned long long)g85_svc3, sm3.c_str(), s3rva,
+                            (unsigned long long)g85_svc4, sm4.c_str(), s4rva);
                 j += b;
                 j += ",\"slots\":[";
                 for (int i = 0; i < 12; ++i) {
@@ -1908,6 +1970,18 @@ static std::string CmdInfoToJsonA() {
                     j += sb;
                 }
                 j += "]";
+                {
+                    std::string fm, rm;
+                    unsigned long long fr2 = 0, rr2 = 0;
+                    attrib(g85_frameVt, fm, fr2);
+                    attrib(g85_recvVt, rm, rr2);
+                    char fb[260];
+                    _snprintf_s(fb, sizeof(fb), _TRUNCATE,
+                                ",\"frame\":\"0x%llX\",\"fvt\":\"%s+0x%llX\",\"recv\":\"0x%llX\",\"rvt\":\"%s+0x%llX\"",
+                                (unsigned long long)g85_frame, fm.c_str(), fr2,
+                                (unsigned long long)g85_recv, rm.c_str(), rr2);
+                    j += fb;
+                }
             } else {
                 j += "\"fn\":null";
             }
