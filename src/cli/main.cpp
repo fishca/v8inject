@@ -657,6 +657,10 @@ int wmain(int argc, wchar_t** argv) {
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
+        // NOTE: CREATE_SUSPENDED + QueueUserAPC(LoadLibraryW) was tried to get
+        // the payload in before main(); it ends with 0xC000001D (illegal
+        // instruction) — the APC can run before ntdll finishes initialising
+        // the process. Back to a plain start + Client injection.
         if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, FALSE,
                             0, nullptr, nullptr, &si, &pi)) {
             wprintf(L"launch failed: %lu\n", GetLastError());

@@ -1568,6 +1568,12 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
 // subscribe chain on that window's UI thread until the core answers.
 static HHOOK g_cbtHook = nullptr;
 static volatile long g_cbtFault = 0;
+static volatile long g_cbtCalls = 0;
+static volatile long g_cbtLastCode = -1;
+static volatile long g_cbtCreateCount = 0;
+static volatile long g_cbtStrCreates = 0;
+static char g_cbtFirstClass[96] = {};
+static char g_cbtLastClass[96] = {};
 static DWORD g_ownerPid = 0;
 static volatile int g_cbtFired = 0;
 
@@ -1578,16 +1584,31 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
     // (0xC000041D), and during 1C start-up almost nothing is safe to call, so
     // the whole body sits under SEH: a failure must not kill the Configurator.
     __try {
+        InterlockedIncrement(&g_cbtCalls);
         if (GetCurrentProcessId() != g_ownerPid)
             return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
-        if (nCode == HCBT_CREATEWND && !g_cbtFired) {
+        if (nCode == HCBT_CREATEWND) {
+            InterlockedIncrement(&g_cbtCreateCount);
             HWND hwnd = (HWND)wParam;
             CBT_CREATEWNDW* cw = (CBT_CREATEWNDW*)lParam;
             const wchar_t* cls = (cw && cw->lpcs) ? cw->lpcs->lpszClass : nullptr;
+            // Remember what actually arrives, so the filter can be fixed from
+            // real data instead of guesses.
+            g_cbtLastCode = nCode;
+            if (cls && cls > (const wchar_t*)0x10000 && IsReadable(cls, 96)) {
+                size_t k = 0;
+                for (; k < sizeof(g_cbtLastClass) - 1 && cls[k]; ++k)
+                    g_cbtLastClass[k] = (char)((cls[k] < 128) ? cls[k] : '?');
+                g_cbtLastClass[k] = 0;
+                if (InterlockedIncrement(&g_cbtStrCreates) == 1 && k)
+                    memcpy(g_cbtFirstClass, g_cbtLastClass, sizeof(g_cbtFirstClass));
+            } else {
+                g_cbtLastClass[0] = 0;
+            }
             // Snegopat compares against "V8Window0." (the main window class
             // carries a hash suffix) and unhooks before doing anything else,
             // so the subscribe chain cannot re-enter the hook.
-            if (cls && cls > (const wchar_t*)0x10000 &&
+            if (cls && cls > (const wchar_t*)0x10000 && IsReadable(cls, 64) &&
                 wcsncmp(cls, L"V8Window0.", 10) == 0) {
                 g_cbtFired = 1;
                 g85_uiWin = (uintptr_t)hwnd;
@@ -2593,10 +2614,13 @@ static std::string CmdFramesToJson(const std::wstring&) {
     char b[512];
     _snprintf_s(b, sizeof(b), _TRUNCATE,
                 "{\"status\":\"ok\",\"count\":%d,\"evCount\":%ld,"
-                "\"cbtFired\":%d,\"cbtFault\":\"0x%08X\",\"cbtHook\":\"0x%llX\","
+                "\"cbtFired\":%d,\"cbtCalls\":%ld,\"cbtCreates\":%ld,"
+                "\"cbtFault\":\"0x%08X\",\"cbtHook\":\"0x%llX\",\"cbtStr\":%ld,"
+                "\"cbtFirstClass\":\"%s\",\"cbtLastClass\":\"%s\","
                 "\"subscribed\":%d,\"frames\":[",
-                g85_evFrame ? 1 : 0, g85_evCount, g_cbtFired, (unsigned)g_cbtFault,
-                (unsigned long long)(uintptr_t)g_cbtHook, g85_subscribed);
+                g85_evFrame ? 1 : 0, g85_evCount, g_cbtFired, g_cbtCalls, g_cbtCreateCount,
+                (unsigned)g_cbtFault, (unsigned long long)(uintptr_t)g_cbtHook, g_cbtStrCreates,
+                g_cbtFirstClass, g_cbtLastClass, g85_subscribed);
     std::string j = b;
     if (!g85_evFrame) {
         j += "]}";
