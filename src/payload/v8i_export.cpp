@@ -1378,6 +1378,7 @@ static uintptr_t g85_qProcFrame = 0, g85_qProcRecv = 0;
 static uintptr_t g85_qCmdFrame = 0, g85_qCmdRecv = 0;
 static uintptr_t g85_qEvFrame = 0, g85_qEvRecv = 0;
 static int g85_sawMsg = 0;
+static volatile int g85_subscribed = 0;
 static uintptr_t g85_slots[24] = {};
 static uintptr_t g85_uiWin = 0;
 
@@ -1522,6 +1523,47 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
     return g85_origWndProc ? CallWindowProcW(g85_origWndProc, h, m, w, l) : 0;
 }
 
+// Startup watch: the payload may be injected before 1C creates its main
+// window. A worker polls for the window and, the moment it exists, runs the
+// subscribe chain on the UI thread (through the subclass bridge) — early
+// enough for the platform to deliver eventCreateFrame to us.
+static BOOL CALLBACK V8iFindMainWindow(HWND w, LPARAM lp) {
+    wchar_t cls[64] = {};
+    GetClassNameW(w, cls, 64);
+    if (wcsncmp(cls, L"V8Window0", 9) == 0 || wcsncmp(cls, L"V8TopLevelFrame", 15) == 0) {
+        *(HWND*)lp = w;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
+    for (int i = 0; i < 4000 && !g85_subscribed; ++i) {
+        HWND h = nullptr;
+        EnumWindows(V8iFindMainWindow, (LPARAM)&h);
+        if (h) {
+            g85_uiWin = (uintptr_t)h;
+            g85_origWndProc = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC,
+                                                         (LONG_PTR)V8iSubclass85);
+            if (g85_origWndProc) {
+                SendMessageW(h, WM_APP + 0x602, 0, 0);
+                SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)g85_origWndProc);
+            }
+            // The core is not ready the instant the window appears, so keep
+            // retrying until the subscribe chain actually succeeds.
+            if (g85_subscribed) return 0;
+            Sleep(50);
+            continue;
+        }
+        Sleep(5);
+    }
+    return 0;
+}
+
+void V8iStartStartupWatch() {
+    CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
+}
+
 // Runs on the 1C UI thread (called from the subclass proc).
 // Subscribes to eventCreateFrame so the next frame creation hands us an
 // ITopLevelFrame; a recipient object with a 4-slot vtable lives here.
@@ -1546,9 +1588,6 @@ static void V8iScanFrame85() {
     static const GUID kEvCreateFrame = {0x3573FFE0, 0x2FFF, 0x11D5,
                                         {0xBF, 0x5E, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79}};
     if (!g85_svc || !g85_svcVt) return;
-    // Ask 1C to open a window; the resulting frame arrives via onEvent.
-    if (g85_uiWin)
-        PostMessageW((HWND)g85_uiWin, WM_COMMAND, 601, 0);
     uintptr_t f1 = 0;
     __try { f1 = ((uintptr_t*)g85_svcVt)[1]; }
     __except (EXCEPTION_EXECUTE_HANDLER) { f1 = 0; }
@@ -1563,6 +1602,7 @@ static void V8iScanFrame85() {
         if (f) {
             __try {
                 ((SubFn)f)((void*)g85_svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
+                g85_subscribed = 1;
             } __except (EXCEPTION_EXECUTE_HANDLER) {
             }
         }
@@ -1587,6 +1627,13 @@ static void V8iScanFrame85() {
 // discovered: window -> GWLP_USERDATA object -> core (obj+8) ->
 // ICommandReceiver (core - offset). No 1C code is called here.
 static std::string CmdInfoToJsonA() {
+    // Arm the startup watcher on every call: if the main window does not exist
+    // yet, the worker subscribes the moment it appears (before the platform
+    // dispatches eventCreateFrame).
+    {
+        static bool armed = false;
+        if (!armed) { armed = true; V8iStartStartupWatch(); }
+    }
     struct WinRec { HWND h; std::wstring cls; std::wstring title; };
     std::vector<WinRec> wins;
     struct Ctx { std::vector<WinRec>* v; DWORD pid; };
