@@ -977,6 +977,9 @@ struct LogCtx {
     int visible = 1;
     std::wstring dir;
     std::wstring detail;   // expanded commit text for the selected row
+    std::wstring diff;     // patch of the selected commit (git show --patch)
+    int diffTop = 0;       // first visible diff line
+    int diffLines = 0;     // total diff lines (for the scroll hint)
     HFONT mono = nullptr;
     HFONT ui = nullptr;
     RECT rcClose{};
@@ -1069,6 +1072,29 @@ void LogPaint(LogCtx* c) {
     DrawTextW(dc, (L"История: " + c->dir).c_str(), -1, &head,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
+    // column headers: graph | subject | date | author
+    {
+        const int kDateW = 84;
+        const int kAuthorW = 150;
+        int right = rc.right - 4;
+        SetTextColor(dc, kLogGray);
+        RECT hSubj{ 40, 20, right - kDateW - kAuthorW, 34 };
+        DrawTextW(dc, L"Комментарий", -1, &hSubj,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RECT hDate{ right - kDateW - kAuthorW, 20, right - kAuthorW, 34 };
+        DrawTextW(dc, L"Дата", -1, &hDate,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RECT hAuth{ right - kAuthorW, 20, right, 34 };
+        DrawTextW(dc, L"Автор", -1, &hAuth,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        HPEN hl = CreatePen(PS_SOLID, 1, kLogBorder);
+        HPEN ohl = (HPEN)SelectObject(dc, hl);
+        MoveToEx(dc, 4, 34, nullptr);
+        LineTo(dc, right, 34);
+        SelectObject(dc, ohl);
+        DeleteObject(hl);
+    }
+
     // close box [X]
     HBRUSH cb = CreateSolidBrush(c->hoverClose ? RGB(226, 216, 178) : kLogBg);
     FillRect(dc, &c->rcClose, cb);
@@ -1080,9 +1106,9 @@ void LogPaint(LogCtx* c) {
     DeleteObject(cp);
     DrawTextW(dc, L"X", -1, &c->rcClose, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    // rows
-    int listTop = 24;
-    int listBottom = rc.bottom - 60;
+    // rows — top half; details + patch below
+    int listTop = 36;
+    int listBottom = 36 + (rc.bottom - 36) * 45 / 100;
     c->visible = (listBottom - listTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
     HGDIOBJ oldMono = SelectObject(dc, c->mono);
@@ -1111,47 +1137,109 @@ void LogPaint(LogCtx* c) {
             gw = sz.cx;
         }
         x += gw;
-        if (!r.hash.empty()) {
-            RECT hr{ x, row.top, x + 74, row.bottom };
-            SetTextColor(dc, selected ? RGB(255, 255, 255) : kLogGray);
-            DrawTextW(dc, r.hash.c_str(), (int)r.hash.size(), &hr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            x += 74;
-        }
-        if (!r.refs.empty() && !selected) SetTextColor(dc, kLogRefs);
-        if (!r.refs.empty()) {
-            SIZE sz{};
-            GetTextExtentPoint32W(dc, r.refs.c_str(), (int)r.refs.size(), &sz);
-            RECT rr{ x, row.top, x + sz.cx + 8, row.bottom };
-            DrawTextW(dc, r.refs.c_str(), (int)r.refs.size(), &rr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            x += sz.cx + 8;
-        }
+        // Columns, as requested: graph | subject | date | author
+        const int kDateW = 84;
+        const int kAuthorW = 150;
+        int subjRight = row.right - kDateW - kAuthorW;
+        RECT sr{ x, row.top, subjRight, row.bottom };
         SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
-        RECT sr{ x, row.top, row.right - 84, row.bottom };
         DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        RECT dr{ row.right - 84, row.top, row.right - 2, row.bottom };
+        RECT dr{ subjRight, row.top, subjRight + kDateW, row.bottom };
         SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
         DrawTextW(dc, r.date.c_str(), (int)r.date.size(), &dr,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        RECT ar{ subjRight + kDateW, row.top, row.right - 2, row.bottom };
+        SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
+        DrawTextW(dc, r.author.c_str(), (int)r.author.size(), &ar,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
     SelectObject(dc, oldMono);
 
-    // scrollbar hint / status line + details
+    // separator, status line, commit details and the patch pane
     SelectObject(dc, oldFont);
+    HPEN sep = CreatePen(PS_SOLID, 1, kLogBorder);
+    HPEN osep = (HPEN)SelectObject(dc, sep);
+    MoveToEx(dc, 4, listBottom + 2, nullptr);
+    LineTo(dc, rc.right - 4, listBottom + 2);
+    SelectObject(dc, osep);
+    DeleteObject(sep);
+
     SetTextColor(dc, kLogGray);
-    wchar_t st[128] = {};
+    wchar_t st[160] = {};
     int shown = c->visible;
     if (shown > (int)c->rows.size() - c->top) shown = (int)c->rows.size() - c->top;
-    _snwprintf_s(st, _TRUNCATE, L"коммитов: %d  ▸ %d…%d   (колесо/↑↓, Enter — закрыть)",
+    _snwprintf_s(st, _TRUNCATE, L"коммитов: %d  ▸ %d…%d   (↑↓ — коммиты, колесо в диффе — прокрутка, Enter — закрыть)",
                  (int)c->rows.size(), c->top + 1, c->top + shown);
-    RECT sr{ 8, rc.bottom - 58, rc.right - 8, rc.bottom - 42 };
-    DrawTextW(dc, st, -1, &sr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    RECT sr{ 8, listBottom + 4, rc.right - 8, listBottom + 20 };
+    DrawTextW(dc, st, -1, &sr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+    int detTop = listBottom + 22;
+    int detBottom = detTop + 34;
     if (!c->detail.empty()) {
-        RECT det{ 8, rc.bottom - 40, rc.right - 8, rc.bottom - 4 };
+        RECT det{ 8, detTop, rc.right - 8, detBottom };
+        SetTextColor(dc, RGB(0, 0, 0));
         DrawTextW(dc, c->detail.c_str(), -1, &det,
-                  DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+                  DT_LEFT | DT_TOP | DT_NOPREFIX | DT_END_ELLIPSIS | DT_WORDBREAK);
+    }
+
+    // patch pane: one line per diff row, coloured by its first character
+    int patchTop = detBottom + 4;
+    int patchBottom = rc.bottom - 6;
+    if (patchBottom > patchTop && !c->diff.empty()) {
+        int rowsFit = (patchBottom - patchTop) / kLogRowH;
+        if (rowsFit < 1) rowsFit = 1;
+        int maxTop = c->diffLines - rowsFit;
+        if (maxTop < 0) maxTop = 0;
+        if (c->diffTop > maxTop) c->diffTop = maxTop;
+        if (c->diffTop < 0) c->diffTop = 0;
+
+        HGDIOBJ oldMono2 = SelectObject(dc, c->mono);
+        size_t pos = 0;
+        int lineIdx = 0;
+        while (pos <= c->diff.size()) {
+            size_t e = c->diff.find_first_of(L"\r\n", pos);
+            if (e == std::wstring::npos) e = c->diff.size();
+            std::wstring line = c->diff.substr(pos, e - pos);
+            pos = e;
+            while (pos < c->diff.size() && (c->diff[pos] == L'\r' || c->diff[pos] == L'\n')) ++pos;
+            if (lineIdx >= c->diffTop && lineIdx < c->diffTop + rowsFit) {
+                int y = patchTop + (lineIdx - c->diffTop) * kLogRowH;
+                RECT lr{ 6, y, rc.right - 6, y + kLogRowH - 1 };
+                wchar_t first = line.empty() ? L' ' : line[0];
+                if (first == L'+' && !(line.size() > 2 && line[1] == L'+')) {
+                    HBRUSH gb = CreateSolidBrush(RGB(228, 245, 228));
+                    FillRect(dc, &lr, gb);
+                    DeleteObject(gb);
+                    SetTextColor(dc, RGB(20, 110, 20));
+                } else if (first == L'-' && !(line.size() > 2 && line[1] == L'-')) {
+                    HBRUSH rb = CreateSolidBrush(RGB(252, 232, 232));
+                    FillRect(dc, &lr, rb);
+                    DeleteObject(rb);
+                    SetTextColor(dc, RGB(160, 30, 30));
+                } else if (line.rfind(L"@@", 0) == 0) {
+                    SetTextColor(dc, RGB(40, 80, 160));
+                } else if (line.rfind(L"diff --git", 0) == 0 ||
+                           line.rfind(L"index ", 0) == 0 ||
+                           line.rfind(L"--- ", 0) == 0 ||
+                           line.rfind(L"+++ ", 0) == 0) {
+                    SetTextColor(dc, kLogGray);
+                } else {
+                    SetTextColor(dc, RGB(0, 0, 0));
+                }
+                DrawTextW(dc, line.c_str(), (int)line.size(), &lr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            }
+            ++lineIdx;
+            if (pos >= c->diff.size()) break;
+        }
+        SelectObject(dc, oldMono2);
+
+        wchar_t dh[64] = {};
+        _snwprintf_s(dh, _TRUNCATE, L"дифф: %d строк ▸ %d", c->diffLines, c->diffTop + 1);
+        RECT dhr{ rc.right - 200, listBottom + 4, rc.right - 8, listBottom + 20 };
+        SetTextColor(dc, kLogGray);
+        DrawTextW(dc, dh, -1, &dhr, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
     }
     EndPaint(c->hwnd, &ps);
 }
@@ -1172,11 +1260,23 @@ void LogSelect(LogCtx* c, int idx) {
     if (c->sel >= c->top + c->visible) LogScrollTo(c, c->sel - c->visible + 1);
     const LogRow& r = c->rows[c->sel];
     c->detail.clear();
+    c->diff.clear();
+    c->diffTop = 0;
+    c->diffLines = 0;
     if (!r.hash.empty()) {
         std::wstring body = RunGit({ L"-C", c->dir, L"show", L"-s",
                                      L"--format=%an <%ae>, %ad%n%B", r.hash });
         c->detail = TrimWs(body);
         if (c->detail.empty()) c->detail = r.author + L", " + r.date;
+
+        // Patch for the diff pane: stat first (one line per file), then the
+        // unified diff itself. Colour comes from the line prefix in LogPaint.
+        std::wstring patch = RunGit({ L"-C", c->dir, L"show", L"--format=",
+                                      L"--stat", L"--patch", L"--no-color", r.hash });
+        c->diff = patch;
+        for (wchar_t ch : patch)
+            if (ch == L'\n') ++c->diffLines;
+        if (c->diffLines == 0 && !patch.empty()) c->diffLines = 1;
     }
     InvalidateRect(c->hwnd, nullptr, FALSE);
 }
@@ -1197,9 +1297,29 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
-    case WM_MOUSEWHEEL:
-        if (c) LogScrollTo(c, c->top - GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 3);
+    case WM_MOUSEWHEEL: {
+        if (!c) break;
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        ScreenToClient(h, &pt);
+        RECT rc{};
+        GetClientRect(h, &rc);
+        int listBottom = 24 + (rc.bottom - 24) * 45 / 100;
+        int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 3;
+        if (pt.y > listBottom + 22) {
+            // cursor over the patch pane — scroll the diff
+            int rowsFit = (rc.bottom - 6 - (listBottom + 60)) / kLogRowH;
+            if (rowsFit < 1) rowsFit = 1;
+            int maxTop = c->diffLines - rowsFit;
+            if (maxTop < 0) maxTop = 0;
+            c->diffTop -= delta;
+            if (c->diffTop > maxTop) c->diffTop = maxTop;
+            if (c->diffTop < 0) c->diffTop = 0;
+            InvalidateRect(h, nullptr, FALSE);
+        } else {
+            LogScrollTo(c, c->top - delta);
+        }
         return 0;
+    }
     case WM_MOUSEMOVE: {
         if (!c) break;
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
@@ -1211,8 +1331,8 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!c) break;
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         if (PtInRect(&c->rcClose, pt)) { DestroyWindow(h); return 0; }
-        if (pt.y >= 24) {
-            int idx = c->top + (pt.y - 24) / kLogRowH;
+        if (pt.y >= 36) {
+            int idx = c->top + (pt.y - 36) / kLogRowH;
             if (idx >= 0 && idx < (int)c->rows.size()) LogSelect(c, idx);
         }
         return 0;
@@ -1274,7 +1394,7 @@ void ShowGitLog(HWND owner) {
     HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitLog",
                              L"История Git — v8inject",
                              WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
-                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 430, owner, nullptr,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 940, 660, owner, nullptr,
                              GetModuleHandleW(nullptr), nullptr);
     if (!h) { delete c; return; }
     SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)c);
