@@ -1564,10 +1564,9 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
 static bool V8iInstallCreateWindowHook();
 
 void V8iStartStartupWatch() {
-    // The window-creation hooks (user32!CreateWindowExW, wbase85!V8CreateWindowEx)
-    // never fire on 8.5 — the main window is created deeper (win32u), so they
-    // are left disabled; the watcher stays as a fallback.
-    // V8iInstallCreateWindowHook();
+    // Window-creation hook: 8.5 creates its main window through
+    // win32u!NtUserCreateWindowEx; the watcher stays as a fallback.
+    V8iInstallCreateWindowHook();
     CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
 }
 
@@ -1763,36 +1762,45 @@ static void* g_cwTrampoline = nullptr;
 static BYTE g_cwOrig[24] = {};
 static volatile int g_cwHookOk = 0;
 static volatile long g_cwHits = 0;
-static volatile int g_cwEnableSubscribe = 1;  // 1 = run the subscribe chain
+static volatile int g_cwEnableSubscribe = 0;  // подписка в детуре опасна до готовности ядра
 
-static HWND WINAPI V8iDetourCreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name,
-                                            DWORD style, int x, int y, int w, int h,
-                                            HWND parent, HMENU menu, HINSTANCE inst,
-                                            LPVOID param, LPVOID info) {
+// NtUserCreateWindowEx takes the class as LARGE_STRING, not LPCWSTR.
+struct V8iLargeString { USHORT len; USHORT max; ULONG pad; PWSTR buf; };
+
+static HWND WINAPI V8iDetourNtUserCreateWindowEx(DWORD exStyle, void* cls, void* name,
+                                                 DWORD style, int x, int y, int w, int h,
+                                                 HWND parent, HMENU menu, HINSTANCE inst,
+                                                 LPVOID param, DWORD flags, void* extra) {
     ++g_cwHits;
-    if (cls && !g85_subscribed && g_cwEnableSubscribe &&
-        (wcsncmp(cls, L"V8Window0", 9) == 0 || wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)) {
-        V8iSubscribeNow();
+    if (cls && !g85_subscribed && g_cwEnableSubscribe) {
+        V8iLargeString* s = (V8iLargeString*)cls;
+        if (s->buf && IsReadable(s->buf, 32) &&
+            (wcsncmp(s->buf, L"V8Window0", 9) == 0 || wcsncmp(s->buf, L"V8TopLevelFrame", 15) == 0)) {
+            V8iSubscribeNow();
+        }
     }
-    typedef HWND(WINAPI* Fn)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int,
-                             HWND, HMENU, HINSTANCE, LPVOID, LPVOID);
-    return ((Fn)g_cwTrampoline)(exStyle, cls, name, style, x, y, w, h, parent, menu, inst, param, info);
+    typedef HWND(WINAPI* Fn)(DWORD, void*, void*, DWORD, int, int, int, int,
+                             HWND, HMENU, HINSTANCE, LPVOID, DWORD, void*);
+    return ((Fn)g_cwTrampoline)(exStyle, cls, name, style, x, y, w, h,
+                                parent, menu, inst, param, flags, extra);
 }
 
 // Installs the inline hook (mov rax, detour; jmp rax = 12 bytes + NOPs).
 static bool V8iInstallCreateWindowHook() {
     if (g_cwTrampoline) return true;
-    // 1C creates its windows through its own wrapper, not user32 directly.
-    ModuleRange wbase = V8iFindModuleByName(L"wbase85.dll");
-    if (!wbase.base) return false;
-    uint32_t expRva = (uint32_t)V8iResolveExportFromFile(wbase.path, "?V8CreateWindowEx@@", 19);
-    if (!expRva) return false;
-    void* target = (void*)(wbase.base + expRva);
-    // Prologue: 40 53 (push rbx) 48 83 EC 60 (sub rsp,60h)
-    //           48 8B 84 24 C8 00 00 00 (mov rax,[rsp+C8h])
-    const BYTE expect[8] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x60, 0x48, 0x8B};
+    // 8.5 creates its main window deeper than user32/wbase85: hook the
+    // syscall stub in win32u.
+    HMODULE w32u = GetModuleHandleW(L"win32u.dll");
+    if (!w32u) w32u = LoadLibraryW(L"win32u.dll");
+    if (!w32u) return false;
+    void* target = (void*)GetProcAddress(w32u, "NtUserCreateWindowEx");
+    if (!target) return false;
+    // 4C 8B D1              mov  r10, rcx
+    // B8 6F 10 00 00        mov  eax, 106Fh
+    // F6 04 25 08 03 FE 7F 01  test byte ptr [7FFE0308h], 1
+    const BYTE expect[8] = {0x4C, 0x8B, 0xD1, 0xB8, 0x6F, 0x10, 0x00, 0x00};
     if (memcmp(target, expect, sizeof(expect)) != 0) return false;
-    const int len = 14;  // 2 + 4 + 8
+    const int len = 16;  // 3 + 5 + 8 whole instructions
     memcpy(g_cwOrig, target, len);
     BYTE* tr = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!tr) return false;
@@ -1803,10 +1811,10 @@ static bool V8iInstallCreateWindowHook() {
     g_cwTrampoline = tr;
     DWORD oldProt = 0;
     if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
-    BYTE patch[14];
+    BYTE patch[16];
     memset(patch, 0x90, sizeof(patch));
     patch[0] = 0x48; patch[1] = 0xB8;
-    *(uintptr_t*)(patch + 2) = (uintptr_t)&V8iDetourCreateWindowExW;
+    *(uintptr_t*)(patch + 2) = (uintptr_t)&V8iDetourNtUserCreateWindowEx;
     patch[10] = 0xFF; patch[11] = 0xE0;
     memcpy(target, patch, len);
     VirtualProtect(target, len, oldProt, &oldProt);
