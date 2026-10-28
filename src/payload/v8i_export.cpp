@@ -1372,12 +1372,16 @@ static uintptr_t g85_frame = 0;
 static uintptr_t g85_frameVt = 0;
 static uintptr_t g85_recv = 0;
 static uintptr_t g85_recvVt = 0;
+static uintptr_t g85_frames[4] = {};
+static int g85_nFrames = 0;
 static int g85_sawMsg = 0;
 static uintptr_t g85_slots[24] = {};
 
 typedef void* (__cdecl* V8iCurProcFn)();
 typedef void* (__cdecl* V8iGetSvcFn)(void*, const GUID*);
 static WNDPROC g85_origWndProc = nullptr;
+
+static void V8iScanFrame85();
 
 static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_APP + 0x602) {
@@ -1465,10 +1469,68 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
                     g85_recvVt = recv ? *(uintptr_t*)recv : 0;
                 }
             }
+
+            // Heap QI scan for IID_ITopLevelFrame — done in a helper that avoids
+            // __try/C++ object conflicts; QI goes through the SEH probe.
+            V8iScanFrame85();
         }
         return 0;
     }
     return g85_origWndProc ? CallWindowProcW(g85_origWndProc, h, m, w, l) : 0;
+}
+
+// Runs on the 1C UI thread (called from the subclass proc).
+// Subscribes to eventCreateFrame so the next frame creation hands us an
+// ITopLevelFrame; a recipient object with a 4-slot vtable lives here.
+static uintptr_t g85_evFrame = 0;
+static volatile long g85_evCount = 0;
+static HRESULT __stdcall V8iRecipQI(void* self, const GUID*, void** out) {
+    if (out) *out = self;
+    return 0;
+}
+static ULONG __stdcall V8iRecipAddRef(void*) { return 1; }
+static ULONG __stdcall V8iRecipRelease(void*) { return 1; }
+static HRESULT __stdcall V8iRecipOnEvent(void*, const GUID*, long, void* obj) {
+    ++g85_evCount;
+    if (obj) g85_evFrame = (uintptr_t)obj;
+    return 0;
+}
+static void* g85_recipVt[4] = {(void*)V8iRecipQI, (void*)V8iRecipAddRef,
+                               (void*)V8iRecipRelease, (void*)V8iRecipOnEvent};
+static struct V8iRecip { void** vt; } g85_recip = {g85_recipVt};
+
+static void V8iScanFrame85() {
+    static const GUID kEvCreateFrame = {0x3573FFE0, 0x2FFF, 0x11D5,
+                                        {0xBF, 0x5E, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79}};
+    if (!g85_svc || !g85_svcVt) return;
+    uintptr_t f1 = 0;
+    __try { f1 = ((uintptr_t*)g85_svcVt)[1]; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { f1 = 0; }
+    if (!f1) return;
+    typedef void(__cdecl* SubFn)(void*, const GUID*, void*, const char*, int);
+    // 8.5 may order the slots differently: try slot 1 then slot 0 as subscribe
+    for (int slot : {1, 0}) {
+        uintptr_t f = 0;
+        __try { f = ((uintptr_t*)g85_svcVt)[slot]; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { f = 0; }
+        if (!f) continue;
+        __try {
+            ((SubFn)f)((void*)g85_svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    // then try both as notify; a working subscribe makes evCount jump
+    for (int slot : {0, 1}) {
+        uintptr_t f = 0;
+        __try { f = ((uintptr_t*)g85_svcVt)[slot]; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { f = 0; }
+        if (!f) continue;
+        __try {
+            ((void(__cdecl*)(void*, const GUID*, long, void*))f)(
+                (void*)g85_svc, &kEvCreateFrame, 0, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
 }
 
 // "cmdinfo" — read-only diagnostics: how the command receiver can be located
@@ -1981,6 +2043,16 @@ static std::string CmdInfoToJsonA() {
                                 (unsigned long long)g85_frame, fm.c_str(), fr2,
                                 (unsigned long long)g85_recv, rm.c_str(), rr2);
                     j += fb;
+                }
+                {
+                    char nb2[260];
+                    _snprintf_s(nb2, sizeof(nb2), _TRUNCATE,
+                                ",\"nFrames\":%d,\"frames\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"],\"evCount\":%ld,\"evFrame\":\"0x%llX\"",
+                                g85_nFrames,
+                                (unsigned long long)g85_frames[0], (unsigned long long)g85_frames[1],
+                                (unsigned long long)g85_frames[2], (unsigned long long)g85_frames[3],
+                                g85_evCount, (unsigned long long)g85_evFrame);
+                    j += nb2;
                 }
             } else {
                 j += "\"fn\":null";
