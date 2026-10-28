@@ -1374,6 +1374,9 @@ static uintptr_t g85_recv = 0;
 static uintptr_t g85_recvVt = 0;
 static uintptr_t g85_frames[4] = {};
 static int g85_nFrames = 0;
+static uintptr_t g85_qProcFrame = 0, g85_qProcRecv = 0;
+static uintptr_t g85_qCmdFrame = 0, g85_qCmdRecv = 0;
+static uintptr_t g85_qEvFrame = 0, g85_qEvRecv = 0;
 static int g85_sawMsg = 0;
 static uintptr_t g85_slots[24] = {};
 
@@ -1436,6 +1439,28 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
             g85_svc4Vt = svc4 && svc4 != (void*)-1 ? *(uintptr_t*)svc4 : 0;
             g85_svcSlot = svcSlot;
             g85_svc2Slot = svc2Slot;
+
+            // QI the objects we already hold for ITopLevelFrame/ICommandReceiver
+            {
+                static const GUID kIID_TopFrame = {0xDE300901, 0xA120, 0x11d4,
+                                                   {0x94, 0x29, 0x00, 0x80, 0x48, 0xDA, 0x11, 0xF9}};
+                static const GUID kIID_CmdRecv = {0x377A2018, 0xC51B, 0x4cf5,
+                                                  {0xAC, 0x03, 0xA1, 0x50, 0x92, 0x66, 0xDF, 0x2D}};
+                struct { uintptr_t obj; uintptr_t* out; } probes[] = {
+                    {g85_proc, &g85_qProcFrame}, {g85_proc, &g85_qProcRecv},
+                    {g85_svc2, &g85_qCmdFrame}, {g85_svc2, &g85_qCmdRecv},
+                    {g85_svc, &g85_qEvFrame}, {g85_svc, &g85_qEvRecv},
+                };
+                const GUID* iids[] = {&kIID_TopFrame, &kIID_CmdRecv, &kIID_TopFrame,
+                                      &kIID_CmdRecv, &kIID_TopFrame, &kIID_CmdRecv};
+                for (int i = 0; i < 6; ++i) {
+                    *probes[i].out = 0;
+                    if (!probes[i].obj || !IsReadable((void*)probes[i].obj, 16)) continue;
+                    void* out = nullptr;
+                    if (V8iQIProbe((void*)probes[i].obj, iids[i], &out) == 0 && out)
+                        *probes[i].out = (uintptr_t)out;
+                }
+            }
 
             // Slot 27 copies {ptr, refcount} from [rcx+0x148] — looks like a
             // getTopLevelFrame-style getter. Try it, then QI the result for
@@ -1508,27 +1533,29 @@ static void V8iScanFrame85() {
     __except (EXCEPTION_EXECUTE_HANDLER) { f1 = 0; }
     if (!f1) return;
     typedef void(__cdecl* SubFn)(void*, const GUID*, void*, const char*, int);
-    // 8.5 may order the slots differently: try slot 1 then slot 0 as subscribe
-    for (int slot : {1, 0}) {
+    // 8.5: slot 4 = _subscribe, slot 3 = notify, slot 5 = unsubscribe
+    // (all three do a GUID lookup; 0..2 are interface thunks).
+    {
         uintptr_t f = 0;
-        __try { f = ((uintptr_t*)g85_svcVt)[slot]; }
+        __try { f = ((uintptr_t*)g85_svcVt)[4]; }
         __except (EXCEPTION_EXECUTE_HANDLER) { f = 0; }
-        if (!f) continue;
-        __try {
-            ((SubFn)f)((void*)g85_svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (f) {
+            __try {
+                ((SubFn)f)((void*)g85_svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
         }
     }
-    // then try both as notify; a working subscribe makes evCount jump
-    for (int slot : {0, 1}) {
+    {
         uintptr_t f = 0;
-        __try { f = ((uintptr_t*)g85_svcVt)[slot]; }
+        __try { f = ((uintptr_t*)g85_svcVt)[3]; }
         __except (EXCEPTION_EXECUTE_HANDLER) { f = 0; }
-        if (!f) continue;
-        __try {
-            ((void(__cdecl*)(void*, const GUID*, long, void*))f)(
-                (void*)g85_svc, &kEvCreateFrame, 0, nullptr);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (f) {
+            __try {
+                ((void(__cdecl*)(void*, const GUID*, long, void*))f)(
+                    (void*)g85_svc, &kEvCreateFrame, 0, nullptr);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
         }
     }
 }
@@ -2045,13 +2072,16 @@ static std::string CmdInfoToJsonA() {
                     j += fb;
                 }
                 {
-                    char nb2[260];
+                    char nb2[520];
                     _snprintf_s(nb2, sizeof(nb2), _TRUNCATE,
-                                ",\"nFrames\":%d,\"frames\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"],\"evCount\":%ld,\"evFrame\":\"0x%llX\"",
-                                g85_nFrames,
-                                (unsigned long long)g85_frames[0], (unsigned long long)g85_frames[1],
-                                (unsigned long long)g85_frames[2], (unsigned long long)g85_frames[3],
-                                g85_evCount, (unsigned long long)g85_evFrame);
+                                ",\"evCount\":%ld,\"evFrame\":\"0x%llX\","
+                                "\"qProcFrame\":\"0x%llX\",\"qProcRecv\":\"0x%llX\","
+                                "\"qCmdFrame\":\"0x%llX\",\"qCmdRecv\":\"0x%llX\","
+                                "\"qEvFrame\":\"0x%llX\",\"qEvRecv\":\"0x%llX\"",
+                                g85_evCount, (unsigned long long)g85_evFrame,
+                                (unsigned long long)g85_qProcFrame, (unsigned long long)g85_qProcRecv,
+                                (unsigned long long)g85_qCmdFrame, (unsigned long long)g85_qCmdRecv,
+                                (unsigned long long)g85_qEvFrame, (unsigned long long)g85_qEvRecv);
                     j += nb2;
                 }
             } else {
