@@ -1291,6 +1291,14 @@ void LogSelect(LogCtx* c, int idx) {
 LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     LogCtx* c = (LogCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
     switch (msg) {
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        if (mmi) {
+            mmi->ptMinTrackSize.x = 620;
+            mmi->ptMinTrackSize.y = 420;
+        }
+        return 0;
+    }
     case WM_PAINT:
         if (c) LogPaint(c);
         return 0;
@@ -1400,7 +1408,8 @@ void ShowGitLog(HWND owner) {
 
     HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitLog",
                              L"История Git — v8inject",
-                             WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
+                             WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX |
+                             WS_OVERLAPPED | WS_VISIBLE,
                              CW_USEDEFAULT, CW_USEDEFAULT, 940, 660, owner, nullptr,
                              GetModuleHandleW(nullptr), nullptr);
     if (!h) { delete c; return; }
