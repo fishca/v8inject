@@ -1636,6 +1636,12 @@ static DWORD WINAPI V8iEarlySubscribeThread(LPVOID param) {
     return 0;
 }
 
+// C linkage so DllMain can arm the hook the moment the payload is loaded —
+// before 1C reaches its main window (the session in v8i_probe starts later).
+extern "C" __declspec(dllexport) void V8iArmEarly() {
+    V8iArmEarlySubscribe();
+}
+
 static bool V8iInstallCreateWindowHook();
 
 void V8iStartStartupWatch() {
