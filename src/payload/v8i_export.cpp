@@ -1560,7 +1560,13 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     return 0;
 }
 
+static bool V8iInstallCreateWindowHook();
+
 void V8iStartStartupWatch() {
+    // NOTE: the inline hook on CreateWindowExW is disabled — the current
+    // trampoline crashes 1C when the window is created. Re-enable after the
+    // trampoline is fixed (see V8iInstallCreateWindowHook).
+    // V8iInstallCreateWindowHook();
     CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
 }
 
@@ -1619,6 +1625,191 @@ static void V8iScanFrame85() {
             }
         }
     }
+}
+
+// --- inline hook on user32!CreateWindowExW -------------------------------
+// The only moment where eventCreateFrame can still be caught: the UI thread
+// calls CreateWindowExW for the main window, the core is already loaded and
+// the window does not exist yet. Runs current_process -> getService ->
+// subscribe right there, then lets the original call proceed.
+static uintptr_t V8iResolveExportFromFile(const std::wstring& modulePath,
+                                          const char* namePrefix, size_t prefixLen) {
+    HANDLE fh = CreateFileW(modulePath.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(fh, &sz);
+    uintptr_t result = 0;
+    if (sz.QuadPart > 0 && sz.QuadPart < 64 * 1024 * 1024LL) {
+        std::vector<unsigned char> fbuf((size_t)sz.QuadPart);
+        DWORD got = 0;
+        if (ReadFile(fh, fbuf.data(), (DWORD)fbuf.size(), &got, nullptr) && got == fbuf.size()) {
+            const unsigned char* fd = fbuf.data();
+            auto r32 = [fd](uintptr_t o) -> uint32_t { return *(const uint32_t*)(fd + o); };
+            uintptr_t dos = fd[0x3C] | (fd[0x3D] << 8) | (fd[0x3E] << 16) | ((uintptr_t)fd[0x3F] << 24);
+            if (dos + 0x100 < fbuf.size()) {
+                uintptr_t nt = dos + 4;
+                uint16_t nsec = *(const uint16_t*)(fd + nt + 2);
+                uint16_t optSize = *(const uint16_t*)(fd + nt + 16);
+                uintptr_t opt = nt + 20;
+                uintptr_t secTab = opt + optSize;
+                auto toRaw = [&](uint32_t rva) -> uint32_t {
+                    for (uint16_t i = 0; i < nsec; ++i) {
+                        uintptr_t sh = secTab + (uintptr_t)i * 40;
+                        if (sh + 40 > fbuf.size()) break;
+                        uint32_t va = r32(sh + 12);
+                        uint32_t vs = r32(sh + 8);
+                        uint32_t raw = r32(sh + 20);
+                        if (rva >= va && rva < va + vs) return rva - va + raw;
+                    }
+                    return rva;
+                };
+                uintptr_t dd = opt + (optSize != 224 ? 112 : 96);
+                uint32_t expRva = (dd + 8 <= fbuf.size()) ? r32(dd) : 0;
+                if (expRva && expRva + 40 <= fbuf.size()) {
+                    uint32_t eo = toRaw(expRva);
+                    if (eo + 40 <= fbuf.size()) {
+                        uint32_t names = r32(eo + 32);
+                        uint32_t funcs = r32(eo + 28);
+                        uint32_t ords = r32(eo + 36);
+                        uint32_t nNames = r32(eo + 24);
+                        for (uint32_t i = 0; i < nNames && i < 16384; ++i) {
+                            uint32_t np = toRaw(r32(toRaw(names + i * 4)));
+                            if (!np || np + prefixLen + 1 > (uint32_t)fbuf.size()) continue;
+                            if (memcmp(fd + np, namePrefix, prefixLen) != 0) continue;
+                            uint16_t idx = *(const uint16_t*)(fd + toRaw(ords + i * 2));
+                            result = r32(toRaw(funcs + (uint32_t)idx * 4));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CloseHandle(fh);
+    return result;  // RVA
+}
+
+static ModuleRange V8iFindModuleByName(const wchar_t* leaf) {
+    for (const ModuleRange& m : EnumModules()) {
+        size_t s = m.path.find_last_of(L"\\/");
+        std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
+        if (_wcsicmp(n.c_str(), leaf) == 0) return m;
+    }
+    return ModuleRange{};
+}
+
+// current_process -> getService(IEventService) -> subscribe(eventCreateFrame)
+static void V8iResolveCore85Proc(uintptr_t* outBase, uint32_t* outRva) {
+    *outBase = 0;
+    *outRva = 0;
+    for (const ModuleRange& m : EnumModules()) {
+        size_t s = m.path.find_last_of(L"\\/");
+        std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
+        if (_wcsicmp(n.c_str(), L"core85.dll") != 0) continue;
+        *outBase = m.base;
+        *outRva = (uint32_t)V8iResolveExportFromFile(m.path, "?current_process@core@@", 23);
+        return;
+    }
+}
+
+static void V8iSubscribeNow() {
+    if (g85_subscribed) return;
+    uintptr_t base = 0;
+    uint32_t rva = 0;
+    V8iResolveCore85Proc(&base, &rva);
+    if (!base || !rva) return;
+    uintptr_t fn = base + rva;
+    void* proc = nullptr;
+    __try {
+        proc = ((V8iCurProcFn)fn)();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        proc = nullptr;
+    }
+    if (!proc) return;
+    uintptr_t vt = 0;
+    __try { vt = *(uintptr_t*)proc; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { vt = 0; }
+    if (!vt) return;
+    static const GUID kIID_EventService = {0xEBF766AA, 0xF32C, 0x11D3,
+                                           {0x98, 0x51, 0x00, 0x80, 0x48, 0xDA, 0x12, 0x52}};
+    static const GUID kEvCreateFrame = {0x3573FFE0, 0x2FFF, 0x11D5,
+                                        {0xBF, 0x5E, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79}};
+    void* svc = nullptr;
+    __try {
+        svc = ((V8iGetSvcFn)((uintptr_t*)vt)[14])(proc, &kIID_EventService);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        svc = nullptr;
+    }
+    if (!svc) return;
+    uintptr_t svt = 0;
+    __try { svt = *(uintptr_t*)svc; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { svt = 0; }
+    if (!svt) return;
+    typedef void(__cdecl* SubFn)(void*, const GUID*, void*, const char*, int);
+    __try {
+        ((SubFn)((uintptr_t*)svt)[4])(svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
+        g85_subscribed = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+static void* g_cwTrampoline = nullptr;
+static BYTE g_cwOrig[24] = {};
+static volatile int g_cwHookOk = 0;
+static volatile long g_cwHits = 0;
+
+static HWND WINAPI V8iDetourCreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name,
+                                            DWORD style, int x, int y, int w, int h,
+                                            HWND parent, HMENU menu, HINSTANCE inst,
+                                            LPVOID param) {
+    ++g_cwHits;
+    if (cls && !g85_subscribed &&
+        (wcsncmp(cls, L"V8Window0", 9) == 0 || wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)) {
+        V8iSubscribeNow();
+    }
+    typedef HWND(WINAPI* Fn)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int,
+                             HWND, HMENU, HINSTANCE, LPVOID);
+    return ((Fn)g_cwTrampoline)(exStyle, cls, name, style, x, y, w, h, parent, menu, inst, param);
+}
+
+// Installs the inline hook (mov rax, detour; jmp rax = 12 bytes + NOPs).
+static bool V8iInstallCreateWindowHook() {
+    if (g_cwTrampoline) return true;
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    if (!u32) u32 = LoadLibraryW(L"user32.dll");
+    if (!u32) return false;
+    void* target = (void*)GetProcAddress(u32, "CreateWindowExW");
+    if (!target) return false;
+    // Prologue of user32!CreateWindowExW on this build:
+    //   4C 8B DC              mov  r11, rsp
+    //   48 81 EC 88 00 00 00  sub  rsp, 0x88
+    //   33 C0                 xor  eax, eax
+    //   66 89 44 24 78        mov  [rsp+78h], ax
+    const BYTE expect[8] = {0x4C, 0x8B, 0xDC, 0x48, 0x81, 0xEC, 0x88, 0x00};
+    if (memcmp(target, expect, sizeof(expect)) != 0) return false;
+    const int len = 17;  // whole instructions: 3 + 7 + 2 + 5
+    memcpy(g_cwOrig, target, len);
+    BYTE* tr = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tr) return false;
+    memcpy(tr, target, len);
+    tr[len] = 0x48; tr[len + 1] = 0xB8;
+    *(uintptr_t*)(tr + len + 2) = (uintptr_t)target + len;
+    tr[len + 10] = 0xFF; tr[len + 11] = 0xE0;
+    g_cwTrampoline = tr;
+    DWORD oldProt = 0;
+    if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+    BYTE patch[20];
+    memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0x48; patch[1] = 0xB8;
+    *(uintptr_t*)(patch + 2) = (uintptr_t)&V8iDetourCreateWindowExW;
+    patch[10] = 0xFF; patch[11] = 0xE0;
+    memcpy(target, patch, len);
+    VirtualProtect(target, len, oldProt, &oldProt);
+    FlushInstructionCache(GetCurrentProcess(), target, len);
+    g_cwHookOk = 1;
+    return true;
 }
 
 // "cmdinfo" — read-only diagnostics: how the command receiver can be located
@@ -2143,11 +2334,12 @@ static std::string CmdInfoToJsonA() {
                 {
                     char nb2[520];
                     _snprintf_s(nb2, sizeof(nb2), _TRUNCATE,
-                                ",\"evCount\":%ld,\"evFrame\":\"0x%llX\","
+                                ",\"evCount\":%ld,\"evFrame\":\"0x%llX\",\"hookOk\":%d,\"cwHits\":%ld,\"subscribed\":%d"
                                 "\"qProcFrame\":\"0x%llX\",\"qProcRecv\":\"0x%llX\","
                                 "\"qCmdFrame\":\"0x%llX\",\"qCmdRecv\":\"0x%llX\","
                                 "\"qEvFrame\":\"0x%llX\",\"qEvRecv\":\"0x%llX\"",
                                 g85_evCount, (unsigned long long)g85_evFrame,
+                                g_cwHookOk, g_cwHits, g85_subscribed,
                                 (unsigned long long)g85_qProcFrame, (unsigned long long)g85_qProcRecv,
                                 (unsigned long long)g85_qCmdFrame, (unsigned long long)g85_qCmdRecv,
                                 (unsigned long long)g85_qEvFrame, (unsigned long long)g85_qEvRecv);
