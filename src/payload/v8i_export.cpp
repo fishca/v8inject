@@ -1567,30 +1567,38 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
 // the hook only remembers the window and starts a worker that retries the
 // subscribe chain on that window's UI thread until the core answers.
 static HHOOK g_cbtHook = nullptr;
+static volatile long g_cbtFault = 0;
 static DWORD g_ownerPid = 0;
 static volatile int g_cbtFired = 0;
 
 static DWORD WINAPI V8iEarlySubscribeThread(LPVOID);
 
 static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (GetCurrentProcessId() != g_ownerPid)
-        return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
-    if (nCode == HCBT_CREATEWND && !g_cbtFired) {
-        HWND hwnd = (HWND)wParam;
-        CBT_CREATEWNDW* cw = (CBT_CREATEWNDW*)lParam;
-        const wchar_t* cls = (cw && cw->lpcs) ? cw->lpcs->lpszClass : nullptr;
-        // Snegopat compares against "V8Window0." (the main window class carries
-        // a hash suffix) and unhooks before doing anything else, so the
-        // subscribe chain cannot re-enter the hook.
-        if (cls && wcsncmp(cls, L"V8Window0.", 10) == 0) {
-            g_cbtFired = 1;
-            g85_uiWin = (uintptr_t)hwnd;
-            HHOOK h = g_cbtHook;
-            g_cbtHook = nullptr;
-            if (h) UnhookWindowsHookEx(h);
-            LogLine("cbt: main window class %ls — unhooked, subscribing", cls);
-            CreateThread(nullptr, 0, V8iEarlySubscribeThread, (LPVOID)hwnd, 0, nullptr);
+    // A fault inside a hook callback terminates the whole process
+    // (0xC000041D), and during 1C start-up almost nothing is safe to call, so
+    // the whole body sits under SEH: a failure must not kill the Configurator.
+    __try {
+        if (GetCurrentProcessId() != g_ownerPid)
+            return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
+        if (nCode == HCBT_CREATEWND && !g_cbtFired) {
+            HWND hwnd = (HWND)wParam;
+            CBT_CREATEWNDW* cw = (CBT_CREATEWNDW*)lParam;
+            const wchar_t* cls = (cw && cw->lpcs) ? cw->lpcs->lpszClass : nullptr;
+            // Snegopat compares against "V8Window0." (the main window class
+            // carries a hash suffix) and unhooks before doing anything else,
+            // so the subscribe chain cannot re-enter the hook.
+            if (cls && cls > (const wchar_t*)0x10000 &&
+                wcsncmp(cls, L"V8Window0.", 10) == 0) {
+                g_cbtFired = 1;
+                g85_uiWin = (uintptr_t)hwnd;
+                HHOOK h = g_cbtHook;
+                g_cbtHook = nullptr;
+                if (h) UnhookWindowsHookEx(h);
+                CreateThread(nullptr, 0, V8iEarlySubscribeThread, (LPVOID)hwnd, 0, nullptr);
+            }
         }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_cbtFault = GetExceptionCode();
     }
     return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
 }
@@ -2576,14 +2584,20 @@ static std::string CmdExports85ToJson(const std::wstring& arg) {
 
 // "frames" — what eventCreateFrame handed us: pointer, vtable, module, dump.
 static std::string CmdFramesToJson(const std::wstring&) {
-    if (!g85_evFrame)
-        return "{\"status\":\"ok\",\"count\":0,\"frames\":[]}";
-    std::string j = "{\"status\":\"ok\",\"count\":1,\"evCount\":";
     char b[512];
-    _snprintf_s(b, sizeof(b), _TRUNCATE, "%ld,\"frames\":[{", g85_evCount);
-    j += b;
     _snprintf_s(b, sizeof(b), _TRUNCATE,
-                "\"ptr\":\"0x%llX\",\"vtable\":\"0x%llX\",\"module\":\"%s\",\"rva\":\"0x%X\",\"dump\":\"",
+                "{\"status\":\"ok\",\"count\":%d,\"evCount\":%ld,"
+                "\"cbtFired\":%d,\"cbtFault\":\"0x%08X\",\"cbtHook\":\"0x%llX\","
+                "\"subscribed\":%d,\"frames\":[",
+                g85_evFrame ? 1 : 0, g85_evCount, g_cbtFired, (unsigned)g_cbtFault,
+                (unsigned long long)(uintptr_t)g_cbtHook, g85_subscribed);
+    std::string j = b;
+    if (!g85_evFrame) {
+        j += "]}";
+        return j;
+    }
+    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                "{\"ptr\":\"0x%llX\",\"vtable\":\"0x%llX\",\"module\":\"%s\",\"rva\":\"0x%X\",\"dump\":\"",
                 (unsigned long long)g85_evFrame, (unsigned long long)g85_frameVt,
                 g85_frameMod, g85_frameRva);
     j += b;

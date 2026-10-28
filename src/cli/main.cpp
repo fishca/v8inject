@@ -670,6 +670,14 @@ int wmain(int argc, wchar_t** argv) {
         bool ok = client.Open(pi.dwProcessId, o.dll, ExeDir(), o.timeoutMs);
         wprintf(L"launched pid=%lu inject=%s\n", pi.dwProcessId, ok ? L"ok" : L"FAILED");
         if (ok) client.Close();
+        DWORD wait = WaitForSingleObject(pi.hProcess, 8000);
+        if (wait == WAIT_OBJECT_0) {
+            DWORD ec = 0;
+            GetExitCodeProcess(pi.hProcess, &ec);
+            wprintf(L"1C exited code=0x%08X\n", ec);
+        } else {
+            wprintf(L"1C alive after 8s\n");
+        }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         return ok ? 0 : 4;
