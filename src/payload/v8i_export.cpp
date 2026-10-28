@@ -1579,11 +1579,16 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
         HWND hwnd = (HWND)wParam;
         CBT_CREATEWNDW* cw = (CBT_CREATEWNDW*)lParam;
         const wchar_t* cls = (cw && cw->lpcs) ? cw->lpcs->lpszClass : nullptr;
-        if (cls && (wcsncmp(cls, L"V8Window0", 9) == 0 ||
-                    wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)) {
+        // Snegopat compares against "V8Window0." (the main window class carries
+        // a hash suffix) and unhooks before doing anything else, so the
+        // subscribe chain cannot re-enter the hook.
+        if (cls && wcsncmp(cls, L"V8Window0.", 10) == 0) {
             g_cbtFired = 1;
             g85_uiWin = (uintptr_t)hwnd;
-            LogLine("cbt: window %ls hwnd=%p — starting early subscribe", cls, (void*)hwnd);
+            HHOOK h = g_cbtHook;
+            g_cbtHook = nullptr;
+            if (h) UnhookWindowsHookEx(h);
+            LogLine("cbt: main window class %ls — unhooked, subscribing", cls);
             CreateThread(nullptr, 0, V8iEarlySubscribeThread, (LPVOID)hwnd, 0, nullptr);
         }
     }

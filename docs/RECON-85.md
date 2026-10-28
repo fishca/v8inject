@@ -204,6 +204,66 @@ frame (ITopLevelFrame*)
 загружает `snegopat.dll`, вызывает `moduleInit`, а тот регистрирует свой API и
 ставит `WH_CBT` (и `CreateWindowExW` для своих окон).
 
+### 7.1 Полная расшифровка установки хуков (`snegopat.dll`)
+
+Оба хука ставятся одинаково — на **текущий поток** (UI 1С), `hMod = NULL`
+(код уже в процессе), адрес процедуры — из `lea rdx,[rip+disp]`:
+
+| RVA установки | idHook | Процедура | Что ловит |
+|---|---|---|---|
+| `0x2350` | **3 = WH_GETMESSAGE** | `0x16CA` | очередь сообщений (перехват для своих окон) |
+| `0x7A77` | **5 = WH_CBT** | `0x77B2` | создание окон ★ |
+
+```
+0x7A7C  call GetCurrentThreadId
+0x7A82  xor  r8d, r8d            ; hMod = NULL
+0x7A85  lea  rdx, [rip-0x2DC]    ; lpfn = 0x77B2
+0x7A8C  mov  r9d, eax            ; threadId = текущий поток
+0x7A8F  lea  ecx, [r8+5]         ; idHook = 5 = WH_CBT
+0x7A93  call [SetWindowsHookExW]
+```
+
+### 7.2 Что делает WH_CBT-процедура `0x77B2`
+
+```
+0x77BF  rsi = lParam                              ; CBT_CREATEWNDW*
+0x77C2  ebx = nCode
+0x77D3  call [CallNextHookEx]                     ; rdi = результат
+0x77DC  cmp  ebx, 3                               ; HCBT_CREATEWND = 3
+0x77DF  jne  0x796A                               ; не создание окна -> выход
+0x77E5  rcx = [rsi]                               ; CBT_CREATEWNDW.lpcs
+0x77E8  rdx = [rcx+0x40]                          ; CREATESTRUCTW.lpszClass
+0x77EC  cmp  rdx, 0xFFFF
+0x77F3  jbe  0x796A                               ; класс-атом, не строка
+0x77F9  lea  rcx, [rip+0x34370]                   ; "V8Window0."
+0x7800  call [wcscmp-подобная]                    ; сравнение класса
+0x7811  lea  rcx, [rip+0x34388]                   ; вторая строка
+0x7818  call [...]
+0x7826  ...                                       ; совпало:
+0x782D  call [UnhookWindowsHookEx]                ; ★ снимаем хук
+0x783A  ... [rax+0x178]                           ; ★ вызов движка (run/init)
+```
+
+**Строка класса в `.rdata` (`0x3BB70`): `"V8Window0."`** — то есть Снегопат
+ловит не заставку, а **создание главного окна** (`V8Window0.<hash>`), и делает
+это в момент, когда окно ещё не создано. В совпавшей ветке: снимает хук,
+затем вызывает инициализацию движка (`[rax+0x178]`), внутри которой — подписка
+на `eventCreateFrame`. Только после этого окно создаётся, и событие приходит.
+
+Это и есть точный ответ на вопрос «как поймать frame»:
+
+1. `SetWindowsHookExW(WH_CBT, proc, NULL, GetCurrentThreadId())` — на поток
+   Конфигуратора;
+2. в процедуре: `nCode == HCBT_CREATEWND (3)`, класс из
+   `CBT_CREATEWNDW->lpcs->lpszClass` (offset `0x40`) равен `"V8Window0."`
+   (сравнение по префиксу);
+3. **снять хук** (`UnhookWindowsHookEx`) — чтобы не рекурсия;
+4. поставить подписку на `eventCreateFrame` — окна ещё нет, событие впереди;
+5. окно создаётся → `onEvent` → объект `obj` и есть `ITopLevelFrame`.
+
+Наш payload делает шаги 1–2 и 4, но не делает 3 (снятие хука) и попытку
+подписки выполняет **из самого хука** — отсюда `0xC000041D`.
+
 Следствия для v8inject:
 - повторять приём `WH_CBT` без патчей кода можно — хуки ставятся штатно;
 - но требования к контексту (поток 1С, готовность ядра) — те же, что мы
