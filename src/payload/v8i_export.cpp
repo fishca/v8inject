@@ -1463,6 +1463,23 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
             }
 
+            // QI the window's OLE drop target — it is a real 1C object
+            if (g85_uiWin) {
+                static const GUID kIID_TopFrame = {0xDE300901, 0xA120, 0x11d4,
+                                                   {0x94, 0x29, 0x00, 0x80, 0x48, 0xDA, 0x11, 0xF9}};
+                static const GUID kIID_CmdRecv = {0x377A2018, 0xC51B, 0x4cf5,
+                                                  {0xAC, 0x03, 0xA1, 0x50, 0x92, 0x66, 0xDF, 0x2D}};
+                uintptr_t dt = (uintptr_t)GetPropW((HWND)g85_uiWin, L"OleDropTargetInterface");
+                if (dt && IsReadable((void*)dt, 16)) {
+                    void* o1 = nullptr;
+                    void* o2 = nullptr;
+                    if (V8iQIProbe((void*)dt, &kIID_TopFrame, &o1) == 0 && o1)
+                        g85_qProcFrame = (uintptr_t)o1;
+                    if (V8iQIProbe((void*)dt, &kIID_CmdRecv, &o2) == 0 && o2)
+                        g85_qProcRecv = (uintptr_t)o2;
+                }
+            }
+
             // Slot 27 copies {ptr, refcount} from [rcx+0x148] — looks like a
             // getTopLevelFrame-style getter. Try it, then QI the result for
             // ICommandReceiver.
