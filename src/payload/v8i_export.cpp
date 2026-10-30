@@ -1,4 +1,4 @@
-#include "v8inject/diag.h"
+﻿#include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
 #include "v8inject/hook.h"
 #include "v8inject/menu.h"
@@ -1187,7 +1187,8 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
     std::vector<WindowEntry> wins = EnumProcessWindows();
     HWND frame = nullptr;
     for (const WindowEntry& w : wins)
-        if (w.cls == L"V8TopLevelFrame") { frame = w.hwnd; break; }
+        if (w.cls == L"V8TopLevelFrame" ||
+            w.cls.rfind(L"V8Window0", 0) == 0) { frame = w.hwnd; break; }
     if (!frame) { *outErr = 0xFFFFFF01; return false; }
 
     // Preferred: comctl32 SetWindowSubclass (chains cleanly with 1C's own).
@@ -1381,6 +1382,33 @@ static int g85_sawMsg = 0;
 static volatile int g85_subscribed = 0;
 static uintptr_t g85_slots[24] = {};
 static uintptr_t g85_uiWin = 0;
+static uintptr_t g85_evFrame = 0;
+static volatile long g85_evCount = 0;
+static const GUID g85_kExitEv = {0x18B3F170, 0x4979, 0x11D6,
+                                 {0xB2, 0x2B, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79}};
+// eventCreateFrame: fired when the platform creates a frame; the event object
+// IS the ITopLevelFrame (verified live on 8.5.1.1529 — object vtable
+// config.dll+0x2ED3B0, and its vtbl[30] gives the command receiver).
+static const GUID g85_kCreateFrameEv = {0x3573FFE0, 0x2FFF, 0x11D5,
+                                        {0xBF, 0x5E, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79}};
+static volatile long g85_exitEvCount = 0;
+static volatile unsigned long g85_attachTick = 0;
+// Diagnostic split of the two candidate receiver chains — one live run settles
+// which is real on 8.5 (the code comment below claimed A; the skill's later
+// live finding is B):
+//   A) obj IS ITopLevelFrame         -> obj->vtbl[30] = commandReceiver
+//   B) obj is an IUnknown wrapper   -> QI(obj, IID_ITopLevelFrame) = frame
+//                                        -> frame->vtbl[30] = commandReceiver
+// Both results are kept so cmdinfo/frames can report them without guessing.
+static const GUID g85_kIID_TopFrame = {0xDE300901, 0xA120, 0x11d4,
+                                       {0x94, 0x29, 0x00, 0x80, 0x48, 0xDA, 0x11, 0xF9}};
+static uintptr_t g85_dirRecv = 0, g85_dirRecvVt = 0;       // path A: obj->vtbl[30]
+static uintptr_t g85_qiFrame = 0, g85_qiFrameVt = 0;       // path B: QI(obj) result
+static uintptr_t g85_qiRecv = 0, g85_qiRecvVt = 0;         // path B: frame->vtbl[30]
+static long g85_dirExc = 0;    // exception from calling vtbl[30] on obj (A)
+static long g85_qiExc = 0;     // error code from QI(obj) (B)
+static long g85_qiCallExc = 0; // exception from vtbl[30] on the QI'd frame (B)
+static uintptr_t g85_dump[4] = {};                       // obj qwords (layout)
 
 typedef void* (__cdecl* V8iCurProcFn)();
 typedef void* (__cdecl* V8iGetSvcFn)(void*, const GUID*);
@@ -1517,6 +1545,21 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
             // Heap QI scan for IID_ITopLevelFrame — done in a helper that avoids
             // __try/C++ object conflicts; QI goes through the SEH probe.
             V8iScanFrame85();
+            // Trace which stage the subscribe chain reached, for the early-path
+            // diagnosis (hookcbt loads the payload without a cmdinfo run).
+            {
+                FILE* tf = nullptr;
+                if (_wfopen_s(&tf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_subscribe.txt", L"a") == 0 && tf) {
+                    fprintf(tf, "dt=%lu fn=%llx proc=%llx procVt=%llx svc=%llx svcVt=%llx "
+                                "subscribed=%d evCount=%ld exitEv=%ld evFrame=%llx\n",
+                            GetTickCount() - g85_attachTick, (unsigned long long)g85_fn,
+                            (unsigned long long)g85_proc, (unsigned long long)g85_procVt,
+                            (unsigned long long)g85_svc, (unsigned long long)g85_svcVt,
+                            g85_subscribed, g85_evCount, g85_exitEvCount,
+                            (unsigned long long)g85_evFrame);
+                    fclose(tf);
+                }
+            }
         }
         return 0;
     }
@@ -1540,6 +1583,7 @@ static BOOL CALLBACK V8iFindMainWindow(HWND w, LPARAM lp) {
 static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam);
 static HHOOK g_cbtThreadHook;
 static volatile long g_cbtThreadTid;
+static void V8iResolveCore85Proc(uintptr_t* outBase, uint32_t* outRva);
 
 static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     for (int i = 0; i < 4000 && !g85_subscribed; ++i) {
@@ -1695,8 +1739,9 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK V8iCbtProcExport(
         const wchar_t* leaf = wcsrchr(p, L'\\');
         leaf = leaf ? leaf + 1 : p;
         FILE* f = nullptr;
-        if (_wfopen_s(&f, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cbt_hit.txt", L"w+") == 0 && f) {
-            fprintf(f, "%lu %ls nCode=%d\n", GetCurrentProcessId(), p, nCode);
+        if (_wfopen_s(&f, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cbt_hit.txt", L"a") == 0 && f) {
+            fprintf(f, "%lu %ls nCode=%d cbtCalls=%ld fired=%d\n",
+                    GetCurrentProcessId(), p, nCode, g_cbtCalls, g_cbtFired);
             fclose(f);
         }
     }
@@ -1708,9 +1753,21 @@ static DWORD WINAPI V8iEarlySubscribeThread(LPVOID param) {
     // The hook fires on the very first 1C window, but the core (and its
     // services) are not initialized that early — subscribing immediately
     // crashes 1C. Wait for the platform to settle before the first attempt.
-    Sleep(3000);
-    for (int i = 0; i < 300 && !g85_subscribed; ++i) {
-        Sleep(50);
+    // The cmdinfo command fills in g85_fn; with the hook path it must be
+    // resolved here (static file resolution, safe at any time).
+    if (!g85_fn) {
+        uintptr_t base = 0;
+        uint32_t rva = 0;
+        V8iResolveCore85Proc(&base, &rva);
+        if (base && rva) g85_fn = base + rva;
+    }
+    // eventCreateFrame fires when the MAIN window is created (~0.81s after
+// launch; verified: with a 31ms subscribe it arrives, with a 3s subscribe it
+// is long gone). So subscribe FAST. The early subscribe does not crash 1C —
+// the "crash at start" seen earlier was a busy infobase (leftover process).
+Sleep(0);
+    for (int i = 0; i < 600 && !g85_subscribed; ++i) {
+        Sleep(10);
         if (!IsWindow(h)) break;
         DWORD tid = GetWindowThreadProcessId(h, nullptr);
         if (tid && tid != GetCurrentThreadId()) {
@@ -1730,6 +1787,7 @@ static DWORD WINAPI V8iEarlySubscribeThread(LPVOID param) {
 // C linkage so DllMain can arm the hook the moment the payload is loaded —
 // before 1C reaches its main window (the session in v8i_probe starts later).
 extern "C" __declspec(dllexport) void V8iArmEarly() {
+    g85_attachTick = GetTickCount();
     V8iArmEarlySubscribe();
 }
 
@@ -1746,46 +1804,210 @@ void V8iStartStartupWatch() {
 // Runs on the 1C UI thread (called from the subclass proc).
 // Subscribes to eventCreateFrame so the next frame creation hands us an
 // ITopLevelFrame; a recipient object with a 4-slot vtable lives here.
-static uintptr_t g85_evFrame = 0;
 static unsigned char g85_frameDump[64] = {};
 static char g85_frameMod[40] = {};
 static uint32_t g85_frameRva = 0;
-static volatile long g85_evCount = 0;
 static HRESULT __stdcall V8iRecipQI(void* self, const GUID*, void** out) {
     if (out) *out = self;
     return 0;
 }
 static ULONG __stdcall V8iRecipAddRef(void*) { return 1; }
 static ULONG __stdcall V8iRecipRelease(void*) { return 1; }
-static HRESULT __stdcall V8iRecipOnEvent(void*, const GUID*, long, void* obj) {
-    ++g85_evCount;
-    if (obj) {
-        g85_evFrame = (uintptr_t)obj;
-        // Capture enough to identify the object later: its vtable, the module
-        // that vtable lives in, and the first 64 bytes of the object itself.
-        if (IsReadable(obj, 16)) {
-            g85_frameVt = *(uintptr_t*)obj;
-            if (IsReadable(obj, 64)) memcpy(g85_frameDump, obj, 64);
-            if (g85_frameVt) {
-                for (const ModuleRange& m : EnumModules()) {
-                    if (g85_frameVt >= m.base && g85_frameVt < m.base + m.size) {
-                        g85_frameRva = (uint32_t)(g85_frameVt - m.base);
-                        size_t s = m.path.find_last_of(L"\\/");
-                        std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
-                        size_t k = 0;
-                        for (; k < n.size() && k < sizeof(g85_frameMod) - 1; ++k)
-                            g85_frameMod[k] = (char)n[k];
-                        g85_frameMod[k] = 0;
-                        break;
-                    }
+// ---------------------------------------------------------------------------
+// 8.5: ITopLevelFrame -> ICommandReceiver.  Runs INSIDE the event callback, i.e.
+// on the 1C UI thread: on 8.5 every core85 call from a foreign thread returns
+// 0 (or crashes the process), so the receiver is captured exactly when the
+// platform hands us the frame — the same moment Snegopat's
+// `mainFrame.getCoreTopLevelFrame(coreMainFrame)` runs.
+//   obj            = ITopLevelFrame (vtable config.dll+0x2ED3B0 on 8.5.1.1529)
+//   obj->vtbl[30]  = commandReceiver(out ICommandReceiver*)   (v8api/window.v)
+//   recv->vtbl[0]  = transmitCommand(const Command&, bool), [1] updateState,
+//                   [2] hasHandler(const CommandID&)          (v8api/command.v)
+// POD + SEH only: no std containers in this frame (MSVC C2712).
+// ---------------------------------------------------------------------------
+// --- 8.5 command send via the early-captured receiver ---------------------
+// V8iCmd85Send sends a designer command through g85_recv on the 1C UI thread
+// (kV8iCmdMsg marshal). rc: >=0 transmit result, -99 no receiver/unreadable,
+// -98 no marshal window, -97 UI thread did not answer, -96 timeout.
+static int V8iCmd85Send(unsigned int num, int sub) {
+    if (!g85_recv || !g85_recvVt) return -99;
+    if (!IsReadable((void*)g85_recvVt, 4 * sizeof(void*))) return -99;
+    uintptr_t tr = ((uintptr_t*)g85_recvVt)[0];
+    if (!tr || !IsReadable((void*)tr, 1)) return -99;
+    HWND cmdHwnd = nullptr;
+    DWORD ensureErr = 0;
+    const char* marshalPath = "";
+    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return -98;
+    g_pending.recv = (void*)g85_recv;
+    g_pending.trFn = (void*)tr;
+    g_pending.mode = 0;
+    memcpy(g_pending.cmd.group, kConfigGroup, 16);
+    g_pending.cmd.cmdNum = num;
+    g_pending.cmd.param = sub;
+    g_pending.cmd.object = nullptr;
+    g_pending.rc = -2;
+    g_pending.exc = 0;
+    InterlockedExchange(&g_pending.done, 0);
+    DWORD_PTR smRes = 0;
+    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes))
+        return -97;
+    if (!g_pending.done) return -96;
+    return g_pending.rc;
+}
+
+// File-driven command sender: lets a host drive 8.5 designer commands without a
+// Client session (the hookcbt-loaded payload is sessionless). Watches
+// %TEMP%\v8i_cmd85_req.txt ("<num> [sub]"), sends each request once (file is
+// consumed), appends the result to %TEMP%\v8i_cmd85_res.txt.
+static DWORD WINAPI V8iCmd85PollThread(LPVOID) {
+    const wchar_t* reqPath = L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cmd85_req.txt";
+    const wchar_t* resPath = L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cmd85_res.txt";
+    for (int i = 0; i < 900; ++i) {          // 900 * 200 ms = 3 min
+        Sleep(200);
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, reqPath, L"r") == 0 && f) {
+            unsigned num = 0;
+            int sub = 0;
+            int matched = fscanf_s(f, "%u %d", &num, &sub);
+            fclose(f);
+            if (matched >= 1) {
+                _wremove(reqPath);
+                int rc = V8iCmd85Send(num, sub);
+                FILE* rf = nullptr;
+                if (_wfopen_s(&rf, resPath, L"a") == 0 && rf) {
+                    fprintf(rf, "num=%u sub=%d rc=%d\n", num, sub, rc);
+                    fclose(rf);
                 }
             }
         }
     }
     return 0;
 }
-static void* g85_recipVt[4] = {(void*)V8iRecipQI, (void*)V8iRecipAddRef,
-                               (void*)V8iRecipRelease, (void*)V8iRecipOnEvent};
+
+static void V8iCaptureCmdRecv(void* obj) {
+    if (!obj) return;
+    uintptr_t fvt = 0;
+    __try { fvt = *(uintptr_t*)obj; } __except (EXCEPTION_EXECUTE_HANDLER) { fvt = 0; }
+    if (!fvt) {
+        LogLine("cmdrecv: frame has no vtable");
+        return;
+    }
+    // Live-calibrated on 8.5.1.1529: the event's obj IS the ITopLevelFrame
+    // (vtable config.dll+0x2ED3B0, a forwarder table; slot 0 = init, NOT QI —
+    // no IUnknown cast is needed). commandReceiver = slot 31, NOT 30 (slot 30
+    // is a different method and raises 0xC0000005). The slot-31 forwarder
+    // reads inner = [obj+8] and dispatches [inner->vt + 0xF8]; the receiver
+    // returned sits 0x20 before that inner object (the same geometry as the
+    // 8.3 "recv = core - 0x20"). recv->vtbl[0] = transmitCommand.
+    uintptr_t fn31 = 0;
+    __try { fn31 = ((uintptr_t*)fvt)[31]; } __except (EXCEPTION_EXECUTE_HANDLER) { fn31 = 0; }
+    g85_recv = 0;
+    g85_recvVt = 0;
+    long exc = 0;
+    if (fn31 && IsReadable((void*)fn31, 1)) {
+        void* recv = nullptr;
+        __try {
+            ((void(__cdecl*)(void*, void**))fn31)(obj, &recv);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            exc = GetExceptionCode();
+            recv = nullptr;
+        }
+        if (recv && IsReadable(recv, 4 * sizeof(void*))) {
+            g85_recv = (uintptr_t)recv;
+            __try { g85_recvVt = *(uintptr_t*)recv; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { g85_recvVt = 0; }
+            LogLine("cmdrecv85: OK recv=0x%llX rvt=0x%llX",
+                    (unsigned long long)(uintptr_t)recv, (unsigned long long)g85_recvVt);
+        } else {
+            LogLine("cmdrecv85: slot31 no receiver (exc=0x%X)", (unsigned)exc);
+        }
+    }
+    // Marker file: the only channel when the payload was loaded by the global
+    // CBT hook (sessionless, no command readback).
+    {
+        FILE* cf = nullptr;
+        if (_wfopen_s(&cf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cmdrecv.txt", L"a") == 0 && cf) {
+            fprintf(cf, "obj=%llx vt=%llx recv31=%llx recvVt31=%llx exc=%x\n",
+                    (unsigned long long)(uintptr_t)obj, (unsigned long long)fvt,
+                    (unsigned long long)g85_recv, (unsigned long long)g85_recvVt, (unsigned)exc);
+            fclose(cf);
+        }
+    }
+    // One-shot: spawn the file-driven command sender (host drives 8.5 command
+    // sends without a Client session; end-to-end proof of the receiver chain).
+    {
+        static bool s_cmd85PollSpawned = false;
+        if (!s_cmd85PollSpawned && g85_recv) {
+            s_cmd85PollSpawned = true;
+            CreateThread(nullptr, 0, V8iCmd85PollThread, nullptr, 0, nullptr);
+        }
+    }
+}
+
+// The frame is handed to us on the 1C UI thread and the receiver chain must be
+// walked right there (8.5 refuses cross-thread calls into core85, so deferring
+// to a worker thread silently yields 0). No std containers in this frame —
+// EnumModules() (std::vector) is called from the caller, not from here.
+static void V8iTakeFrame85(void* obj) {
+    g85_evFrame = (uintptr_t)obj;
+    for (int i = 0; i < 4; ++i) g85_dump[i] = 0;
+    if (IsReadable(obj, 16)) {
+        g85_frameVt = *(uintptr_t*)obj;
+        for (int i = 0; i < 4; ++i) {
+            __try { g85_dump[i] = ((uintptr_t*)obj)[i]; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { g85_dump[i] = 0; }
+        }
+        if (IsReadable(obj, 64)) memcpy(g85_frameDump, obj, 64);
+    }
+    if (!g85_subscribed) return;   // only the eventCreateFrame path owns a frame
+    V8iCaptureCmdRecv(obj);        // always: diagnose both chains in one shot
+}
+
+static HRESULT __stdcall V8iRecipOnEvent(void*, const GUID* ev, long, void* obj) {
+    ++g85_evCount;
+    if (ev && memcmp(ev, &g85_kExitEv, 16) == 0)
+        ++g85_exitEvCount;
+    bool isCreateFrame = ev && memcmp(ev, &g85_kCreateFrameEv, 16) == 0;
+    // Diagnostic trail (append-only; a marker file is the only channel that
+    // also works when the payload was loaded by the global CBT hook, i.e.
+    // without any Client session to answer commands).
+    {
+        FILE* rf = nullptr;
+        if (_wfopen_s(&rf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_recip.txt", L"a") == 0 && rf) {
+            fprintf(rf, "ev=%d create=%d exit=%d obj=%llx evid=%02x%02x%02x%02x-%02x%02x-%02x%02x"
+                        "-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                    g85_evCount, isCreateFrame ? 1 : 0, g85_exitEvCount,
+                    (unsigned long long)(uintptr_t)obj,
+                    ev ? ev->Data1 & 0xFF : 0, ev ? (ev->Data1 >> 8) & 0xFF : 0,
+                    ev ? (ev->Data1 >> 16) & 0xFF : 0, ev ? (ev->Data1 >> 24) & 0xFF : 0,
+                    ev ? ev->Data2 & 0xFF : 0, ev ? (ev->Data2 >> 8) & 0xFF : 0,
+                    ev ? ev->Data3 & 0xFF : 0, ev ? (ev->Data3 >> 8) & 0xFF : 0,
+                    ev ? ev->Data4[0] : 0, ev ? ev->Data4[1] : 0,
+                    ev ? ev->Data4[2] : 0, ev ? ev->Data4[3] : 0,
+                    ev ? ev->Data4[4] : 0, ev ? ev->Data4[5] : 0,
+                    ev ? ev->Data4[6] : 0, ev ? ev->Data4[7] : 0);
+            fclose(rf);
+        }
+    }
+    if (isCreateFrame && obj) V8iTakeFrame85(obj);
+    return 0;
+}
+// The exact IEventRecipient slot layout is not documented for 8.5: the 1C
+// event interface appears to be IUnknown-derived (QI/AddRef/Release first),
+// but ICommandReceiver-like pure interfaces put their single method at slot 0.
+// To not guess, every slot dispatches onEvent — whichever one the platform
+// calls (0, 3, …), we see the event.
+static void* g85_recipVt[8] = {
+    (void*)V8iRecipOnEvent,  // slot 0: pure-interface layout (onEvent)
+    (void*)V8iRecipAddRef,   // slot 1
+    (void*)V8iRecipRelease,  // slot 2
+    (void*)V8iRecipOnEvent,  // slot 3: IUnknown-derived layout (onEvent)
+    (void*)V8iRecipOnEvent,
+    (void*)V8iRecipOnEvent,
+    (void*)V8iRecipOnEvent,
+    (void*)V8iRecipOnEvent,
+};
 static struct V8iRecip { void** vt; } g85_recip = {g85_recipVt};
 
 static void V8iScanFrame85() {
@@ -1806,6 +2028,9 @@ static void V8iScanFrame85() {
         if (f) {
             __try {
                 ((SubFn)f)((void*)g85_svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
+                // Also subscribe to an event that always fires at close, to
+                // prove the platform delivers to *our* recipient at all.
+                ((SubFn)f)((void*)g85_svc, &g85_kExitEv, (void*)&g85_recip, "v8inject", 0);
                 g85_subscribed = 1;
             } __except (EXCEPTION_EXECUTE_HANDLER) {
             }
@@ -2706,8 +2931,93 @@ static std::string CmdFramesToJson(const std::wstring&) {
         _snprintf_s(b, sizeof(b), _TRUNCATE, "%s%02X", i ? " " : "", g85_frameDump[i]);
         j += b;
     }
-    j += "\"}]}";
+    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                "\",\"dirRecv\":\"0x%llX\",\"dirRecvVt\":\"0x%llX\",\"dirExc\":\"0x%X\","
+                "\"qiFrame\":\"0x%llX\",\"qiFrameVt\":\"0x%llX\",\"qiRecv\":\"0x%llX\",\"qiRecvVt\":\"0x%llX\","
+                "\"qiExc\":%d,\"qiCallExc\":\"0x%X\"}]}",
+                (unsigned long long)g85_dirRecv, (unsigned long long)g85_dirRecvVt,
+                (unsigned)g85_dirExc,
+                (unsigned long long)g85_qiFrame, (unsigned long long)g85_qiFrameVt,
+                (unsigned long long)g85_qiRecv, (unsigned long long)g85_qiRecvVt,
+                (int)g85_qiExc, (unsigned)g85_qiCallExc);
+    j += b;
     return j;
+}
+
+// "cmd85 <num> [sub]" — invoke a designer command on 8.5 through the receiver
+// captured by the early subscribe (g85_recv, obtained live: commandReceiver is
+// slot 31 of the ITopLevelFrame forwarder vtable; recv->vtbl[0] is
+// transmitCommand). Runs on the 1C UI thread through the same kV8iCmdMsg
+// marshal as the 8.3 `cmd`. Requires eventCreateFrame to have fired, which on
+// 8.5 needs the early injection path (hookcbt / launch) — a post-start attach
+// never sees the frame event.
+static std::string CmdCmd85ToJson(const std::wstring& args0) {
+    std::wstring args = args0;
+    while (!args.empty() && (args.front() == L' ' || args.front() == L'\t')) args.erase(0, 1);
+    unsigned int num = 0;
+    int sub = 0;
+    if (swscanf_s(args.c_str(), L"%u %d", &num, &sub) < 1)
+        return "{\"status\":\"error\",\"message\":\"usage: cmd85 <num> [sub]\"}";
+    if (!g85_recv || !g85_recvVt)
+        return "{\"status\":\"error\",\"message\":\"no 8.5 receiver captured — needs early subscribe (hookcbt/launch)\"}";
+    uintptr_t tr = 0;
+    if (IsReadable((void*)g85_recvVt, 4 * sizeof(void*)))
+        tr = ((uintptr_t*)g85_recvVt)[0];
+    if (!tr || !IsReadable((void*)tr, 1)) {
+        char nb[160];
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"receiver vtbl[0] unreadable\",\"recv\":\"0x%llX\"}",
+                    (unsigned long long)g85_recv);
+        return nb;
+    }
+    HWND cmdHwnd = nullptr;
+    DWORD ensureErr = 0;
+    const char* marshalPath = "";
+    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) {
+        char nb[200];
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"marshaling setup failed\",\"code\":\"0x%X\"}",
+                    (unsigned)ensureErr);
+        return nb;
+    }
+    g_pending.recv = (void*)g85_recv;
+    g_pending.trFn = (void*)tr;
+    g_pending.mode = 0;
+    memcpy(g_pending.cmd.group, kConfigGroup, 16);
+    g_pending.cmd.cmdNum = num;
+    g_pending.cmd.param = sub;
+    g_pending.cmd.object = nullptr;
+    g_pending.rc = -2;
+    g_pending.exc = 0;
+    InterlockedExchange(&g_pending.done, 0);
+    DWORD_PTR smRes = 0;
+    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes)) {
+        char nb[200];
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"UI thread did not answer (0x%X)\"}",
+                    (unsigned)GetLastError());
+        return nb;
+    }
+    if (!g_pending.done)
+        return "{\"status\":\"error\",\"message\":\"timeout waiting for UI thread\"}";
+    int rc = g_pending.rc;
+    if (rc < 0) {
+        char nb[200];
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"transmit exception\",\"exc\":\"0x%X\"}",
+                    (unsigned)g_pending.exc);
+        return nb;
+    }
+    {
+        char nb[220];
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"ok\",\"num\":%u,\"sub\":%d,\"recv\":\"0x%llX\",\"rvt\":\"0x%llX\","
+                    "\"marshal\":\"%s\",\"rc\":%d}",
+                    num, sub, (unsigned long long)g85_recv,
+                    (unsigned long long)g85_recvVt, marshalPath, rc);
+        return nb;
+    }
 }
 
 static std::string CmdInfoToJson(const std::wstring&) { return CmdInfoToJsonA(); }
@@ -3200,6 +3510,13 @@ static int RunPayload(const wchar_t* sharedName) {
             LogLine("cmd: invoking designer command");
             PutResponse(Guarded(L"cmd", CmdCommandToJson, std::wstring(g_io->request).substr(4)));
             LogLine("cmd: done");
+            continue;
+        }
+
+        if (wcsncmp(g_io->request, L"cmd85", 5) == 0) {
+            LogLine("cmd85: invoking 8.5 designer command");
+            PutResponse(Guarded(L"cmd85", CmdCmd85ToJson, std::wstring(g_io->request).substr(5)));
+            LogLine("cmd85: done");
             continue;
         }
 

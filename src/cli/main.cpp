@@ -502,6 +502,7 @@ int wmain(int argc, wchar_t** argv) {
         cmd == L"memmap" || cmd == L"heapobjects" || cmd == L"findvalue" || cmd == L"byhwnd" ||
         cmd == L"around" || cmd == L"xref" ||
         cmd == L"gitbar" || cmd == L"cmdinfo" || cmd == L"exports85" || cmd == L"frames" ||
+        cmd == L"cmd85" ||
         cmd == L"hook" || cmd == L"hooks" || cmd == L"unhook" || cmd == L"trace") {
         if (argc < 3) { PrintUsage(); return 1; }
         if (cmd == L"imports" && argc < 4) { PrintUsage(); return 1; }
