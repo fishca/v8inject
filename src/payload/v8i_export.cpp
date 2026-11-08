@@ -1058,6 +1058,8 @@ uintptr_t g_x86FrameObj = 0;   // discovered frame object (x86 runtime calibrati
 #else
 uintptr_t g_x64FrameObj = 0;   // discovered frame object (x64 runtime calibration)
 uintptr_t g_x64RecvOffset = 0x20;
+bool g_x64DiscoveryDone = false;       // discovery attempted this session
+ULONGLONG g_x64DiscoveryTick = 0;      // cooldown gate for re-discovery
 #endif
 }
 
@@ -1254,6 +1256,35 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
 }  // namespace
 
 #if defined(_WIN64)
+// True when `vt` is a config.dll .rdata table whose slots 3..40 point into
+// config.dll .text — the shape shared by the ITopLevelFrame vtable family.
+// Used both by the discovery and to re-validate the cached frame object:
+// 1C destroys transient frames, and freed memory reads as garbage (live:
+// a stale object's "vtable" was a module base).
+static bool X64FrameVtValid(const ModuleRange& cfg, uintptr_t vt) {
+    if (!vt) return false;
+    PeImage cfgImg = ParsePe(cfg.base);
+    if (!cfgImg.valid) return false;
+    const PeSection* textSec = nullptr;
+    const PeSection* rdataSec = nullptr;
+    for (const PeSection& s : cfgImg.sections) {
+        if (s.Executable() && s.name == ".text") textSec = &s;
+        if (s.Readable() && !s.Executable() && s.name == ".rdata") rdataSec = &s;
+    }
+    if (!textSec || !rdataSec) return false;
+    const uintptr_t textLo = cfg.base + textSec->va;
+    const uintptr_t textHi = textLo + textSec->virtualSize;
+    const uintptr_t rdataLo = cfg.base + rdataSec->va;
+    const uintptr_t rdataHi = rdataLo + rdataSec->virtualSize;
+    if (vt < rdataLo || vt >= rdataHi) return false;
+    if (!IsReadable((void*)vt, 41 * sizeof(void*))) return false;
+    for (int s = 3; s <= 40; ++s) {
+        uintptr_t fn = ((uintptr_t*)vt)[s];
+        if (fn < textLo || fn >= textHi) return false;
+    }
+    return true;
+}
+
 // x64 runtime calibration: the hardcoded ITopLevelFrame vtable RVA below is
 // valid for 8.3.27.1989 only — on other 8.3 patches (8.3.27.2342, live) an
 // unrelated vtable sits at the same RVA, the scan finds a wrong object and
@@ -1265,15 +1296,11 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
 static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
     PeImage cfgImg = ParsePe(cfg.base);
     if (!cfgImg.valid) return 0;
-    const PeSection* textSec = nullptr;
     const PeSection* rdataSec = nullptr;
     for (const PeSection& s : cfgImg.sections) {
-        if (s.Executable() && s.name == ".text") textSec = &s;
         if (s.Readable() && !s.Executable() && s.name == ".rdata") rdataSec = &s;
     }
-    if (!textSec || !rdataSec) return 0;
-    const uintptr_t textLo = cfg.base + textSec->va;
-    const uintptr_t textHi = textLo + textSec->virtualSize;
+    if (!rdataSec) return 0;
     const uintptr_t rdataLo = cfg.base + rdataSec->va;
     const uintptr_t rdataHi = rdataLo + rdataSec->virtualSize;
 
@@ -1302,12 +1329,7 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
                  p < (uintptr_t)mi.BaseAddress + cap; p += sizeof(void*)) {
                 uintptr_t v = *(uintptr_t*)p;
                 if (v < rdataLo || v >= rdataHi) continue;
-                bool ok = true;
-                for (int s = 3; s <= 40; ++s) {
-                    uintptr_t fn = ((uintptr_t*)v)[s];
-                    if (fn < textLo || fn >= textHi) { ok = false; break; }
-                }
-                if (!ok) continue;
+                if (!X64FrameVtValid(cfg, v)) continue;
                 objs.push_back(p);
                 if (objs.size() >= 64) break;
             }
@@ -1316,8 +1338,14 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
         addr = end == addr ? addr + sizeof(void*) : end;
     }
 
-    // receiver chain must validate; try the documented offset first
+    // receiver chain must validate; try the documented offset first. The
+    // structural checks alone are NOT enough (8.3.27.2342 live: nine heap
+    // slots pass them, the first pick was garbage that died within 21 ms) —
+    // every candidate is probed live: hasHandler(45) on the UI thread through
+    // the marshal bridge. Only a receiver that answers without an exception
+    // is trusted; the first alive-but-silent one is the fallback.
     static const uintptr_t kRecvOffs[] = {0x20, 0x10, 0x18, 0x28, 0x30, 0x38, 0x40, 0x08};
+    uintptr_t fallbackObj = 0, fallbackOff = 0;
     for (uintptr_t obj : objs) {
         uintptr_t core = *(uintptr_t*)(obj + sizeof(void*));
         if (!IsReadable((void*)core, sizeof(void*))) continue;
@@ -1331,12 +1359,46 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
             if (!insideModule(tr)) continue;
             if (!IsReadable((void*)tr, 32)) continue;
             if (*(const unsigned char*)tr == 0xCC) continue;   // int3 padding, not code
+
+            // live probe: hasHandler(45), mode 1, SEH on the UI thread
+            HWND probeHwnd = nullptr;
+            DWORD probeErr = 0;
+            const char* probePath = "";
+            if (!EnsureCmdUi(&probeHwnd, &probeErr, &probePath))
+                break;   // no frame window yet — fall back to structural pick
+            void* hasTr = (void*)((uintptr_t*)recvVt)[5];
+            if (!IsReadable(hasTr, 1)) continue;
+            g_pending.recv = (void*)recv;
+            g_pending.trFn = hasTr;
+            g_pending.mode = 1;
+            memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
+            g_pending.u.cmd.cmdNum = 45;
+            g_pending.u.cmd.param = 0;
+            g_pending.u.cmd.object = nullptr;
+            g_pending.rc = -2;
+            g_pending.exc = 0;
+            InterlockedExchange(&g_pending.done, 0);
+            DWORD_PTR probeRes = 0;
+            if (!SendMessageTimeoutW(probeHwnd, kV8iCmdMsg, 0, 0,
+                                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes))
+                continue;
+            if (g_pending.exc != 0 || g_pending.rc < 0) continue;   // wrong chain
+            if (g_pending.rc == 0 && fallbackObj == 0) {
+                fallbackObj = obj; fallbackOff = off;   // alive, no handler yet
+                continue;
+            }
             g_x64RecvOffset = off;
-            LogLine("cmd x64 discovery: frame=0x%llX recvOff=0x%llX recv=0x%llX",
+            LogLine("cmd x64 discovery: frame=0x%llX recvOff=0x%llX recv=0x%llX probed=1",
                     (unsigned long long)obj, (unsigned long long)off,
                     (unsigned long long)recv);
             return obj;
         }
+    }
+    if (fallbackObj) {
+        g_x64RecvOffset = fallbackOff;
+        LogLine("cmd x64 discovery: frame=0x%llX recvOff=0x%llX (fallback, alive)",
+                (unsigned long long)fallbackObj, (unsigned long long)fallbackOff);
+        return fallbackObj;
     }
     return 0;
 }
@@ -3218,6 +3280,22 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
         return "{\"status\":\"error\",\"message\":\"config.dll not loaded\"}";
 
 #if defined(_WIN64)
+    // Re-validate the runtime-discovered frame on every use: 1C destroys
+    // transient frames, and a stale object poisons all later calls (its freed
+    // memory reads as garbage — live: the "vtable" became a module base).
+    if (g_x64FrameObj) {
+        uintptr_t vt = IsReadable((void*)g_x64FrameObj, sizeof(void*))
+                           ? *(uintptr_t*)g_x64FrameObj : 0;
+        uintptr_t core = vt && IsReadable((void*)(g_x64FrameObj + sizeof(void*)), sizeof(void*))
+                             ? *(uintptr_t*)(g_x64FrameObj + sizeof(void*)) : 0;
+        if (!vt || !core || !X64FrameVtValid(cfg, vt) ||
+            !IsReadable((void*)core, sizeof(void*))) {
+            LogLine("cmd: discovered frame 0x%llX went stale, re-discovering",
+                    (unsigned long long)g_x64FrameObj);
+            g_x64FrameObj = 0;
+            g_x64DiscoveryDone = false;
+        }
+    }
     const uintptr_t kFrameVtblRva = 0x2EFB50;   // ITopLevelFrame vtable, 8.3.27.1989 x64
     const uintptr_t kCoreOffset = sizeof(void*);
     const int kTransmitSlot = 3;
@@ -3420,12 +3498,13 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     if (!trFn) {
 #if defined(_WIN64)
         // The hardcoded vtable RVA is calibrated to 8.3.27.1989; other 8.3
-        // patches have an unrelated vtable at the same RVA (8.3.27.2342 live:
-        // the scan finds one wrong object and the chain fails). Discover the
-        // frame at runtime once and re-run with it.
-        static bool s_x64Discovered = false;
-        if (!s_x64Discovered && !g_x64FrameObj) {
-            s_x64Discovered = true;
+        // patches have an unrelated vtable at the same RVA (8.3.27.2342 live).
+        // Discover the frame at runtime (live-probed) and re-run with it; the
+        // cooldown keeps repeated failing clicks from re-scanning in a loop.
+        ULONGLONG now = GetTickCount64();
+        if (!g_x64DiscoveryDone || now - g_x64DiscoveryTick > 3000) {
+            g_x64DiscoveryDone = true;
+            g_x64DiscoveryTick = now;
             g_x64FrameObj = DiscoverFrameVtblX64(cfg);
             if (g_x64FrameObj) return CmdCommandToJson(args0);
         }
