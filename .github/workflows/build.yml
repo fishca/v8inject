@@ -122,6 +122,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Tag checkout: RELEASE.md (release notes, when present) is read from
+      # here, and gh infers the repository from the git context.
+      - uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -148,17 +152,22 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          # This job checks nothing out: without a git context gh cannot infer
-          # the repo from the working directory ("not a git repository").
-          GH_REPO: ${{ github.repository }}
         run: |
           $tag = "${{ github.ref_name }}"
           $zips = "dist/v8inject-$tag-x64.zip", "dist/v8inject-$tag-x86.zip"
+          # Release notes come from RELEASE.md at the tag when present (the
+          # author writes them alongside the code); without the file gh falls
+          # back to auto-generated commit notes.
+          $notesArgs = if (Test-Path RELEASE.md) {
+            @('--notes-file', 'RELEASE.md')
+          } else {
+            @('--generate-notes')
+          }
           # Re-runs of the workflow hit an existing release: refresh its
           # assets instead of failing on `create`.
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag --clobber @zips
           } else {
-            gh release create $tag --title "v8inject $tag" --generate-notes @zips
+            gh release create $tag --title "v8inject $tag" @notesArgs @zips
           }

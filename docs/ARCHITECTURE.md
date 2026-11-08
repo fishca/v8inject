@@ -436,7 +436,8 @@ GitBar. Клиентский деструктор **не** выгружает pa
 (`.github/workflows/build.yml`, runner `windows-2022`). Пуш тега `v*`
 запускает job `release`: артефакты сборки пакуются в zip (только
 пользовательские бинари) и публикуются GitHub Release'ом через `gh release
-create --generate-notes`.
+create`. Заметки — из `RELEASE.md` в корне тега, если файл есть, иначе
+автогенерация из коммитов.
 
 ## 15. Сборка
 

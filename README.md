@@ -231,9 +231,10 @@ tools/              E2E-проверки, recon-скрипты, генерато
 
 GitHub Actions собирает обе разрядности на `windows-2022`,
 прогоняет smoke-тест и складывает артефакты. Пуш тега `v*` дополнительно
-публикует GitHub Release с zip-архивами x86/x64 (заметки генерируются из
-коммитов автоматически; содержимое релиза — только v8inject.exe,
-v8inject-gui.exe, v8inject-agent.exe и v8i_payload.dll).
+публикует GitHub Release с zip-архивами x86/x64 (только v8inject.exe,
+v8inject-gui.exe, v8inject-agent.exe и v8i_payload.dll). Заметки берутся из
+файла `RELEASE.md` в корне тега, если он там есть, иначе генерируются из
+коммитов.
 
 ## Статус
 
