@@ -148,6 +148,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job checks nothing out: without a git context gh cannot infer
+          # the repo from the working directory ("not a git repository").
+          GH_REPO: ${{ github.repository }}
         run: |
           $tag = "${{ github.ref_name }}"
           $zips = "dist/v8inject-$tag-x64.zip", "dist/v8inject-$tag-x86.zip"
