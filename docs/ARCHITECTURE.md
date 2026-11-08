@@ -433,7 +433,10 @@ GitBar. Клиентский деструктор **не** выгружает pa
 
 Тесты, требующие живой 1С (`check_gitbar.sh`), в CI не выполняются — только
 локально; CI гоняет сборку обеих разрядностей и ctest
-(`.github/workflows/build.yml`, runner `windows-2022`).
+(`.github/workflows/build.yml`, runner `windows-2022`). Пуш тега `v*`
+запускает job `release`: артефакты сборки пакуются в zip (только
+пользовательские бинари) и публикуются GitHub Release'ом через `gh release
+create --generate-notes`.
 
 ## 15. Сборка
 
