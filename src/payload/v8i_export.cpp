@@ -1118,16 +1118,31 @@ static const unsigned char kConfigGroup[16] = {
 // frame window once; a posting thread fills the pending slot and posts a
 // custom message, the UI thread's WndProc executes transmitCommand and flips
 // the done flag. Pod-only state; no calls from the io thread into 1C UI.
+// 8.5 command receiver, captured from the slot-31 forwarder of a live
+// ITopLevelFrame (declared here: the marshal bridges below read them).
+static uintptr_t g85_recv = 0;
+static uintptr_t g85_recvVt = 0;
+static void V8iCaptureCmdRecv(void* obj);   // 8.5 slot-31 walk, defined below
 namespace {
 const UINT kV8iCmdMsg = WM_APP + 0x2F11;
 struct V8iPending {
     void* recv;
     void* trFn;
-    V8Cmd cmd;
+    // Command buffer, shared by both platform layouts at the same address.
+    // 8.3 transmits V8Cmd (32 bytes); 8.5 expects the RECON-85 layout
+    // (CommandID padded to 24, param at 24, object at 32 — 40 bytes). The
+    // sender zeroes raw first, so either interpretation of the padding reads
+    // param=0 / object=nullptr. hasHandler (CommandID, 20 bytes) is identical
+    // in both layouts.
+    union {
+        V8Cmd cmd;
+        unsigned char raw[48];
+    } u;
     volatile LONG done;
     int rc;
     LONG exc;
-    int mode;   // 0 = transmitCommand(recv, &cmd, 0), 1 = hasHandler(recv, &cmd)
+    int mode;   // 0 = transmitCommand(recv, &cmd, 0), 1 = hasHandler(recv, &cmd),
+                // 2 = capture the 8.5 receiver from the frame object in recv
 };
 V8iPending g_pending = {};
 HWND g_cmdHwnd = NULL;
@@ -1140,9 +1155,16 @@ LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                 UINT_PTR id, DWORD_PTR data) {
     if (m == kV8iCmdMsg) {
         V8iPending* p = (V8iPending*)data;
-        p->rc = p->mode == 1 ? HasGuarded(p->trFn, p->recv, &p->cmd)
-                             : TransmitGuarded(p->trFn, p->recv, &p->cmd);
-        if (p->rc < 0) p->exc = g_cmdLastExc;
+        if (p->mode == 2) {
+            // The slot-31 walk calls into core85, which on 8.5 only answers on
+            // the UI thread — so the capture rides the same marshal bridge.
+            V8iCaptureCmdRecv(p->recv);
+            p->rc = g85_recv ? 0 : -1;
+        } else {
+            p->rc = p->mode == 1 ? HasGuarded(p->trFn, p->recv, &p->u.cmd)
+                                 : TransmitGuarded(p->trFn, p->recv, &p->u.cmd);
+            if (p->rc < 0) p->exc = g_cmdLastExc;
+        }
         InterlockedExchange(&p->done, 1);
         return 0;
     }
@@ -1156,10 +1178,15 @@ LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
 
 LRESULT CALLBACK V8iCmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == kV8iCmdMsg) {
-        g_pending.rc = g_pending.mode == 1
-                           ? HasGuarded(g_pending.trFn, g_pending.recv, &g_pending.cmd)
-                           : TransmitGuarded(g_pending.trFn, g_pending.recv, &g_pending.cmd);
-        if (g_pending.rc < 0) g_pending.exc = g_cmdLastExc;
+        if (g_pending.mode == 2) {
+            V8iCaptureCmdRecv(g_pending.recv);
+            g_pending.rc = g85_recv ? 0 : -1;
+        } else {
+            g_pending.rc = g_pending.mode == 1
+                               ? HasGuarded(g_pending.trFn, g_pending.recv, &g_pending.u.cmd)
+                               : TransmitGuarded(g_pending.trFn, g_pending.recv, &g_pending.u.cmd);
+            if (g_pending.rc < 0) g_pending.exc = g_cmdLastExc;
+        }
         InterlockedExchange(&g_pending.done, 1);
         return 0;
     }
@@ -1356,6 +1383,8 @@ static void* V8iCallNoArg(uintptr_t fn) {
 // thread. To run them on the UI thread we subclass the main window for a
 // moment and post WM_APP+0x602; the subclass proc executes
 // current_process() -> getService(IID_IEventService) and caches the results.
+// (g85_recv / g85_recvVt live near the top of the file, next to the marshal
+// bridge that reads them.)
 static uintptr_t g85_fn = 0;
 static uintptr_t g85_proc = 0;
 static uintptr_t g85_procVt = 0;
@@ -1371,8 +1400,6 @@ static int g85_svcSlot = -1;
 static int g85_svc2Slot = -1;
 static uintptr_t g85_frame = 0;
 static uintptr_t g85_frameVt = 0;
-static uintptr_t g85_recv = 0;
-static uintptr_t g85_recvVt = 0;
 static uintptr_t g85_frames[4] = {};
 static int g85_nFrames = 0;
 static uintptr_t g85_qProcFrame = 0, g85_qProcRecv = 0;
@@ -1829,10 +1856,16 @@ static ULONG __stdcall V8iRecipRelease(void*) { return 1; }
 // V8iCmd85Send sends a designer command through g85_recv on the 1C UI thread
 // (kV8iCmdMsg marshal). rc: >=0 transmit result, -99 no receiver/unreadable,
 // -98 no marshal window, -97 UI thread did not answer, -96 timeout.
-static int V8iCmd85Send(unsigned int num, int sub) {
+// `has` queries ICommandReceiver::hasHandler instead of transmitting.
+// The v8api slot numbering EXCLUDES IUnknown: the live vtable is
+// [0]=QI, [1]=AddRef, [2]=Release (verified by disasm on 8.5.1.1529 —
+// slot 0 compares its arg against IID_IUnknown and writes *out; "has" via
+// slot 2 was a false positive: AddRef just returns 1). Real slots are +3,
+// same as the 8.3 chain (kTransmitSlot=3): transmit=[3], hasHandler=[5].
+static int V8iCmd85Send(unsigned int num, int sub, bool has = false) {
     if (!g85_recv || !g85_recvVt) return -99;
-    if (!IsReadable((void*)g85_recvVt, 4 * sizeof(void*))) return -99;
-    uintptr_t tr = ((uintptr_t*)g85_recvVt)[0];
+    if (!IsReadable((void*)g85_recvVt, 6 * sizeof(void*))) return -99;
+    uintptr_t tr = ((uintptr_t*)g85_recvVt)[has ? 5 : 3];
     if (!tr || !IsReadable((void*)tr, 1)) return -99;
     HWND cmdHwnd = nullptr;
     DWORD ensureErr = 0;
@@ -1840,11 +1873,15 @@ static int V8iCmd85Send(unsigned int num, int sub) {
     if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return -98;
     g_pending.recv = (void*)g85_recv;
     g_pending.trFn = (void*)tr;
-    g_pending.mode = 0;
-    memcpy(g_pending.cmd.group, kConfigGroup, 16);
-    g_pending.cmd.cmdNum = num;
-    g_pending.cmd.param = sub;
-    g_pending.cmd.object = nullptr;
+    g_pending.mode = has ? 1 : 0;
+    // 8.5 Command layout (RECON-85 §3.3): CommandID { GUID, num } padded to
+    // 24, param at 24, object at 32 — 40 bytes total. Zeroed tail = nullptr
+    // object; the 8.3 32-byte interpretation of the same buffer would read
+    // param from the pad (0) and object from the first zeroed qword.
+    memset(g_pending.u.raw, 0, sizeof(g_pending.u.raw));
+    memcpy(g_pending.u.raw, kConfigGroup, 16);
+    *(unsigned int*)(g_pending.u.raw + 16) = num;
+    *(int*)(g_pending.u.raw + 24) = sub;
     g_pending.rc = -2;
     g_pending.exc = 0;
     InterlockedExchange(&g_pending.done, 0);
@@ -1854,6 +1891,106 @@ static int V8iCmd85Send(unsigned int num, int sub) {
         return -97;
     if (!g_pending.done) return -96;
     return g_pending.rc;
+}
+
+// Post-start receiver capture for 8.5: the eventCreateFrame path only runs
+// when the payload subscribed before the frames existed (hookcbt/launch).
+// For a plain post-start inject (`v8inject gitbar ...`) nothing hands us the
+// frame, so: scan the heap for the live-calibrated ITopLevelFrame vtable and
+// marshal the slot-31 walk onto the UI thread (mode 2) — the only context
+// where 8.5 answers. The static check (slot 31 is readable code inside
+// config.dll) keeps bogus candidates from executing random bytes; SEH covers
+// the rest.
+static bool V8iCaptureRecv85Late() {
+    if (g85_recv && g85_recvVt) return true;
+    ModuleRange cfg;
+    if (!FindModule(L"config.dll", cfg)) return false;
+    const uintptr_t kFrameVtbl = cfg.base + 0x2ED3B0;  // ITopLevelFrame, live-calibrated on 8.5.1.1529
+
+    std::vector<ModuleRange> mods;
+    for (const ModuleRange& m : EnumModules()) mods.push_back(m);
+    auto insideCfg = [&](uintptr_t a) {
+        return a >= cfg.base && a < cfg.base + cfg.size;
+    };
+
+    uintptr_t addr = 0x10000;
+    while (addr < 0x00007FFFFFFFFFFFULL) {
+        MEMORY_BASIC_INFORMATION mi = {};
+        if (VirtualQuery((void*)addr, &mi, sizeof(mi)) == 0) break;
+        uintptr_t end = addr + mi.RegionSize;
+        bool usable = mi.State == MEM_COMMIT &&
+                      (mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) &&
+                      !(mi.Protect & PAGE_GUARD) &&
+                      !insideCfg((uintptr_t)mi.BaseAddress);
+        if (usable) {
+            const uintptr_t cap = mi.RegionSize > 64 * 1024 * 1024
+                                      ? 64 * 1024 * 1024 : (uintptr_t)mi.RegionSize;
+            for (uintptr_t p = (uintptr_t)mi.BaseAddress;
+                 p < (uintptr_t)mi.BaseAddress + cap; p += sizeof(void*)) {
+                if (*(uintptr_t*)p != kFrameVtbl) continue;
+                uintptr_t fvt = *(uintptr_t*)p;
+                uintptr_t fn31 = ((uintptr_t*)fvt)[31];
+                if (!fn31 || !IsReadable((void*)fn31, 1) || !insideCfg(fn31)) continue;
+
+                HWND cmdHwnd = nullptr;
+                DWORD ensureErr = 0;
+                const char* marshalPath = "";
+                if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return false;
+                g_pending.recv = (void*)p;
+                g_pending.trFn = nullptr;
+                g_pending.mode = 2;
+                g_pending.rc = -2;
+                g_pending.exc = 0;
+                InterlockedExchange(&g_pending.done, 0);
+                DWORD_PTR smRes = 0;
+                SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &smRes);
+                if (g85_recv && g85_recvVt) {
+                    LogLine("cmd85 late capture: frame=0x%llX recv=0x%llX rvt=0x%llX",
+                            (unsigned long long)p, (unsigned long long)g85_recv,
+                            (unsigned long long)g85_recvVt);
+                    return true;
+                }
+            }
+        }
+        addr = end == addr ? addr + sizeof(void*) : end;
+    }
+    LogLine("cmd85 late capture: no frame with vtable config.dll+0x2ED3B0 found");
+    return false;
+}
+
+// Shared JSON front for the 8.5 send path: `cmd85 ...` and `cmd ...` on 8.5
+// both land here. Captures the receiver post-start when it is missing, so a
+// plain post-start GitBar dump button works without hookcbt/launch.
+static std::string Cmd85SendJson(unsigned int num, int sub, bool has) {
+    if (!g85_recv && !V8iCaptureRecv85Late())
+        return "{\"status\":\"error\",\"message\":\"no 8.5 receiver captured — "
+               "needs early subscribe (hookcbt/launch) or a live frame\"}";
+    int rc = V8iCmd85Send(num, sub, has);
+    char nb[256];
+    if (rc == -99)
+        return "{\"status\":\"error\",\"message\":\"receiver vtbl[0] unreadable\"}";
+    if (rc == -98)
+        return "{\"status\":\"error\",\"message\":\"marshaling setup failed\"}";
+    if (rc == -97)
+        return "{\"status\":\"error\",\"message\":\"UI thread did not answer\"}";
+    if (rc == -96)
+        return "{\"status\":\"error\",\"message\":\"timeout waiting for UI thread\"}";
+    if (rc < 0) {
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"transmit exception\",\"exc\":\"0x%X\"}",
+                    (unsigned)g_pending.exc);
+        return nb;
+    }
+    if (has)
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"ok\",\"num\":%u,\"sub\":%d,\"recv\":\"0x%llX\",\"has\":%s}",
+                    num, sub, (unsigned long long)g85_recv, rc == 0 ? "false" : "true");
+    else
+        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
+                    "{\"status\":\"ok\",\"num\":%u,\"sub\":%d,\"recv\":\"0x%llX\",\"rvt\":\"0x%llX\",\"rc\":%d}",
+                    num, sub, (unsigned long long)g85_recv, (unsigned long long)g85_recvVt, rc);
+    return nb;
 }
 
 // File-driven command sender: lets a host drive 8.5 designer commands without a
@@ -2958,66 +3095,7 @@ static std::string CmdCmd85ToJson(const std::wstring& args0) {
     int sub = 0;
     if (swscanf_s(args.c_str(), L"%u %d", &num, &sub) < 1)
         return "{\"status\":\"error\",\"message\":\"usage: cmd85 <num> [sub]\"}";
-    if (!g85_recv || !g85_recvVt)
-        return "{\"status\":\"error\",\"message\":\"no 8.5 receiver captured — needs early subscribe (hookcbt/launch)\"}";
-    uintptr_t tr = 0;
-    if (IsReadable((void*)g85_recvVt, 4 * sizeof(void*)))
-        tr = ((uintptr_t*)g85_recvVt)[0];
-    if (!tr || !IsReadable((void*)tr, 1)) {
-        char nb[160];
-        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
-                    "{\"status\":\"error\",\"message\":\"receiver vtbl[0] unreadable\",\"recv\":\"0x%llX\"}",
-                    (unsigned long long)g85_recv);
-        return nb;
-    }
-    HWND cmdHwnd = nullptr;
-    DWORD ensureErr = 0;
-    const char* marshalPath = "";
-    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) {
-        char nb[200];
-        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
-                    "{\"status\":\"error\",\"message\":\"marshaling setup failed\",\"code\":\"0x%X\"}",
-                    (unsigned)ensureErr);
-        return nb;
-    }
-    g_pending.recv = (void*)g85_recv;
-    g_pending.trFn = (void*)tr;
-    g_pending.mode = 0;
-    memcpy(g_pending.cmd.group, kConfigGroup, 16);
-    g_pending.cmd.cmdNum = num;
-    g_pending.cmd.param = sub;
-    g_pending.cmd.object = nullptr;
-    g_pending.rc = -2;
-    g_pending.exc = 0;
-    InterlockedExchange(&g_pending.done, 0);
-    DWORD_PTR smRes = 0;
-    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes)) {
-        char nb[200];
-        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
-                    "{\"status\":\"error\",\"message\":\"UI thread did not answer (0x%X)\"}",
-                    (unsigned)GetLastError());
-        return nb;
-    }
-    if (!g_pending.done)
-        return "{\"status\":\"error\",\"message\":\"timeout waiting for UI thread\"}";
-    int rc = g_pending.rc;
-    if (rc < 0) {
-        char nb[200];
-        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
-                    "{\"status\":\"error\",\"message\":\"transmit exception\",\"exc\":\"0x%X\"}",
-                    (unsigned)g_pending.exc);
-        return nb;
-    }
-    {
-        char nb[220];
-        _snprintf_s(nb, sizeof(nb), _TRUNCATE,
-                    "{\"status\":\"ok\",\"num\":%u,\"sub\":%d,\"recv\":\"0x%llX\",\"rvt\":\"0x%llX\","
-                    "\"marshal\":\"%s\",\"rc\":%d}",
-                    num, sub, (unsigned long long)g85_recv,
-                    (unsigned long long)g85_recvVt, marshalPath, rc);
-        return nb;
-    }
+    return Cmd85SendJson(num, sub, false);
 }
 
 static std::string CmdInfoToJson(const std::wstring&) { return CmdInfoToJsonA(); }
@@ -3033,6 +3111,15 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     int sub = 0;
     if (swscanf_s(args.c_str(), L"%u %d", &num, &sub) < 1)
         return "{\"status\":\"error\",\"message\":\"usage: cmd <num> [sub]\"}";
+
+    // 8.5 runs a different frame geometry: the 8.3 calibration below points at
+    // an unrelated config.dll vtable there, and its receiver chain does not
+    // exist (live: "no working receiver chain" plus an AV during validation).
+    // A loaded core85.dll is the reliable platform marker — route through the
+    // 8.5 receiver (slot-31 forwarder), captured post-start when needed.
+    ModuleRange core85Probe;
+    if (FindModule(L"core85.dll", core85Probe))
+        return Cmd85SendJson(num, sub, wantHas);
 
     ModuleRange cfg;
     if (!FindModule(L"config.dll", cfg))
@@ -3204,10 +3291,10 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     g_pending.recv = recv;
     g_pending.trFn = trFn;
     g_pending.mode = wantHas ? 1 : 0;
-    memcpy(g_pending.cmd.group, kConfigGroup, 16);
-    g_pending.cmd.cmdNum = num;
-    g_pending.cmd.param = sub;
-    g_pending.cmd.object = nullptr;
+    memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
+    g_pending.u.cmd.cmdNum = num;
+    g_pending.u.cmd.param = sub;
+    g_pending.u.cmd.object = nullptr;
     g_pending.rc = -2;
     g_pending.exc = 0;
     InterlockedExchange(&g_pending.done, 0);

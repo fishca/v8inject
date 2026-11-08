@@ -506,7 +506,10 @@ int wmain(int argc, wchar_t** argv) {
         cmd == L"hook" || cmd == L"hooks" || cmd == L"unhook" || cmd == L"trace") {
         if (argc < 3) { PrintUsage(); return 1; }
         if (cmd == L"imports" && argc < 4) { PrintUsage(); return 1; }
-        int timeout = (cmd == L"xref") ? 120000 : 15000;
+        // cmd 45 opens a modal dump dialog: the 1C UI thread (and with it the
+        // payload's marshal SendMessageTimeout, 30 s) stays busy, so the reply
+        // legitimately takes longer than the default 15 s.
+        int timeout = (cmd == L"xref" || cmd == L"cmd85") ? 120000 : 15000;
         Options o = ParseOptions(argc, argv, 3);
         return RunPayloadCommand(cmd.c_str(), argv[2], argc, argv, 3, timeout);
     }

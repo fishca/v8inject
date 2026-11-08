@@ -97,7 +97,7 @@ v8inject trace  1cv8.exe [--count N] [--since N] [--clear]
 | Команда | Доступ | Что делает |
 |---|---|---|
 | `cmd <num> [sub]` | **только в `attach`** | команда дизайнера на 8.3 (выгрузка в файлы — 45, открыть конфигурацию — 2) |
-| `cmd85 <num> [sub]` | `v8inject cmd85 …` или в `attach` | то же на 8.5 через ранний приёмник |
+| `cmd85 <num> [sub]` | `v8inject cmd85 …` или в `attach` | команда дизайнера на 8.5 (таймаут 120 с: cmd 45 открывает модальный диалог выгрузки — «UI thread did not answer» в ответе и есть успех) |
 | `cmdinfo` | CLI / attach | диагностика: как найти command receiver на данной платформе |
 | `frames` | CLI / attach | что прислал `eventCreateFrame`, статистика CBT |
 | `exports85 <module> [--count N]` | CLI / attach | экспорты модуля **с диска** (в памяти 8.5 занулены) |
