@@ -294,10 +294,18 @@ recv->vtbl[3] ── transmitCommand(Command*, bool deactivate)   // x64, __fast
 recv->vtbl[0] ── transmitCommand                              // x86, __stdcall, ret 0xC
 ```
 
+**Нумерация слотов снова «+3»** (IUnknown): `[0]=QI, [3]=transmit, [5]=hasHandler` —
+та же система, что и на 8.5.
+
 На x86 калибровка **runtime** (`DiscoverFrameVtblX86`): ищется объект, чья
 vtable лежит в `.rdata` `config.dll` со слотами в `.text`, и проверяется, что
 transmitCommand — настоящий метод (сигнатура пролога + `ret 8/0xC`), а не
-property-getter.
+property-getter. **На x64 хардкод `0x2EFB50` валиден только для 8.3.27.1989** —
+на других патчах (8.3.27.2342 проверено живьём) по этому RVA лежит уже чужая
+vtable, поэтому при провале цепочки включается `DiscoverFrameVtblX64` — та же
+эвристика, что на x86, плюс **живой зонд**: каждый структурно-валидный
+кандидат проверяется вызовом `hasHandler(45)` на UI-потоке под SEH (чужая
+цепочка падает по исключению — берём следующего кандидата).
 
 Структура `Command` — 32 байта на x64: GUID группы Config
 `{F10CBB81-F679-11D4-9DD3-0050BAE2BC79}` + номер + param + object.

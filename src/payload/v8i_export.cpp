@@ -1055,6 +1055,9 @@ namespace {
 uintptr_t g_cmdFrameCache = 0;
 #if !defined(_WIN64)
 uintptr_t g_x86FrameObj = 0;   // discovered frame object (x86 runtime calibration)
+#else
+uintptr_t g_x64FrameObj = 0;   // discovered frame object (x64 runtime calibration)
+uintptr_t g_x64RecvOffset = 0x20;
 #endif
 }
 
@@ -1249,6 +1252,95 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
     return true;
 }
 }  // namespace
+
+#if defined(_WIN64)
+// x64 runtime calibration: the hardcoded ITopLevelFrame vtable RVA below is
+// valid for 8.3.27.1989 only — on other 8.3 patches (8.3.27.2342, live) an
+// unrelated vtable sits at the same RVA, the scan finds a wrong object and
+// the receiver chain fails ("no working receiver chain"). Same heuristics as
+// the x86 discovery: a heap object whose vtable lives in config.dll .rdata
+// with slots 3..40 pointing into config.dll .text, and whose receiver chain
+// (core = obj+8, recv = core - off, recvVt readable, transmit slot readable
+// inside a loaded module) validates. POD-only reads; no calls into 1C.
+static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
+    PeImage cfgImg = ParsePe(cfg.base);
+    if (!cfgImg.valid) return 0;
+    const PeSection* textSec = nullptr;
+    const PeSection* rdataSec = nullptr;
+    for (const PeSection& s : cfgImg.sections) {
+        if (s.Executable() && s.name == ".text") textSec = &s;
+        if (s.Readable() && !s.Executable() && s.name == ".rdata") rdataSec = &s;
+    }
+    if (!textSec || !rdataSec) return 0;
+    const uintptr_t textLo = cfg.base + textSec->va;
+    const uintptr_t textHi = textLo + textSec->virtualSize;
+    const uintptr_t rdataLo = cfg.base + rdataSec->va;
+    const uintptr_t rdataHi = rdataLo + rdataSec->virtualSize;
+
+    std::vector<ModuleRange> mods;
+    for (const ModuleRange& m : EnumModules()) mods.push_back(m);
+    auto insideModule = [&mods](uintptr_t a) {
+        for (const ModuleRange& m : mods)
+            if (a >= m.base && a < m.base + m.size) return true;
+        return false;
+    };
+
+    // one heap walk: objects whose first qword is a config.dll .rdata vtable
+    std::vector<uintptr_t> objs;
+    uintptr_t addr = 0x10000;
+    while (addr < 0x00007FFFFFFFFFFFULL) {
+        MEMORY_BASIC_INFORMATION mi = {};
+        if (VirtualQuery((void*)addr, &mi, sizeof(mi)) == 0) break;
+        uintptr_t end = addr + mi.RegionSize;
+        bool usable = mi.State == MEM_COMMIT &&
+                      (mi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) &&
+                      !(mi.Protect & PAGE_GUARD);
+        if (usable) {
+            const uintptr_t cap = mi.RegionSize > 64 * 1024 * 1024
+                                      ? 64 * 1024 * 1024 : (uintptr_t)mi.RegionSize;
+            for (uintptr_t p = (uintptr_t)mi.BaseAddress;
+                 p < (uintptr_t)mi.BaseAddress + cap; p += sizeof(void*)) {
+                uintptr_t v = *(uintptr_t*)p;
+                if (v < rdataLo || v >= rdataHi) continue;
+                bool ok = true;
+                for (int s = 3; s <= 40; ++s) {
+                    uintptr_t fn = ((uintptr_t*)v)[s];
+                    if (fn < textLo || fn >= textHi) { ok = false; break; }
+                }
+                if (!ok) continue;
+                objs.push_back(p);
+                if (objs.size() >= 64) break;
+            }
+        }
+        if (objs.size() >= 64) break;
+        addr = end == addr ? addr + sizeof(void*) : end;
+    }
+
+    // receiver chain must validate; try the documented offset first
+    static const uintptr_t kRecvOffs[] = {0x20, 0x10, 0x18, 0x28, 0x30, 0x38, 0x40, 0x08};
+    for (uintptr_t obj : objs) {
+        uintptr_t core = *(uintptr_t*)(obj + sizeof(void*));
+        if (!IsReadable((void*)core, sizeof(void*))) continue;
+        for (uintptr_t off : kRecvOffs) {
+            uintptr_t recv = core - off;
+            if (!IsReadable((void*)recv, sizeof(void*))) continue;
+            uintptr_t recvVt = *(uintptr_t*)recv;
+            if (!IsReadable((void*)recvVt, 6 * sizeof(void*))) continue;
+            if (!insideModule(recvVt)) continue;
+            uintptr_t tr = ((uintptr_t*)recvVt)[3];
+            if (!insideModule(tr)) continue;
+            if (!IsReadable((void*)tr, 32)) continue;
+            if (*(const unsigned char*)tr == 0xCC) continue;   // int3 padding, not code
+            g_x64RecvOffset = off;
+            LogLine("cmd x64 discovery: frame=0x%llX recvOff=0x%llX recv=0x%llX",
+                    (unsigned long long)obj, (unsigned long long)off,
+                    (unsigned long long)recv);
+            return obj;
+        }
+    }
+    return 0;
+}
+#endif
 
 #if !defined(_WIN64)
 // x86 runtime calibration: find the ITopLevelFrame vtable without hardcoded
@@ -3129,8 +3221,11 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     const uintptr_t kFrameVtblRva = 0x2EFB50;   // ITopLevelFrame vtable, 8.3.27.1989 x64
     const uintptr_t kCoreOffset = sizeof(void*);
     const int kTransmitSlot = 3;
-    const uintptr_t kRecvBackOffset = 0x20;   // ICommandReceiver sits 0x20 before coreMainFrame
-    uintptr_t vtblPtr = cfg.base + kFrameVtblRva;
+    // With a runtime-discovered frame (other 8.3 patches) both the vtable and
+    // the receiver offset come from the discovery, not from the constants.
+    const uintptr_t vtblPtr = g_x64FrameObj ? *(uintptr_t*)g_x64FrameObj
+                                            : cfg.base + kFrameVtblRva;
+    uintptr_t kRecvBackOffset = g_x64FrameObj ? g_x64RecvOffset : 0x20;
     if (kFrameVtblRva == 0)
         return "{\"status\":\"error\",\"message\":\"frame vtable not calibrated for this build\"}";
 #else
@@ -3246,30 +3341,97 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     // For each candidate the receiver is a fixed distance before coreMainFrame
     // (frame+ptrSize), so no vtable calls are needed to obtain it.
     if (!forced) {
+        // Best = receiver answered hasHandler(45) alive; fallback = first
+        // structurally valid chain that did not throw. A structurally valid
+        // chain can still belong to a sibling class (8.3.27.2342 live: three
+        // config-vtable objects pass the static checks, only the main frame's
+        // receiver answers a COM call without an exception).
+        uintptr_t bestFrame = 0, aliveFrame = 0;
+        void* bestRecv = nullptr; void* bestTr = nullptr; uintptr_t bestVt = 0;
+        void* aliveRecv = nullptr; void* aliveTr = nullptr; uintptr_t aliveVt = 0;
         for (uintptr_t cand : candidates) {
             uintptr_t core = *(uintptr_t*)(cand + kCoreOffset);
             if (!IsReadable((void*)core, sizeof(void*))) continue;
             uintptr_t candRecv = core - kRecvBackOffset;
             if (!IsReadable((void*)candRecv, sizeof(void*))) continue;
             uintptr_t recvVt = *(uintptr_t*)candRecv;
-            if (!IsReadable((void*)(recvVt + 4 * sizeof(void*)), sizeof(void*))) continue;
+            if (!IsReadable((void*)(recvVt + 6 * sizeof(void*)), sizeof(void*))) continue;
             void* candTr = ((void**)recvVt)[kTransmitSlot];
             if (!IsReadable(candTr, 1)) continue;
-            if (wantHas) {
-                // ICommandReceiver::hasHandler is the 5th slot (after queryIface).
-                candTr = ((void**)recvVt)[5];
-                if (!IsReadable(candTr, 1)) continue;
+
+            // Live probe on the UI thread: hasHandler(cmd 45) through the same
+            // marshal bridge the transmit uses. Exception / timeout = wrong
+            // chain, try the next candidate.
+            HWND probeHwnd = nullptr;
+            DWORD probeErr = 0;
+            const char* probePath = "";
+            if (!EnsureCmdUi(&probeHwnd, &probeErr, &probePath)) {
+                // no marshal window (yet) — keep the structural pick
+                bestFrame = cand; bestRecv = (void*)candRecv; bestTr = candTr;
+                bestVt = recvVt;
+                break;
             }
-            usedFrame = cand;
-            recv = (void*)candRecv;
-            trFn = candTr;
-            frame = cand;
-            break;
+            void* probeTr = ((void**)recvVt)[5];              // hasHandler
+            if (!IsReadable(probeTr, 1)) continue;
+            g_pending.recv = (void*)candRecv;
+            g_pending.trFn = probeTr;
+            g_pending.mode = 1;
+            memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
+            g_pending.u.cmd.cmdNum = 45;
+            g_pending.u.cmd.param = 0;
+            g_pending.u.cmd.object = nullptr;
+            g_pending.rc = -2;
+            g_pending.exc = 0;
+            InterlockedExchange(&g_pending.done, 0);
+            DWORD_PTR probeRes = 0;
+            if (!SendMessageTimeoutW(probeHwnd, kV8iCmdMsg, 0, 0,
+                                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes))
+                continue;
+            if (g_pending.exc != 0 || g_pending.rc < 0) continue;   // wrong chain
+
+            if (bestFrame == 0) {
+                bestFrame = cand; bestRecv = (void*)candRecv; bestTr = candTr;
+                bestVt = recvVt;
+                break;   // alive and claims the command — the strongest match
+            }
+            if (aliveFrame == 0) {
+                aliveFrame = cand; aliveRecv = (void*)candRecv; aliveTr = candTr;
+                aliveVt = recvVt;
+            }
+        }
+        if (bestFrame == 0 && aliveFrame != 0) {
+            bestFrame = aliveFrame; bestRecv = aliveRecv; bestTr = aliveTr;
+            bestVt = aliveVt;
+        }
+        if (bestFrame != 0) {
+            usedFrame = bestFrame;
+            recv = bestRecv;
+            trFn = bestTr;
+            frame = bestFrame;
+            if (wantHas) {
+                // The caller asked for hasHandler, not transmit: swap the
+                // target to slot 5 of the picked receiver's vtable.
+                void* hasTr = ((void**)bestVt)[5];
+                if (IsReadable(hasTr, 1)) trFn = hasTr;
+            }
         }
     }
 
-    if (!trFn)
+    if (!trFn) {
+#if defined(_WIN64)
+        // The hardcoded vtable RVA is calibrated to 8.3.27.1989; other 8.3
+        // patches have an unrelated vtable at the same RVA (8.3.27.2342 live:
+        // the scan finds one wrong object and the chain fails). Discover the
+        // frame at runtime once and re-run with it.
+        static bool s_x64Discovered = false;
+        if (!s_x64Discovered && !g_x64FrameObj) {
+            s_x64Discovered = true;
+            g_x64FrameObj = DiscoverFrameVtblX64(cfg);
+            if (g_x64FrameObj) return CmdCommandToJson(args0);
+        }
+#endif
         return j + ",\"error\":\"no working receiver chain\"}";
+    }
 
     _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"frame\":\"0x%llX\",\"recv\":\"0x%llX\"",
                 (unsigned long long)usedFrame, (unsigned long long)(uintptr_t)recv);
