@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 
@@ -693,13 +694,34 @@ const wchar_t* kFieldLabels[4] = { L"git.exe", L"папка выгрузки",
                                    L"комментарий к коммиту", L"remote origin (не обяз.)" };
 const wchar_t* kFieldIni[4]    = { L"gitpath", L"dumpdir", L"commitmsg", L"remote" };
 
+// Standard shell folder picker for the "..." button. Runs its own modal loop,
+// same contract as the MessageBoxes this dialog already uses. COM is
+// initialized for the BIF_NEWDIALOGSTYLE UI and released right after.
+std::wstring PickFolder(HWND owner) {
+    std::wstring res;
+    bool comHere = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+    BROWSEINFOW bi = {};
+    bi.hwndOwner = owner;
+    bi.lpszTitle = L"Папка выгрузки конфигурации";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (pidl) {
+        wchar_t buf[MAX_PATH] = {};
+        if (SHGetPathFromIDListW(pidl, buf)) res = buf;
+        CoTaskMemFree(pidl);
+    }
+    if (comHere) CoUninitialize();
+    return res;
+}
+
 struct SettingsCtx {
     std::wstring fields[4];
     size_t caret[4] = {};
     int    active = 0;
     RECT   fieldRects[4];
+    RECT   browseRect;          // "..." next to the dumpdir field
     RECT   okRect, cancelRect;
-    int    hoverBtn = -1;   // 0 = OK, 1 = Отмена, -1 = none
+    int    hoverBtn = -1;   // 0 = OK, 1 = Отмена, 2 = "...", -1 = none
     int    pressBtn = -1;
     HFONT  font = nullptr;
     bool   trackedLeave = false;
@@ -720,6 +742,10 @@ void SettingsLayout(HWND h, SettingsCtx* c) {
     const int fx = 150, fw = rc.right - fx - 14, fh = 22;
     for (int i = 0; i < 4; ++i)
         SetRect(&c->fieldRects[i], fx, 20 + i * 34, fx + fw, 20 + i * 34 + fh);
+    // The dumpdir row shrinks to make room for the folder-picker button in
+    // the same line (the button rect covers the freed gap, no overlap).
+    c->fieldRects[1].right -= 32;
+    SetRect(&c->browseRect, fx + fw - 28, 20 + 1 * 34, fx + fw, 20 + 1 * 34 + fh);
     SetRect(&c->okRect,     fx, 166, fx + 84, 190);
     SetRect(&c->cancelRect, fx + 94, 166, fx + 178, 190);
 }
@@ -763,6 +789,7 @@ void SettingsInvalidateField(HWND h, SettingsCtx* c, int i) {
 int SettingsHitButton(SettingsCtx* c, POINT pt) {
     if (PtInRect(&c->okRect, pt)) return 0;
     if (PtInRect(&c->cancelRect, pt)) return 1;
+    if (PtInRect(&c->browseRect, pt)) return 2;
     return -1;
 }
 
@@ -836,6 +863,23 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SelectObject(dc, obp);
             DeleteObject(bp);
             DrawTextW(dc, b ? L"Отмена" : L"OK", -1, &br,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        // "..." opens the shell folder picker for the dumpdir row
+        {
+            RECT& br = c->browseRect;
+            HBRUSH bf = CreateSolidBrush(c->pressBtn == 2 ? kDlgPress
+                                       : c->hoverBtn == 2 ? kDlgHover : kDlgBg);
+            FillRect(dc, &br, bf);
+            DeleteObject(bf);
+            HPEN bp = CreatePen(PS_SOLID, 1, kDlgBorder);
+            HPEN obp = (HPEN)SelectObject(dc, bp);
+            HBRUSH obr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, br.left, br.top, br.right, br.bottom);
+            SelectObject(dc, obr);
+            SelectObject(dc, obp);
+            DeleteObject(bp);
+            DrawTextW(dc, L"...", -1, &br,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
         SelectObject(dc, oldFont);
@@ -951,6 +995,18 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         int b = SettingsHitButton(c, pt);
         if (b == c->pressBtn && b == 0) { c->pressBtn = -1; SettingsSave(h, c); return 0; }
         if (b == c->pressBtn && b == 1) { c->pressBtn = -1; DestroyWindow(h); return 0; }
+        if (b == c->pressBtn && b == 2) {
+            c->pressBtn = -1;
+            std::wstring dir = PickFolder(h);
+            if (!dir.empty()) {
+                c->fields[1] = dir;
+                c->caret[1] = dir.size();
+                if (c->active == 1) UpdateCaretPix(h, c);
+                SettingsInvalidateField(h, c, 1);
+            }
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         c->pressBtn = -1;
         InvalidateRect(h, nullptr, FALSE);
         return 0;

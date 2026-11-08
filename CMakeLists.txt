@@ -75,7 +75,7 @@ endif()
 target_compile_definitions(v8i_payload PRIVATE V8I_PAYLOAD_EXPORTS)
 # msimg32: the GitBar draws 1C's own toolbar pictures, which are RGBA -
 # GDI needs AlphaBlend for that.
-target_link_libraries(v8i_payload PRIVATE v8i_common capstone comctl32 msimg32)
+target_link_libraries(v8i_payload PRIVATE v8i_common capstone comctl32 msimg32 shell32)
 set_target_properties(v8i_payload PROPERTIES
     OUTPUT_NAME "v8i_payload"
     PREFIX ""
@@ -104,7 +104,7 @@ add_executable(v8inject-gui WIN32
     src/host/client.cpp
     src/host/procs.cpp
 )
-target_link_libraries(v8inject-gui PRIVATE v8i_common psapi comctl32 comdlg32)
+target_link_libraries(v8inject-gui PRIVATE v8i_common psapi comctl32 comdlg32 shell32)
 v8i_set_output(v8inject-gui)
 
 # ---- agent: tray service that auto-injects into 1C on launch ----

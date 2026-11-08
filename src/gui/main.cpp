@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #include <shellscalingapi.h>
 
 #include "v8inject/client.h"
@@ -416,6 +417,20 @@ LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (c && LOWORD(wp) == IDCANCEL) { DestroyWindow(h); return 0; }
+        if (c && LOWORD(wp) == 2001 && HIWORD(wp) == BN_CLICKED) {
+            // Standard shell folder picker for the dumpdir edit.
+            wchar_t buf[MAX_PATH] = {};
+            BROWSEINFOW bi = {};
+            bi.hwndOwner = h;
+            bi.lpszTitle = L"Папка выгрузки конфигурации";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+            if (pidl) {
+                if (SHGetPathFromIDListW(pidl, buf)) SetWindowTextW(c->ed[1], buf);
+                CoTaskMemFree(pidl);
+            }
+            return 0;
+        }
         break;
     case WM_CLOSE:
         DestroyWindow(h);
@@ -446,13 +461,22 @@ void DoGitbarSettings() {
     };
 
     ctx.ed[0] = Edt(14);
-    ctx.ed[1] = Edt(44);
+    // dumpdir gets a folder-picker button in the same row: narrower edit,
+    // standard shell browse dialog on the "..." click (see WM_COMMAND 2001).
+    ctx.ed[1] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                158, 44, 250, 22, dlg, nullptr,
+                                GetModuleHandleW(nullptr), nullptr);
     ctx.ed[2] = Edt(74);
     ctx.ed[3] = Edt(104);
     Lbl(15, L"git.exe");
     Lbl(45, L"папка выгрузки");
     Lbl(75, L"комментарий к коммиту");
     Lbl(105, L"remote origin (не обяз.)");
+    CreateWindowExW(0, L"BUTTON", L"...",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                    414, 44, 28, 22, dlg, (HMENU)(INT_PTR)2001,
+                    GetModuleHandleW(nullptr), nullptr);
     CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                     158, 150, 90, 26, dlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleW(nullptr), nullptr);
     CreateWindowExW(0, L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
