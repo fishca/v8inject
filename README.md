@@ -2,6 +2,14 @@
 
 Инжектор и точка расширения для процессов 1С:Предприятие.
 
+Подробная документация: [docs/](docs/) —
+[архитектура](docs/ARCHITECTURE.md),
+[справочник команд](docs/CLI.md),
+[GitBar](docs/GITBAR.md),
+[ревизия проекта](docs/AUDIT.md),
+[инвентарь 8.5](docs/RECON-85.md),
+[план исследования 8.5](docs/plan_inj_ext.md).
+
 ## Что делает
 
 - находит процесс `1cv8.exe` / `1cv8c.exe` / `1cv8s.exe` по имени
@@ -26,8 +34,12 @@ cmake --build build\x64 --config Release
 
 ```
 build\x86\bin\x86\v8inject.exe
+build\x86\bin\x86\v8inject-gui.exe
+build\x86\bin\x86\v8inject-agent.exe
 build\x86\bin\x86\v8i_payload.dll
 build\x64\bin\x64\v8inject.exe
+build\x64\bin\x64\v8inject-gui.exe
+build\x64\bin\x64\v8inject-agent.exe
 build\x64\bin\x64\v8i_payload.dll
 ```
 
@@ -43,6 +55,10 @@ v8inject inject 1cv8.exe --dll bin\x64\v8i_payload.dll
 # любой команде можно указать --pid <n>, если процессов с таким именем несколько
 # (две открытые 1С, например):
 v8inject hook 1cv8.exe core83.dll!findMethod --pid 12345
+
+# запуск 1С с немедленным внедрением payload (до создания главного окна —
+# так payload успевает подписаться на события 8.5):
+v8inject launch 'C:\Program Files\1cv8\8.5.1.1529\bin\1cv8.exe' DESIGNER /F E:\bases\test
 
 # диалог с загруженным payload — команды идут вторым аргументом после exe:
 v8inject probe   1cv8.exe                  # версия payload, проверка связи
@@ -61,6 +77,13 @@ v8inject memmap 1cv8.exe [--count N]                  # карта приват�
 v8inject heapobjects 1cv8.exe [--module m] [--count N]   # живые объекты кучи
 v8inject findvalue 1cv8.exe <hex> [--count N] [--module m] # все 4-байтные вхождения
 v8inject byhwnd 1cv8.exe <hwnd> [--offset 0x200]       # объект, владеющий окном
+
+# ранняя подписка на 8.5: глобальный WH_CBT с hMod=payload — Windows сама
+# загрузит payload в 1С при создании первого окна (хост держит хук N секунд):
+v8inject hookcbt [секунд]
+
+# триггер на выгрузку конфигурации в файлы для git-конвейера:
+v8inject watch 1cv8.exe --dump-dir E:\dump\config --run "git add -A && git commit -m auto"
 
 # слой расширения: inline-хуки и трассировка вызовов
 v8inject attach 1cv8.exe                               # интерактивная сессия
@@ -84,12 +107,17 @@ v8inject log [--clear]                                # лог хоста
 `v8inject-gui.exe` — оконная версия: список процессов с фильтром,
 выбор payload-DLL по разрядности цели, строка команды и живой лог.
 
+`v8inject-agent.exe` — трей-агент: следит за запуском 1С, внедряет payload
+сам (один раз на процесс), по настройке сразу показывает GitBar; может
+стоять в автозапуске. Настройки — `%APPDATA%\v8inject\agent.ini`.
+
 ## GitBar — git-панель в конфигураторе
 
 Панель живёт **внутри процесса 1С**: это дочернее окно окна конфигуратора,
 пристыкованное справа в ряду тулбара, поэтому выглядит как штатный тулбар —
 включая иконки: они взяты из ресурсов самой платформы (`core83_root.res`,
-`mngcore_root.res`), а не нарисованы заново.
+`mngcore_root.res`), а не нарисованы заново. Подробно —
+[docs/GITBAR.md](docs/GITBAR.md).
 
 ```bat
 v8inject gitbar 1cv8.exe --pid 12345   # показать (payload остаётся в процессе)
@@ -97,8 +125,9 @@ v8inject gitbar hide 1cv8.exe --pid 12345
 ```
 
 То же из `v8inject-gui.exe`: выбрали процесс → «GitBar: показать».
+Или автоматически: `v8inject-agent.exe` показывает панель при старте 1С.
 
-Пять кнопок слева направо:
+Двенадцать кнопок слева направо:
 
 | Кнопка | Что делает |
 |---|---|
@@ -107,6 +136,10 @@ v8inject gitbar hide 1cv8.exe --pid 12345
 | стопка с галочкой | `git add -A` и коммит; комментарий спрашивается каждый раз |
 | стрелка вверх | `git push`; грязное дерево предлагает закоммитить, при отсутствии upstream — `push -u origin HEAD` |
 | шестерёнка | настройки |
+| журнал | история: граф коммитов + патч выбранного коммита |
+| pull / fetch | `git pull --no-edit` / `git fetch --all --prune` |
+| branches / stash / tags | списки с действиями (checkout, pop, push и т.д.) |
+| status | рабочая копия: индексировать, снять, отменить, коммит, amend |
 
 Настройки пишутся в `%APPDATA%\v8inject\gitbar.ini` (секция `[git]`):
 
@@ -125,11 +158,19 @@ remote=git@github.com:user/repo.git        ; origin для git init (необя�
 ## Команды дизайнера
 
 `cmd <num> [sub]` вызывает штатную команду конфигуратора (`ICommandReceiver::transmitCommand`)
-на UI-потоке — так работает кнопка выгрузки и любые другие действия меню:
+на UI-потоке — так работает кнопка выгрузки и любые другие действия меню.
+На 8.3 это команда payload `cmd` (пока только внутри сессии `attach`),
+на 8.5 — `cmd85` (доступна и отдельной командой CLI):
 
 ```bat
-v8inject cmd 1cv8.exe 2      # открыть конфигурацию
-v8inject cmd 1cv8.exe 45     # выгрузить конфигурацию в файлы
+v8inject attach 1cv8.exe
+cmd 2        # открыть конфигурацию (8.3)
+cmd 45       # выгрузить конфигурацию в файлы (8.3)
+exit
+
+v8inject cmd85 1cv8.exe 45     # выгрузка на 8.5
+v8inject cmdinfo 1cv8.exe      # диагностика цепочки команд
+v8inject frames  1cv8.exe      # что прислал eventCreateFrame (8.5)
 ```
 
 Калибровка (8.3.27.1989): x86 — `recv = core − 0x10`, `transmitCommand = frame.dll + 0x8980A0`;
@@ -176,16 +217,19 @@ x64 — `recv = core − 0x20`, `transmitCommand = frame.dll + 0x921730`.
 
 ```
 include/v8inject/   публичные заголовки
-src/common/         PE-разбор, ITypeInfo, JSON-отчёт
+src/common/         PE-разбор, ITypeInfo, JSON-отчёт, лог
 src/payload/        DLL, которая грузится В целевой процесс
 src/host/           внедрение (снаружи)
 src/cli/            консольный интерфейс
 src/gui/            оконная версия v8inject-gui
+src/agent/          v8inject-agent — трей, авто-внедрение при старте 1С
+tests/              smoke-тест хуков
+tools/              E2E-проверки, recon-скрипты, генератор иконок
 ```
 
 ## CI
 
-GitHub Actions собирает обе разрядности на `windows-latest`,
+GitHub Actions собирает обе разрядности на `windows-2022`,
 прогоняет smoke-тест и складывает артефакты.
 
 ## Статус
@@ -194,7 +238,8 @@ GitHub Actions собирает обе разрядности на `windows-late
 
 ## Совместимость
 
-1С:Предприятие 8.3.x (проверялось на 8.3.24).
+1С:Предприятие: 8.3.27.1989 (x86 и x64 — рабочий путь), 8.5.1.1529 (x64 —
+в разработке: ранняя подписка через WH_CBT работает, `cmd85` доводится).
 
 ## Отказ от ответственности
 

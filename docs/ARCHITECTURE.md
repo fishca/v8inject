@@ -1,0 +1,430 @@
+# Архитектура v8inject
+
+Подробное описание устройства проекта: компоненты, протоколы, механизмы и
+интеграция с платформой 1С:Предприятие. Для краткого обзора и инструкций
+см. [README](../README.md); справочник команд — [CLI.md](CLI.md);
+git-панель Конфигуратора — [GITBAR.md](GITBAR.md).
+
+---
+
+## 1. Общая схема
+
+v8inject — система из нескольких исполнимых компонентов. Ядро —
+**payload-DLL**, которая загружается в процесс 1С и обслуживает команды
+внешних «хостов» через разделяемую память. Хосты ничего не знают о внутреннем
+устройстве 1С — весь реверс-слой живёт в payload.
+
+```
+        ┌──────────────────────┐   разделяемая память       ┌─────────────────────────┐
+        │  хост-процессы       │  Local\v8inject.<pid>      │  1cv8.exe (Конфигуратор)│
+        │                      │  request  ──────────────▶  │                         │
+        │  v8inject.exe (CLI)  │  response ◀──────────────  │  v8i_payload.dll        │
+        │  v8inject-gui.exe    │  (JSON, UTF-8)             │   ├─ команды (JSON)     │
+        │  v8inject-agent.exe  │                            │   ├─ inline-хуки        │
+        └──────────┬───────────┘                            │   ├─ скан памяти        │
+                   │  CreateRemoteThread(LoadLibraryW)      │   ├─ дизассемблер       │
+                   └────────────────────────────────────▶   │   ├─ вызов команд 1С    │
+                                                            │   └─ GitBar (окно)      │
+                                                            └─────────────────────────┘
+```
+
+Все ответы payload — JSON одной строкой (UTF-8). Грамматика команд живёт
+в payload; CLI/GUI/агент только строят строку запроса и печатают ответ.
+
+## 2. Цели сборки
+
+| Цель | Артефакт | Где выполняется | Роль |
+|---|---|---|---|
+| `v8i_payload` | `v8i_payload.dll` | **внутри** 1С | Командный центр: реверс, хуки, сканы, GitBar, вызов команд дизайнера |
+| `v8inject` | `v8inject.exe` | снаружи | CLI: внедрение, сессии, автоматизация |
+| `v8inject-gui` | `v8inject-gui.exe` | снаружи | Оконный фронтенд: выбор процесса, инжект, командная строка, кнопки GitBar |
+| `v8inject-agent` | `v8inject-agent.exe` | снаружи | Трей-агент: следит за запуском 1С и внедряет payload автоматически |
+| `v8i_common` | `v8i_common.lib` | — | Общая статика: лог, PE-разбор, ITypeInfo, JSON-отчёт |
+| `v8i_hook_target` | `v8i_hook_target.exe` | снаружи | Одноразовый процесс-мишень для smoke-теста хуков |
+
+Требование разрядности: payload и хост должны совпадать по битности с целевым
+процессом (1С 8.3 — обычно x86, 1С 8.5 — x64). Агент и GUI сами выбирают
+payload нужной битности.
+
+## 3. Структура каталогов
+
+```
+include/v8inject/   публичные заголовки (протокол, API хоста, API payload)
+src/common/         модули, используемые обеими сторонами
+src/host/           внедрение и клиент разделяемой памяти (снаружи)
+src/payload/        DLL, работающая ВНУТРИ 1С
+src/cli/            консольный интерфейс
+src/gui/            оконный интерфейс
+src/agent/          трей-агент
+tests/              hook_target + hook_smoke.ps1
+tools/              recon-скрипты, генератор иконок, E2E-проверки
+third_party/capstone/  вендоренный Capstone 5 (только x86/x64, BSD-3)
+docs/               документация
+```
+
+## 4. Протокол разделяемой памяти
+
+**Имя блока** — `Local\v8inject.<pid>`, где `<pid>` — PID **payload-процесса**
+(`include/v8inject/protocol.h:40`). Имя строится самой payload, поэтому
+несколько хостов и несколько экземпляров 1С не конфликтуют, а аргументы через
+границу процессов не маршалятся.
+
+**Layout** (`#pragma pack(4)`, только POD — писатели могут быть разной
+разрядности):
+
+| Поле | Тип | Назначение |
+|---|---|---|
+| `ready` | `volatile LONG` | автомат состояний (ниже) |
+| `requestLen` / `responseLen` | `LONG` | длины полезных данных |
+| `seq` | `LONG` | номер запроса (инкремент хостом) |
+| `diag` | `LONG` | диагностический код последнего сбоя |
+| `logDir` | `wchar_t[MAX_PATH]` | каталог лога; хост пишет **до** старта payload |
+| `request` | `wchar_t[4096]` | команда (wide-строка) |
+| `response` | `char[512*1024]` | ответ (UTF-8 JSON) |
+
+**Автомат состояний** (`protocol.h:18-21`):
+
+```
+kStateIdle(0) ──хост: CAS 0→1──▶ kStateRequest(1)
+kStateRequest(1) ──payload: пишет ответ──▶ kStateResponse(2)
+kStateResponse(2) ──хост читает──▶ kStateIdle(0)   (и kStateExit(3) = выгрузка)
+```
+
+- Хост отправляет запрос через **CAS** `InterlockedCompareExchange(ready,
+  kStateRequest, kStateIdle)` — если payload ещё занят, это ошибка «BUSY», а не
+  гонка на полузаписанном буфере (`src/host/client.cpp:131`).
+- Ожидание ответа — поллинг по 15 мс. Таймауты: `Open`/`Call` — 15 с по
+  умолчанию; `find`/`xref`/`attach` — 120 с; `Close` — 5 с.
+- Первый ответ готовности **потребляется** — иначе следующая команда получила
+  бы «busy» (`client.cpp:54-116`).
+- `Close` шлёт `"exit"`, затем CAS → `kStateExit`; payload снимает все хуки и
+  завершает поток (`v8i_export.cpp:3608`).
+
+## 5. Внедрение DLL
+
+`src/host/injector.cpp` — два пути: `InjectLibrary` (только загрузить) и
+`StartPayloadThread` (загрузить + запустить `v8i_probe`). Шаги:
+
+1. `OpenProcess(PROCESS_CREATE_THREAD | QUERY_INFORMATION | VM_OPERATION |
+   VM_WRITE | VM_READ)`. Отказ → stage `kStageOpenProcess` (1).
+2. `VirtualAllocEx` + `WriteProcessMemory` — путь к DLL в целевом процессе.
+3. `CreateRemoteThread(LoadLibraryW, path)` — адрес `LoadLibraryW` берётся из
+   **своего** kernel32 (совпадает для процессов одной разрядности). Отказ →
+   stage `kStageLoadLibrary` (2).
+4. Реальная база модуля в цели — `EnumProcessModulesEx` + сравнение имён. Нужна,
+   потому что `GetExitCodeThread` несёт только 32 бита (на x64 HMODULE
+   обрезался бы).
+5. Локальная загрузка той же DLL и `GetProcAddress("v8i_probe")` (для x86 —
+   запасной декорированный `_v8i_probe@4`).
+6. Пересчёт адреса: `delta = targetBase − localBase`. Своя копия выгружается.
+7. `CreateRemoteThread(v8i_probe)` — без аргументов. Отказ → stage
+   `kStageCreateThread` (7).
+8. Проверка: ожидание 3 с; exit code `259 (STILL_ACTIVE)` = поток жив и
+   обслуживает сессию.
+
+Полный перечень стадий отказа — `include/v8inject/injector.h:15-24`; CLI/GUI
+печатают их при неудаче.
+
+Запуск 1С из хоста — команда `launch`: обычный `CreateProcessW` + немедленный
+инжект. `CREATE_SUSPENDED` + `QueueUserAPC(LoadLibraryW)` не используется:
+APC успевает выполниться до инициализации ntdll и даёт `0xC000001D`.
+
+## 6. Payload: жизненный цикл и экспорты
+
+Экспорты DLL:
+
+| Экспорт | Назначение |
+|---|---|
+| `v8i_probe` | точка входа; хост стартует её на remote thread (`v8i_export.cpp:3625`) |
+| `v8i_version` | версия API (=1) |
+| `V8iArmEarly` | ранняя установка WH_CBT (вызывается из DllMain) |
+| `V8iCbtProcExport` | CBT-колбэк (используется и хостом для глобального хука) |
+| `V8iGitBarDump` | выгрузка конфигурации (кнопка GitBar) |
+
+Для x86 stdcall-декорация компенсируется `src/payload/v8i_payload32.def`.
+
+Жизненный цикл: `v8i_probe` мапит `SharedIo` (имя — из своего PID), пишет
+`{"status":"loaded"}` и крутит цикл команд. Каждая команда выполняется под SEH
+(`Guarded` + POD-структура `PackedThunk`, `v8i_export.cpp:3323-3360`) — крах
+команды превращается в JSON-ошибку, а не в падение 1С.
+
+**DllMain** (`src/payload/dllmain.cpp`) при загрузке проверяет, что процесс —
+`1cv8.exe`/`1cv8c.exe`, и вызывает `V8iArmEarly` (WH_CBT для перехвата создания
+главного окна 1С). Логирование в DllMain запрещено — риск падения под loader
+lock.
+
+### Полный список команд payload
+
+Диспетчер — `RunPayload` (`v8i_export.cpp:3387-3605`).
+
+| Команда | Аргументы | Что делает |
+|---|---|---|
+| `version` | — | версия API и разрядность указателя |
+| `mods [filter] [--count N]` | — | список загруженных модулей (base/size/имя) |
+| `pe [module]` | имя модуля | PE-заголовок, секции, экспорты из памяти |
+| `imports <module> [filter]` | — | таблица импортов с IAT-RVA |
+| `exports <module> [filter]` | — | экспорты модуля из памяти |
+| `exports85 <module> [--count N]` | — | экспорты **с диска** (8.5 зануляет их в памяти) |
+| `disasm [addr] [--module m]` | — | линейное дизассемблирование (Capstone) |
+| `around <addr> [--count N]` | — | инструкции вокруг адреса с маркером |
+| `xref <addr\|imp> [--from --to] [--count]` | — | кросс-ссылки на адрес или импорт (через IAT) |
+| `peek <addr> [len]` | — | сырые байты + классификация первого qword |
+| `str <addr>` | — | чтение UTF-16 строки по адресу |
+| `find <pattern> [--module] [--wide] [--max]` | — | поиск строки/байт в памяти |
+| `findvalue <hex> [--count] [--module]` | — | все 4-байтные вхождения значения |
+| `memmap [--count N]` | — | карта committed-регионов ≥64 КБ по protection |
+| `heapobjects [--module] [--count]` | — | живые объекты кучи, группировка по RVA vtable |
+| `byhwnd <hwnd> [--offset 0x200]` | — | объект-владелец окна (скан назад до vtable) |
+| `objects` | — | перечисление окон процесса (класс/заголовок/userdata) |
+| `scan <module> <addr>` | — | разбор COM-интерфейса через ITypeInfo |
+| `hook <target> [--name t]` | `addr\|module!Export\|module+0xRVA` | установка inline-хука |
+| `hooks` | — | список установленных хуков |
+| `unhook <id\|all>` | — | снятие хука (восстановление байт) |
+| `trace [--count N] [--since N] [--clear]` | — | чтение кольцевого буфера вызовов |
+| `cmd <num> [sub]` | — | вызов команды дизайнера на **8.3** |
+| `cmd85 <num> [sub]` | — | то же на **8.5** (через ранний приёмник) |
+| `cmdinfo` | — | диагностика: как найти command receiver на данной платформе |
+| `frames` | — | что прислал `eventCreateFrame` + статистика CBT |
+| `gitbar [hide]` | — | показать/скрыть git-панель (см. [GITBAR.md](GITBAR.md)) |
+| `menu [filter]` / `menucmd <hwnd> <id>` | — | перечисление меню фрейма / вызов пункта |
+
+> CLI-хост форвардит не все команды: `cmd`, `menu`, `menucmd` и `str` доступны
+> только внутри сессии `attach` (см. [CLI.md](CLI.md) и находку A3 в
+> [AUDIT.md](AUDIT.md)).
+
+## 7. Движок inline-хуков
+
+`src/payload/hook.cpp` + ассемблерные thunk'и. Патч — 5-байтный `jmp rel32`
+на обеих архитектурах, поэтому блок хука выделяется **в пределах ±2 ГБ** от
+цели (`AllocNear`).
+
+Структура 256-байтного блока: `stub@0` — переход на thunk, `slot@32` — адрес
+thunk (для x86-достижимости), `trampoline@64` — копия перезаписанного пролога
++ переход назад.
+
+**Установка** (`HookInstall`, `hook.cpp:415`):
+
+1. Проверка цели: исполнимая committed-память.
+2. Декодирование пролога до 5 байт **целыми инструкциями** (Capstone,
+   `DecodeForCopy` в `disasm.cpp:218`).
+3. Отклоняются: `loop/jecxz/jrcxz` (нет rel32-формы), пролог, заканчивающийся
+   `ret` или переходом за пределы окна.
+4. Релокации: rip-relative дисплачи правятся на разницу адресов; ветки внутрь
+   окна переприсваиваются на копию в трамплине; `rel8` расширяется в `rel32`;
+   ветки наружу пересчитываются.
+5. Патч под `Suspender`: все прочие потоки замораживаются; отказ, если чей-то
+   IP внутри патчируемого диапазона. `VirtualProtect` + memcpy +
+   `FlushInstructionCache`.
+
+**Runtime**: перехваченная функция → stub → asm-thunk (`hook_thunk_x64.asm`,
+`hook_thunk_x86.asm`) → `V8iHookEnter(ctx, retAddr, entryRbp, args[4])`.
+Thunk сохраняет регистры, выравнивает стек (x64 — `sub rsp,90h` для movdqa-CRT),
+вызывает C-функцию записи и уходит в трамплин. SSE-аргументы сознательно не
+перехватываются.
+
+**Запись** — кольцевой буфер на 1024 слота с seqlock на слот (`TraceSlot`,
+`hook.cpp:69`): `seq` нечётный = идёт запись, чётный = слот готов. Запись
+содержит id хука, tid, тик, адрес возврата, первые 4 аргумента (rcx/rdx/r8/r9
+на x64, стек на x86) и цепочку возвратов по ebp/rbp до 24 кадров. Потеря
+записи допустима, останов хука — нет. Первые 3 попадания каждого хука
+дублируются в лог.
+
+**Чтение** — команда `trace` валидирует слоты по поколению
+`2*((idx/1024)+1)` и чётному seq.
+
+**Снятие** — восстановление оригинальных байт под Suspender'ом; блок с
+трамплином **не освобождается** (поток, уже находящийся в трамплине, иначе
+прыгнул бы в освобождённую память).
+
+Хуки живут столько же, сколько сессия: одноразовая команда `v8inject hook`
+снимает их при закрытии сессии, для наблюдения за живым процессом используется
+`attach`. `HookInstallFaultLogger` ставит vectored handler — падение внутри
+хукнутой функции пишет регистры и адрес исключения в `v8inject.log`.
+
+## 8. Сканирование памяти
+
+Все сканы — только для чтения, постранично через `ReadProcessMemory` с фильтром
+`VirtualQuery` (committed + читаемая защита, без `PAGE_GUARD`). Одна невалидная
+страница пропускается, не обрывает скан (`src/payload/memscan.cpp:95`).
+
+| Функция | Команда | Механика |
+|---|---|---|
+| `FindInMemory` | `find` | паттерн (UTF-8 или UTF-16LE) по readable-памяти; окна 1 МБ с перекрытием; 16 байт контекста; ограничение по модулю |
+| `FindDword` | `findvalue` | 4-байтовые вхождения в writable-памяти (локализация полей, например HWND) |
+| `FindHeapObjects` | `heapobjects` | объекты кучи по vtable модуля; эвристика — ≥3 из первых 4 слотов указывают внутрь модуля; группировка по RVA |
+| `FindObjectsByHwnd` | `byhwnd` | HWND без back-pointer: ищем слот, *значение* которого — хэндл, затем назад до ближайшего слота-указателя на vtable |
+| `MemMap` | `memmap` | сводка committed-регионов ≥64 КБ |
+
+## 9. Дизассемблер
+
+`src/payload/disasm.cpp` — обёртка над вендоренным Capstone (только x86/x64;
+собирается из `third_party/capstone`, BSD-3). По одному хэндлу на битность,
+Intel-синтаксис, detail ON.
+
+Ключевые функции: `Disassemble` (линейный проход, байты копируются в
+scratch-буфер, чтобы не словить fault на последней странице), `FindXrefsVerbose`
+(свип диапазона страницами 0x1000; хит = immediate или absolute displacement
+равен цели), `DecodeForCopy` (ответ на вопрос «можно ли скопировать эти байты
+в трамплин» — основа хуков), `FindFunctionPrologues` (грубый поиск начал функций
+по сигнатурам MSVC-прологов).
+
+## 10. Интеграция с 1С
+
+Это самый деликатный слой. Инварианты (нарушение = падение 1С, из
+[plan_inj_ext.md](plan_inj_ext.md) §1.5):
+
+1. **Вызовы ядра — только на UI-потоке 1С.** Механизм: временный subclass
+   главного окна + синхронное `WM_APP+0x602` (`EnsureCmdUi`, `V8iSubclass85`).
+2. **Каждая команда — под SEH**: крах → JSON-ошибка.
+3. **`__try` несовместим с C++-объектами в том же кадре** (MSVC C2712):
+   внутри — только POD.
+4. **Скан памяти — постранично.**
+5. **Экспорты читать с диска**: 8.5 зануляет export directory `core85.dll`
+   в памяти и маскирует PE-магию (`V8iResolveExportFromFile`).
+6. **Никаких хардкодов RVA без калибровки** — см. §10.1.
+
+### 10.1 Вызов команд дизайнера — 8.3 (`cmd`)
+
+Калиброванная цепочка на 8.3.27.1989 (`v8i_export.cpp:1044-1120`):
+
+```
+frame (куча) ── vtable = config.dll+0x2EFB50 (ITopLevelFrame)
+frame+8 ── coreMainFrame; ICommandReceiver = core − 0x20 (x64) / core − 0x10 (x86)
+recv->vtbl[3] ── transmitCommand(Command*, bool deactivate)   // x64, __fastcall
+recv->vtbl[0] ── transmitCommand                              // x86, __stdcall, ret 0xC
+```
+
+На x86 калибровка **runtime** (`DiscoverFrameVtblX86`): ищется объект, чья
+vtable лежит в `.rdata` `config.dll` со слотами в `.text`, и проверяется, что
+transmitCommand — настоящий метод (сигнатура пролога + `ret 8/0xC`), а не
+property-getter.
+
+Структура `Command` — 32 байта на x64: GUID группы Config
+`{F10CBB81-F679-11D4-9DD3-0050BAE2BC79}` + номер + param + object.
+
+> В [RECON-85.md](RECON-85.md) §3.3 размер `Command` указан как 40 байт
+> (CommandID с выравниванием 8); код использует 32-байтовую раскладку
+> (`v8i_export.cpp:1104-1110`). См. находку A8 в [AUDIT.md](AUDIT.md).
+
+Маршалинг на UI-поток: subclass окна `V8TopLevelFrame`/`V8Window0*`, сообщение
+`kV8iCmdMsg = WM_APP+0x2F11`, `SendMessageTimeoutW(SMTO_BLOCK, 30 c)`. WndProc
+перепроверяется перед каждой посылкой — 1С пересоздаёт свои окна.
+
+### 10.2 Вызов команд и подписка — 8.5 (`cmd85`, `frames`)
+
+8.5 существенно отличается; рабочая цепочка построена по образцу Снегопата
+(см. [RECON-85.md](RECON-85.md) §7):
+
+1. **Ранний WH_CBT.** Хук ставится до создания главного окна тремя путями:
+   из DllMain (`V8iArmEarly`), из `v8i_probe` до старта сессии, или глобально
+   из хоста (`v8inject hookcbt`: `SetWindowsHookExW(WH_CBT, proc, hMod=payload)`;
+   Windows сама загружает DLL в 1С при создании первого окна).
+2. CBT-колбэк (`V8iCbtProc`, всё под SEH) фильтрует процессы `1cv8*.exe`.
+   На 8.5 класс окна в CREATESTRUCT числовой («V8Window0.» там не виден),
+   поэтому берётся **первое** окно Конфигуратора, хук снимается и стартует
+   поток ранней подписки.
+3. **Подписка на `eventCreateFrame`** (`{3573FFE0-2FFF-11D5-BF5E-0050BAE2BC79}`)
+   идёт на UI-потоке через временный subclass: `core85!current_process` →
+   `getService` (слоты **14 и 15** vtable `SCOM_Process`) → `IEventService`
+   (`_subscribe` — слот 4). Событие приходит ~0.81 с после запуска —
+   подписываться надо быстро.
+4. Объект события **сам есть ITopLevelFrame** (vtable `config.dll+0x2ED3B0`
+   на 8.5.1.1529). **Receiver — слот 31, не 30** (вызов слота 30 даёт
+   `0xC0000005`); форвардер слота 31 читает `inner=[obj+8]`, приёмник лежит на
+   0x20 перед inner — та же геометрия, что `recv = core − 0x20` в 8.3.
+   `recv->vtbl[0] = transmitCommand`.
+5. Диагностика — команды `frames` (что прислал eventCreateFrame) и `cmdinfo`.
+
+Резервные пути: поток-наблюдатель `V8iStartupWatchThread`; inline-хук
+`CreateWindowExW` — **отключён** (трамплин крэшил 1С; для окон 1С он всё равно
+не вызывается — окна создаются через `win32u!NtUserCreateWindowEx`).
+
+Для 8.5 есть и файловый привод команд: поток `V8iCmd85PollThread` читает
+`%TEMP%\v8i_cmd85_req.txt` («num sub»), шлёт команду и дописывает
+`v8i_cmd85_res.txt` — канал для отладки sessionless-загрузки. Диагностические
+маркеры payload пишет в `%TEMP%\v8i_*.txt` (cbt_hit, cbt_classes, recip,
+cmdrecv, subscribe).
+
+### 10.3 Совместимость
+
+| Платформа | Архитектура | Цепочка команд | Статус |
+|---|---|---|---|
+| 8.3.27.1989 | x86 | `cmd`, калибровка runtime | рабочий |
+| 8.3.27.1989 | x64 | `cmd`, vtable `config.dll+0x2EFB50` | рабочий |
+| 8.5.1.1529 | x64 | `cmd85` через eventCreateFrame + слот 31 | в разработке |
+
+## 11. GitBar
+
+Git-панель внутри процесса 1С — 12 owner-draw кнопок (dump, init, commit,
+push, настройки, история, pull, fetch, branches, stash, tags, status),
+запуск git через пайпы с таймаутом 120 с, настройки в
+`%APPDATA%\v8inject\gitbar.ini`. Полное описание — [GITBAR.md](GITBAR.md).
+
+## 12. Агент
+
+`src/agent/agent.cpp` — обычный EXE в собственном процессе (в отличие от
+payload, который живёт в чужом). Сидит в трее, раз в 2 с опрашивает список
+процессов и внедряет payload в каждый новый `1cv8.exe`/`1cv8c.exe`/`1cv8s.exe`
+(один раз на PID, множества `g_injected`/`g_failed`). Может сразу показывать
+GitBar. Клиентский деструктор **не** выгружает payload — панель и хуки
+переживают закрытие сессии.
+
+- Настройки: `%APPDATA%\v8inject\agent.ini`, секция `[agent]` (имена процессов,
+  флаги gitbar/autostart).
+- Автозапуск: значение `v8inject-agent` в `HKCU\...\Run`.
+- Лог: `%APPDATA%\v8inject\agent.log`.
+- Один экземпляр — мьютекс `V8iAgentMutex`; флаг `--settings` открывает диалог
+  настроек при старте.
+
+## 13. Диагностика и логи
+
+| Что | Где |
+|---|---|
+| Лог хоста и payload | `v8inject.log` рядом с `v8inject.exe` (каталог передаётся payload'у через `SharedIo.logDir` до старта) |
+| Фолбэк-лог payload | `%TEMP%\v8inject_payload.log` |
+| Лог агента | `%APPDATA%\v8inject\agent.log` |
+| Сообщение коммита GitBar | `%TEMP%\v8i_commitmsg.txt` (UTF-8 без BOM) |
+| Файловый привод cmd85 | `%TEMP%\v8i_cmd85_req.txt` / `v8i_cmd85_res.txt` |
+| Маркеры ранней подписки | `%TEMP%\v8i_cbt_hit.txt`, `v8i_cbt_classes.txt`, `v8i_recip.txt`, `v8i_cmdrecv.txt`, `v8i_subscribe.txt` |
+
+Формат строки лога: `HH:MM:SS.mmm [pid … tid …] текст`, каждая строка — один
+`WriteFile` без CRT-буферизации (`src/common/diag.cpp`) — дёшево и
+«крэш-безопасно».
+
+## 14. Тесты и инструменты
+
+| Что | Как запускать | Покрывает |
+|---|---|---|
+| `ctest` (cli_help + hook_smoke) | `ctest --test-dir build/<arch> -C Release` | help, полный цикл хуков: 4 хука разных типов релокации → трасса → снятие |
+| `tests/hook_smoke.ps1 -BinDir <dir>` | напрямую | тот же сценарий руками |
+| `tools/check_gitbar.sh [8.3\|8.5]` | локально, нужна установленная 1С | E2E GitBar: запуск Конфигуратора → инжект → окно `V8iGitBar` живо |
+| `tools/recon_exports.py` | python + pefile | инвентарь экспортов 8.5/8.3 с диска |
+| `tools/recon_coreas_cbt.py`, `recon_snegopat_hooks.py` | python + capstone | дизасм Снегопата: как ставятся WH_CBT-хуки |
+| `tools/gen_icons.py` | python | конвейер иконок: PNG → premultiplied BGRA → `icons.h` |
+
+Тесты, требующие живой 1С (`check_gitbar.sh`), в CI не выполняются — только
+локально; CI гоняет сборку обеих разрядностей и ctest
+(`.github/workflows/build.yml`, runner `windows-2022`).
+
+## 15. Сборка
+
+Требуется Windows и Visual Studio 2022 (или Build Tools) с C++ workload.
+
+```bat
+cmake -S . -B build\x86 -G "Visual Studio 17 2022" -A Win32
+cmake --build build\x86 --config Release
+
+cmake -S . -B build\x64 -G "Visual Studio 17 2022" -A x64
+cmake --build build\x64 --config Release
+```
+
+Бинарные артефакты: `build\<arch>\bin\<arch>\`. Особенности сборки:
+
+- `/utf-8` обязателен — исходники содержат кириллические строки
+  (`CMakeLists.txt:11`); то же для `.rc` — `#pragma code_page(65001)`.
+- MASM thunk'и: x64 не имеет inline-asm; для x86 — `/safeseh` (иначе
+  LNK2026/LNK1281).
+- Capstone вендорится (сборка должна быть hermetic и offline), собирается
+  только x86-подмножество с `/W0`.
+- x86: `.def`-алиас `v8i_probe=_v8i_probe@4`, потому что stdcall-декорация
+  прячет экспорт от `GetProcAddress`.
