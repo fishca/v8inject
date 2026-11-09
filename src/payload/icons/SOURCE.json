@@ -1,4 +1,5 @@
 {
+ "note": "PNG bytes are stored verbatim at off. mngcore/core83_root.res entries are from 8.3.27.1989; core85/moxel/backend_root.res entries are from 8.5.1.1529 (offsets are the same in 8.5.1.960/1236/1529).",
  "dump": {
   "res": "core83_root.res",
   "off": 146315,
@@ -23,5 +24,40 @@
   "res": "mngcore_root.res",
   "off": 2050734,
   "name": "GroupService.png"
+ },
+ "log": {
+  "res": "mngcore_root.res",
+  "off": 491871,
+  "name": "ChangeHistory.png"
+ },
+ "pull": {
+  "res": "core85_root.res",
+  "off": 257889,
+  "name": "_arrowDown.png"
+ },
+ "fetch": {
+  "res": "core85_root.res",
+  "off": 363765,
+  "name": "_arrowRound.png"
+ },
+ "branches": {
+  "res": "moxel_root.res",
+  "off": 157979,
+  "name": "_dendrogram.png"
+ },
+ "stash": {
+  "res": "mngcore_root.res",
+  "off": 3164530,
+  "name": "_paperDoubleCopy.png"
+ },
+ "tags": {
+  "res": "core83_root.res",
+  "off": 70352,
+  "name": "AddToFavorites.png"
+ },
+ "status": {
+  "res": "backend_root.res",
+  "off": 21462675,
+  "name": "_documentCheck.png"
  }
 }

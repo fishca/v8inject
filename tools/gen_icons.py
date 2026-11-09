@@ -25,6 +25,13 @@ ROLES = [
     ("commit", "kIconCommit"),
     ("push", "kIconPush"),
     ("settings", "kIconSettings"),
+    ("log", "kIconLog"),
+    ("pull", "kIconPull"),
+    ("fetch", "kIconFetch"),
+    ("branches", "kIconBranches"),
+    ("stash", "kIconStash"),
+    ("tags", "kIconTags"),
+    ("status", "kIconStatus"),
 ]
 
 

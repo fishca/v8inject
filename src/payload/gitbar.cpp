@@ -245,6 +245,7 @@ const int kWinIdDump = 1, kWinIdInit = 2, kWinIdCommit = 3,
 struct GitBar {
     HWND hwnd = nullptr;
     HWND tooltip = nullptr;
+    HWND statusTip = nullptr;   // separate tracking tip for action feedback
     int hover = 0;          // cell index under the cursor (1..kCells), 0 = none
     bool pressed = false;
     bool dragging = false;
@@ -270,9 +271,9 @@ int IdFromPoint(POINT pt) {
     return 0;
 }
 
-// The five glyphs are 1C's own toolbar pictures, baked to premultiplied BGRA
-// by tools/gen_icons.py: hand-drawn GDI shapes never matched the platform's
-// look, and these do because they come from the same resource bundles.
+// Every glyph is a 1C toolbar picture, baked to premultiplied BGRA by
+// tools/gen_icons.py: hand-drawn GDI shapes never matched the platform's look,
+// and these do because they come from the same resource bundles.
 const unsigned char* IconFor(int id) {
     switch (id) {
     case kWinIdDump: return icons::kIconDump;
@@ -280,6 +281,13 @@ const unsigned char* IconFor(int id) {
     case kWinIdCommit: return icons::kIconCommit;
     case kWinIdPush: return icons::kIconPush;
     case kWinIdSettings: return icons::kIconSettings;
+    case kWinIdLog: return icons::kIconLog;
+    case kWinIdPull: return icons::kIconPull;
+    case kWinIdFetch: return icons::kIconFetch;
+    case kWinIdBranches: return icons::kIconBranches;
+    case kWinIdStash: return icons::kIconStash;
+    case kWinIdTags: return icons::kIconTags;
+    case kWinIdStatus: return icons::kIconStatus;
     }
     return nullptr;
 }
@@ -342,96 +350,8 @@ void Paint(HWND hwnd) {
             Rectangle(dc, cell.left, cell.top, cell.right, cell.bottom);
             DeleteObject(pen);
         }
-        if (id == kWinIdLog) {
-            // Hand-drawn "log" glyph (three text lines with a leading dot):
-            // there is no suitable picture among the baked 1C icons.
-            int gx = x + 4, gy = 5;
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(96, 96, 96));
-            HPEN op = (HPEN)SelectObject(dc, pen);
-            for (int k = 0; k < 3; ++k) {
-                int yy = gy + k * 5;
-                MoveToEx(dc, gx, yy, nullptr);
-                LineTo(dc, gx + 3, yy);
-                MoveToEx(dc, gx + 5, yy, nullptr);
-                LineTo(dc, gx + 15, yy);
-            }
-            SelectObject(dc, op);
-            DeleteObject(pen);
-        } else if (id == kWinIdPull || id == kWinIdFetch) {
-            // down arrow (fetch: two of them)
-            HPEN pen = CreatePen(PS_SOLID, 2, RGB(50, 110, 50));
-            HPEN op = (HPEN)SelectObject(dc, pen);
-            int ax = x + 8;
-            for (int k = 0; k < (id == kWinIdFetch ? 2 : 1); ++k) {
-                int gx = ax + k * 6, gy = 4;
-                MoveToEx(dc, gx, gy, nullptr);
-                LineTo(dc, gx, gy + 13);
-                MoveToEx(dc, gx - 3, gy + 9, nullptr);
-                LineTo(dc, gx, gy + 13);
-                MoveToEx(dc, gx + 3, gy + 9, nullptr);
-                LineTo(dc, gx, gy + 13);
-            }
-            SelectObject(dc, op);
-            DeleteObject(pen);
-        } else if (id == kWinIdBranches) {
-            // fork: trunk with a branch leaving it
-            HPEN pen = CreatePen(PS_SOLID, 2, RGB(70, 90, 160));
-            HPEN op = (HPEN)SelectObject(dc, pen);
-            MoveToEx(dc, x + 7, 3, nullptr);
-            LineTo(dc, x + 7, 17);
-            MoveToEx(dc, x + 7, 8, nullptr);
-            LineTo(dc, x + 15, 4);
-            MoveToEx(dc, x + 15, 4, nullptr);
-            LineTo(dc, x + 15, 10);
-            SelectObject(dc, op);
-            DeleteObject(pen);
-        } else if (id == kWinIdStash) {
-            // box with a lid
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 100, 60));
-            HBRUSH br = CreateSolidBrush(RGB(232, 214, 168));
-            HPEN op = (HPEN)SelectObject(dc, pen);
-            HBRUSH ob = (HBRUSH)SelectObject(dc, br);
-            Rectangle(dc, x + 4, 7, x + 18, 17);
-            SelectObject(dc, ob);
-            SelectObject(dc, op);
-            DeleteObject(br);
-            DeleteObject(pen);
-            HPEN lp = CreatePen(PS_SOLID, 1, RGB(120, 100, 60));
-            HPEN olp = (HPEN)SelectObject(dc, lp);
-            MoveToEx(dc, x + 4, 11, nullptr);
-            LineTo(dc, x + 18, 11);
-            SelectObject(dc, olp);
-            DeleteObject(lp);
-        } else if (id == kWinIdTags) {
-            // tag: diamond
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(150, 90, 40));
-            HBRUSH br = CreateSolidBrush(RGB(238, 200, 140));
-            HPEN op = (HPEN)SelectObject(dc, pen);
-            HBRUSH ob = (HBRUSH)SelectObject(dc, br);
-            POINT pts[4] = { { x + 11, 3 }, { x + 18, 10 }, { x + 11, 18 }, { x + 4, 10 } };
-            Polygon(dc, pts, 4);
-            SelectObject(dc, ob);
-            SelectObject(dc, op);
-            DeleteObject(br);
-            DeleteObject(pen);
-        } else if (id == kWinIdStatus) {
-            // working copy: three lines with a check mark
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(96, 96, 96));
-            HPEN op = (HPEN)SelectObject(dc, pen);
-            for (int k = 0; k < 3; ++k) {
-                int yy = 6 + k * 5;
-                MoveToEx(dc, x + 4, yy, nullptr);
-                LineTo(dc, x + 13, yy);
-            }
-            MoveToEx(dc, x + 14, 15, nullptr);
-            LineTo(dc, x + 16, 18);
-            LineTo(dc, x + 21, 11);
-            SelectObject(dc, op);
-            DeleteObject(pen);
-        } else {
-            DrawIcon(dc, IconFor(id), x + (kCell - icons::kSize) / 2,
-                     (kBarH - icons::kSize) / 2);
-        }
+        DrawIcon(dc, IconFor(id), x + (kCell - icons::kSize) / 2,
+                 (kBarH - icons::kSize) / 2);
     }
     EndPaint(hwnd, &ps);
 }
@@ -482,14 +402,32 @@ void Reposition(bool forceDock) {
                  SWP_NOSIZE | SWP_NOACTIVATE | (g_topLevelDwm ? 0 : SWP_SHOWWINDOW));
 }
 
-void ShowTip(const std::wstring& text) {
-    if (!g_bar.tooltip || !g_bar.hwnd) return;
-    TOOLINFOW ti{ sizeof(ti), TTF_IDISHWND };
+// The per-button tools are TTF_SUBCLASS and must stay silent unless hovered, so
+// action feedback uses its own tracking tool: it is placed under the bar and
+// switched off by timer 2.
+const UINT_PTR kStatusTipId = 100;
+
+void HideStatusTip() {
+    if (!g_bar.statusTip || !g_bar.hwnd) return;
+    TOOLINFOW ti{ sizeof(ti), TTF_TRACK };
     ti.hwnd = g_bar.hwnd;
-    ti.uId = (UINT_PTR)g_bar.hwnd;
+    ti.uId = kStatusTipId;
+    SendMessageW(g_bar.statusTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+}
+
+void ShowTip(const std::wstring& text) {
+    if (!g_bar.statusTip || !g_bar.hwnd) return;
+    TOOLINFOW ti{ sizeof(ti), TTF_TRACK };
+    ti.hwnd = g_bar.hwnd;
+    ti.uId = kStatusTipId;
     ti.lpszText = (LPWSTR)text.c_str();
-    SendMessageW(g_bar.tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
-    SendMessageW(g_bar.tooltip, TTM_POPUP, 0, 0);
+    SendMessageW(g_bar.statusTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    POINT pt{ 0, kBarH + 2 };
+    ClientToScreen(g_bar.hwnd, &pt);
+    SendMessageW(g_bar.statusTip, TTM_TRACKPOSITION, 0, MAKELPARAM(pt.x, pt.y));
+    SendMessageW(g_bar.statusTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+    KillTimer(g_bar.hwnd, 2);
+    SetTimer(g_bar.hwnd, 2, 3000, nullptr);
     LogGit(L"tip", text);
 }
 
@@ -1956,9 +1894,23 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TIMER:
         if (wp == 1) Reposition(false);
+        else if (wp == 2) {
+            KillTimer(hwnd, 2);
+            HideStatusTip();
+        }
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, 1);
+        KillTimer(hwnd, 2);
+        if (g_bar.statusTip) {
+            DestroyWindow(g_bar.statusTip);
+            g_bar.statusTip = nullptr;
+        }
+        if (g_bar.tooltip) {
+            DestroyWindow(g_bar.tooltip);
+            g_bar.tooltip = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -2007,6 +1959,7 @@ DWORD WINAPI BarThread(LPVOID) {
                                     WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                     CW_USEDEFAULT, CW_USEDEFAULT, 0, 0,
                                     g_bar.hwnd, nullptr, hInst, nullptr);
+    // Indexed by cell id - 1, so the table must stay aligned with the ids.
     const wchar_t* texts[kCells] = {
         L"Выгрузить исходники: конфигурация в файлы (команда 45)",
         L"git init в папке выгрузки (+ origin из настроек)",
@@ -2014,23 +1967,38 @@ DWORD WINAPI BarThread(LPVOID) {
         L"Пуш в удалённый репозиторий",
         L"Настройки: git.exe, папка выгрузки, комментарий, remote",
         L"История коммитов (git log --graph)",
+        L"Забрать изменения из удалённого репозитория (git pull)",
+        L"Получить изменения без слияния (git fetch --all --prune)",
+        L"Ветки: переключить или удалить (git branch -a)",
+        L"Отложенные изменения: применить или удалить (git stash list)",
+        L"Теги: удалить или отправить в origin (git tag -n1)",
+        L"Рабочая копия: индексировать, снять, коммит (git status)",
     };
-    for (int i = 0; i < kCells; ++i) {
-        TOOLINFOW ti{ sizeof(ti), TTF_SUBCLASS };
-        ti.hwnd = g_bar.hwnd;
-        ti.uId = (UINT_PTR)(i + 1);
-        int x = CellX(i + 1);
-        ti.rect = { x, 1, x + kCell, kBarH - 1 };
-        ti.lpszText = (LPWSTR)texts[i];
-        SendMessageW(g_bar.tooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    if (g_bar.tooltip) {
+        SendMessageW(g_bar.tooltip, TTM_SETMAXTIPWIDTH, 0, 360);
+        for (int i = 0; i < kCells; ++i) {
+            TOOLINFOW ti{ sizeof(ti), TTF_SUBCLASS };
+            ti.hwnd = g_bar.hwnd;
+            ti.uId = (UINT_PTR)(i + 1);
+            int x = CellX(i + 1);
+            ti.rect = { x, 1, x + kCell, kBarH - 1 };
+            ti.lpszText = (LPWSTR)texts[i];
+            SendMessageW(g_bar.tooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
     }
-    {  // status tool: the whole bar, shown programmatically by ShowTip()
-        TOOLINFOW ti{ sizeof(ti), TTF_SUBCLASS };
+    // Action feedback lives in its own tracking tool (see ShowTip): a subclass
+    // tool spanning the whole bar would mask the per-cell tools.
+    g_bar.statusTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                      WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                      CW_USEDEFAULT, CW_USEDEFAULT, 0, 0,
+                                      g_bar.hwnd, nullptr, hInst, nullptr);
+    if (g_bar.statusTip) {
+        TOOLINFOW ti{ sizeof(ti), TTF_TRACK };
         ti.hwnd = g_bar.hwnd;
-        ti.uId = 100;
-        ti.rect = { 0, 0, kBarW, kBarH };
+        ti.uId = kStatusTipId;
         ti.lpszText = (LPWSTR)L"";
-        SendMessageW(g_bar.tooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        SendMessageW(g_bar.statusTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        SendMessageW(g_bar.statusTip, TTM_SETMAXTIPWIDTH, 0, 480);
     }
 
     GetClientRect(frame, &g_bar.lastFrame);
@@ -2044,6 +2012,7 @@ DWORD WINAPI BarThread(LPVOID) {
     }
     g_bar.hwnd = nullptr;
     g_bar.tooltip = nullptr;
+    g_bar.statusTip = nullptr;
     return 0;
 }
 
