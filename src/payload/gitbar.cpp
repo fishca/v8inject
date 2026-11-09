@@ -431,6 +431,112 @@ void ShowTip(const std::wstring& text) {
     LogGit(L"tip", text);
 }
 
+// ---------------------------------------------------------------------------
+// Shared 1C-style window theme: cream dialog face, 1px #B0A68E frames, white
+// fields and a flat blue list selection — the palette measured from a live
+// designer and already used by the settings and history windows.
+// ---------------------------------------------------------------------------
+
+const COLORREF kDlgBg      = RGB(245, 242, 221);
+const COLORREF kDlgBorder  = RGB(176, 166, 142);
+const COLORREF kDlgFieldBg = RGB(255, 255, 255);
+const COLORREF kDlgHover   = RGB(252, 246, 199);
+const COLORREF kDlgPress   = RGB(226, 216, 178);
+const COLORREF kDlgText    = RGB(0, 0, 0);
+const COLORREF kDlgSel     = RGB(49, 106, 197);
+const COLORREF kDlgSelIdle = RGB(212, 208, 200);
+
+HFONT CreateDlgFont() {
+    HDC dc = GetDC(nullptr);
+    int h = -MulDiv(8, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    ReleaseDC(nullptr, dc);
+    return CreateFontW(h, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Tahoma");
+}
+
+HBRUSH UiBgBrush() {
+    static HBRUSH b = CreateSolidBrush(kDlgBg);
+    return b;
+}
+
+HBRUSH UiFieldBrush() {
+    static HBRUSH b = CreateSolidBrush(kDlgFieldBg);
+    return b;
+}
+
+void UiFrame(HDC dc, const RECT& rc, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
+void UiDrawButton(HDC dc, const RECT& rc, const wchar_t* text, HFONT font,
+                  bool hover, bool press) {
+    HBRUSH face = CreateSolidBrush(press ? kDlgPress : hover ? kDlgHover : kDlgBg);
+    FillRect(dc, &rc, face);
+    DeleteObject(face);
+    UiFrame(dc, rc, kDlgBorder);
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    int oldMode = SetBkMode(dc, TRANSPARENT);
+    COLORREF oldColor = SetTextColor(dc, kDlgText);
+    RECT tr = rc;
+    DrawTextW(dc, text, -1, &tr,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SetTextColor(dc, oldColor);
+    SetBkMode(dc, oldMode);
+    SelectObject(dc, oldFont);
+}
+
+// Ownerdraw buttons would otherwise stay flat grey: the subclass only tracks
+// hover (the press state arrives as ODS_SELECTED) and redraws on change.
+const wchar_t* kBtnOldProc = L"v8i.oldBtnProc";
+
+LRESULT CALLBACK ThemedButtonProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    WNDPROC old = (WNDPROC)GetPropW(h, kBtnOldProc);
+    switch (msg) {
+    case WM_MOUSEMOVE:
+        if (!GetWindowLongPtrW(h, GWLP_USERDATA)) {
+            SetWindowLongPtrW(h, GWLP_USERDATA, 1);
+            TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+        InvalidateRect(h, nullptr, FALSE);
+        break;
+    }
+    return CallWindowProcW(old, h, msg, wp, lp);
+}
+
+void ThemedButton(HWND btn, HFONT font) {
+    if (!btn) return;
+    WNDPROC old = (WNDPROC)SetWindowLongPtrW(btn, GWLP_WNDPROC, (LONG_PTR)ThemedButtonProc);
+    SetPropW(btn, kBtnOldProc, (HANDLE)old);
+    SendMessageW(btn, WM_SETFONT, (WPARAM)font, TRUE);
+}
+
+bool UiDrawOwnerButton(const DRAWITEMSTRUCT* dis, HFONT font) {
+    if (!dis || dis->CtlType != ODT_BUTTON) return false;
+    wchar_t text[256] = {};
+    GetWindowTextW(dis->hwndItem, text, 256);
+    bool press = (dis->itemState & ODS_SELECTED) != 0;
+    bool hover = GetWindowLongPtrW(dis->hwndItem, GWLP_USERDATA) != 0;
+    UiDrawButton(dis->hDC, dis->rcItem, text, font, hover, press);
+    if (dis->itemState & ODS_FOCUS) {
+        RECT fr = dis->rcItem;
+        InflateRect(&fr, -3, -3);
+        DrawFocusRect(dis->hDC, &fr);
+    }
+    return true;
+}
+
 // One-field modal prompt (commit message). WS_VISIBLE is not decoration: a
 // top-level window created without it is never shown, and the modal loop below
 // would then wait on an invisible dialog.
@@ -441,12 +547,44 @@ void ShowTip(const std::wstring& text) {
 struct PromptCtx {
     std::wstring* out = nullptr;
     HWND ed = nullptr;
+    HFONT font = nullptr;
     bool accepted = false;
 };
 
 LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     PromptCtx* c = (PromptCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
     switch (msg) {
+    case WM_CTLCOLORDLG:
+        return (LRESULT)UiBgBrush();
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, kDlgText);
+        return (LRESULT)UiBgBrush();
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, kDlgFieldBg);
+        SetTextColor(dc, kDlgText);
+        return (LRESULT)UiFieldBrush();
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, UiBgBrush());
+        // the edit sits 1px inside this frame and erases its own interior
+        RECT field = { 12, 34, 442, 58 };
+        UiFrame(dc, field, kDlgBorder);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_DRAWITEM:
+        if (c && UiDrawOwnerButton((const DRAWITEMSTRUCT*)lp, c->font)) return TRUE;
+        break;
+    case DM_GETDEFID:   // IsDialogMessageW turns Enter into this button
+        return MAKELRESULT(IDOK, DC_HASDEFID);
     case WM_COMMAND:
         if (c && LOWORD(wp) == IDOK) {
             wchar_t b[1024] = {};
@@ -475,23 +613,36 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
 
     PromptCtx ctx;
     ctx.out = out;
+    ctx.font = CreateDlgFont();
     SetWindowLongPtrW(dlg, GWLP_WNDPROC, (LONG_PTR)PromptDlgProc);
     SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
 
-    CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                    12, 12, 430, 18, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
-    HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+    HWND label1 = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                  12, 12, 430, 18, dlg, nullptr,
+                                  GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(label1, WM_SETFONT, (WPARAM)ctx.font, TRUE);
+    // borderless: PromptDlgProc paints the 1C field frame around it
+    HWND ed = CreateWindowExW(0, L"EDIT", L"",
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                              12, 34, 430, 24, dlg, (HMENU)1001,
+                              13, 35, 428, 22, dlg, (HMENU)1001,
                               GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(ed, WM_SETFONT, (WPARAM)ctx.font, TRUE);
+    SendMessageW(ed, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELPARAM(2, 2));
     ctx.ed = ed;
     SetWindowTextW(ed, initial.c_str());
     SendMessageW(ed, EM_SETSEL, 0, -1);
-    CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                    252, 72, 90, 26, dlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleW(nullptr), nullptr);
-    CreateWindowExW(0, L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    352, 72, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL,
-                    GetModuleHandleW(nullptr), nullptr);
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
+                              WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                              BS_DEFPUSHBUTTON | BS_OWNERDRAW,
+                              252, 72, 90, 26, dlg, (HMENU)(INT_PTR)IDOK,
+                              GetModuleHandleW(nullptr), nullptr);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Отмена",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                  352, 72, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL,
+                                  GetModuleHandleW(nullptr), nullptr);
+    ThemedButton(ok, ctx.font);
+    ThemedButton(cancel, ctx.font);
 
     SetForegroundWindow(dlg);
     SetFocus(ed);
@@ -507,6 +658,7 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
         DispatchMessageW(&msg);
     }
     if (IsWindow(dlg)) DestroyWindow(dlg);
+    if (ctx.font) DeleteObject(ctx.font);
     Reposition(true);
     return ctx.accepted;
 }
@@ -620,14 +772,6 @@ void RunPush() {
 
 namespace {
 
-const COLORREF kDlgBg      = RGB(245, 242, 221);   // 1C window cream (measured
-                                                   // from a live designer: #F5F2DD)
-const COLORREF kDlgBorder  = RGB(176, 166, 142);
-const COLORREF kDlgFieldBg = RGB(255, 255, 255);
-const COLORREF kDlgHover   = RGB(250, 244, 214);
-const COLORREF kDlgPress   = RGB(226, 216, 178);
-const COLORREF kDlgText    = RGB(0, 0, 0);
-
 const wchar_t* kFieldLabels[4] = { L"git.exe", L"папка выгрузки",
                                    L"комментарий к коммиту", L"remote origin (не обяз.)" };
 const wchar_t* kFieldIni[4]    = { L"gitpath", L"dumpdir", L"commitmsg", L"remote" };
@@ -664,15 +808,6 @@ struct SettingsCtx {
     HFONT  font = nullptr;
     bool   trackedLeave = false;
 };
-
-HFONT CreateDlgFont() {
-    HDC dc = GetDC(nullptr);
-    int h = -MulDiv(8, GetDeviceCaps(dc, LOGPIXELSY), 72);
-    ReleaseDC(nullptr, dc);
-    return CreateFontW(h, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Tahoma");
-}
 
 void SettingsLayout(HWND h, SettingsCtx* c) {
     RECT rc;
@@ -789,37 +924,12 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // buttons
         for (int b = 0; b < 2; ++b) {
             RECT& br = b ? c->cancelRect : c->okRect;
-            HBRUSH bf = CreateSolidBrush(c->pressBtn == b ? kDlgPress
-                                       : c->hoverBtn == b ? kDlgHover : kDlgBg);
-            FillRect(dc, &br, bf);
-            DeleteObject(bf);
-            HPEN bp = CreatePen(PS_SOLID, 1, kDlgBorder);
-            HPEN obp = (HPEN)SelectObject(dc, bp);
-            HBRUSH obr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-            Rectangle(dc, br.left, br.top, br.right, br.bottom);
-            SelectObject(dc, obr);
-            SelectObject(dc, obp);
-            DeleteObject(bp);
-            DrawTextW(dc, b ? L"Отмена" : L"OK", -1, &br,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            UiDrawButton(dc, br, b ? L"Отмена" : L"OK", c->font,
+                         c->hoverBtn == b, c->pressBtn == b);
         }
         // "..." opens the shell folder picker for the dumpdir row
-        {
-            RECT& br = c->browseRect;
-            HBRUSH bf = CreateSolidBrush(c->pressBtn == 2 ? kDlgPress
-                                       : c->hoverBtn == 2 ? kDlgHover : kDlgBg);
-            FillRect(dc, &br, bf);
-            DeleteObject(bf);
-            HPEN bp = CreatePen(PS_SOLID, 1, kDlgBorder);
-            HPEN obp = (HPEN)SelectObject(dc, bp);
-            HBRUSH obr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-            Rectangle(dc, br.left, br.top, br.right, br.bottom);
-            SelectObject(dc, obr);
-            SelectObject(dc, obp);
-            DeleteObject(bp);
-            DrawTextW(dc, L"...", -1, &br,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        }
+        UiDrawButton(dc, c->browseRect, L"...", c->font,
+                     c->hoverBtn == 2, c->pressBtn == 2);
         SelectObject(dc, oldFont);
         ShowCaret(h);
         EndPaint(h, &ps);
@@ -1585,12 +1695,33 @@ void RunFetch() {
 struct ListDlg {
     HWND h = nullptr;
     HWND list = nullptr;
+    HWND closeBtn = nullptr;
+    RECT listFrame{};             // 1px 1C frame painted around the list
+    HFONT font = nullptr;
     std::wstring dir;
     int kind = 0;                 // 0=status 1=branches 2=stash 3=tags
     std::vector<std::wstring> items;
     int btnIds[5] = {};
     int btnCount = 0;
 };
+
+static void ListDlgLayout(ListDlg* d) {
+    if (!d || !d->h) return;
+    RECT rc{};
+    GetClientRect(d->h, &rc);
+    const int pad = 8, bh = 26;
+    int by = rc.bottom - pad - bh;
+    SetRect(&d->listFrame, pad, pad, rc.right - pad, by - pad);
+    MoveWindow(d->list, pad + 1, pad + 1, rc.right - 2 * pad - 2,
+               by - 2 * pad - 2, TRUE);
+    int bx = pad;
+    for (int i = 0; i < d->btnCount; ++i) {
+        MoveWindow(GetDlgItem(d->h, d->btnIds[i]), bx, by, 110, bh, TRUE);
+        bx += 116;
+    }
+    if (d->closeBtn)
+        MoveWindow(d->closeBtn, rc.right - pad - 110, by, 110, bh, TRUE);
+}
 
 static void SplitLines(const std::wstring& s, std::vector<std::wstring>& out) {
     out.clear();
@@ -1680,6 +1811,28 @@ static void ListDlgAct(ListDlg* d, int btn) {
     Reposition(false);
 }
 
+static void ListDlgDrawItem(const DRAWITEMSTRUCT* dis, HFONT font) {
+    bool sel = (dis->itemState & ODS_SELECTED) != 0;
+    bool focus = GetFocus() == dis->hwndItem;
+    COLORREF face = sel ? (focus ? kDlgSel : kDlgSelIdle) : kDlgFieldBg;
+    HBRUSH b = CreateSolidBrush(face);
+    FillRect(dis->hDC, &dis->rcItem, b);
+    DeleteObject(b);
+    if (dis->itemID == (UINT)-1) return;   // just the empty tail of the list
+
+    wchar_t text[1024] = {};
+    SendMessageW(dis->hwndItem, LB_GETTEXT, dis->itemID, (LPARAM)text);
+    RECT row = dis->rcItem;
+    row.left += 4;
+    HGDIOBJ oldFont = SelectObject(dis->hDC, font);
+    int oldMode = SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, sel && focus ? RGB(255, 255, 255) : kDlgText);
+    DrawTextW(dis->hDC, text, -1, &row,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetBkMode(dis->hDC, oldMode);
+    SelectObject(dis->hDC, oldFont);
+}
+
 static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     ListDlg* d = (ListDlg*)GetWindowLongPtrW(h, GWLP_USERDATA);
     switch (msg) {
@@ -1702,16 +1855,37 @@ static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case WM_CTLCOLORLISTBOX:
+        SetBkColor((HDC)wp, kDlgFieldBg);
+        return (LRESULT)UiFieldBrush();
+    case WM_PAINT: {
+        if (!d) break;
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        UiFrame(dc, d->listFrame, kDlgBorder);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        if (!d) break;
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
+        if (dis->CtlType == ODT_BUTTON && UiDrawOwnerButton(dis, d->font))
+            return TRUE;
+        if (dis->CtlType == ODT_LISTBOX) {
+            ListDlgDrawItem(dis, d->font);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* mm = (MINMAXINFO*)lp;
+        mm->ptMinTrackSize.x = 740;
+        mm->ptMinTrackSize.y = 220;
+        return 0;
+    }
     case WM_SIZE: {
         if (!d) break;
-        RECT rc{};
-        GetClientRect(h, &rc);
-        MoveWindow(d->list, 8, 8, rc.right - 16, rc.bottom - 48, TRUE);
-        int bx = 8;
-        for (int i = 0; i < d->btnCount; ++i) {
-            MoveWindow(GetDlgItem(h, d->btnIds[i]), bx, rc.bottom - 34, 110, 26, TRUE);
-            bx += 116;
-        }
+        ListDlgLayout(d);
         return 0;
     }
     case WM_CLOSE:
@@ -1739,7 +1913,7 @@ void ShowList(int kind) {
         wc.lpfnWndProc = ListDlgProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = UiBgBrush();
         wc.lpszClassName = L"V8iGitList";
         if (!RegisterClassW(&wc)) return;
         cls = true;
@@ -1751,17 +1925,25 @@ void ShowList(int kind) {
     ListDlg* d = new ListDlg();
     d->dir = dir;
     d->kind = kind;
+    d->font = CreateDlgFont();
     HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitList", title,
                              WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
                              CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
                              g_bar.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!h) { delete d; return; }
+    if (!h) { DeleteObject(d->font); delete d; return; }
     d->h = h;
     SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)d);
-    d->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-                              WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
-                              8, 8, 740, 420, h, nullptr, GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(d->list, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    d->list = CreateWindowExW(0, L"LISTBOX", L"",
+                              WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                              LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                              0, 0, 0, 0, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(d->list, WM_SETFONT, (WPARAM)d->font, TRUE);
+    {
+        HDC dc = GetDC(h);
+        int rowH = MulDiv(17, GetDeviceCaps(dc, LOGPIXELSY), 96);
+        ReleaseDC(h, dc);
+        SendMessageW(d->list, LB_SETITEMHEIGHT, 0, rowH);
+    }
 
     struct { const wchar_t* text; } defs[5] = {};
     if (kind == 0) {
@@ -1780,16 +1962,21 @@ void ShowList(int kind) {
     }
     for (int i = 0; i < d->btnCount; ++i) {
         d->btnIds[i] = 901 + i;
-        CreateWindowExW(0, L"BUTTON", defs[i].text,
-                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        8 + i * 116, 430, 110, 26, h, (HMENU)(INT_PTR)(901 + i),
-                        GetModuleHandleW(nullptr), nullptr);
+        HWND btn = CreateWindowExW(0, L"BUTTON", defs[i].text,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                   0, 0, 110, 26, h, (HMENU)(INT_PTR)(901 + i),
+                                   GetModuleHandleW(nullptr), nullptr);
+        ThemedButton(btn, d->font);
     }
-    CreateWindowExW(0, L"BUTTON", L"Закрыть", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    8 + d->btnCount * 116, 430, 110, 26, h,
-                    (HMENU)(INT_PTR)900, GetModuleHandleW(nullptr), nullptr);
+    d->closeBtn = CreateWindowExW(0, L"BUTTON", L"Закрыть",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                  0, 0, 110, 26, h, (HMENU)(INT_PTR)900,
+                                  GetModuleHandleW(nullptr), nullptr);
+    ThemedButton(d->closeBtn, d->font);
+    ListDlgLayout(d);
     ListDlgFill(d);
     SetForegroundWindow(h);
+    SetFocus(d->list);
 
     MSG msg;
     while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0)) {
@@ -1797,6 +1984,7 @@ void ShowList(int kind) {
         DispatchMessageW(&msg);
     }
     if (IsWindow(h)) DestroyWindow(h);
+    if (d->font) DeleteObject(d->font);
     delete d;
     Reposition(false);
 }
