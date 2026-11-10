@@ -48,6 +48,258 @@ v8i::Client g_client;
 uint32_t g_targetPid = 0;
 std::wstring g_targetName;
 
+// ---------------------------------------------------------------------------
+// 1C-style theme: the same palette as the in-process GitBar dialogs (measured
+// from a live designer) — cream form, 1px #B0A68E frames, white fields, flat
+// beige buttons and the blue list selection. Native message boxes stay native.
+// ---------------------------------------------------------------------------
+
+const COLORREF kUiBg       = RGB(245, 242, 221);
+const COLORREF kUiBorder   = RGB(176, 166, 142);
+const COLORREF kUiFieldBg  = RGB(255, 255, 255);
+const COLORREF kUiHover    = RGB(252, 246, 199);
+const COLORREF kUiPress    = RGB(226, 216, 178);
+const COLORREF kUiText     = RGB(0, 0, 0);
+const COLORREF kUiDisabled = RGB(150, 146, 136);
+const COLORREF kUiSel      = RGB(49, 106, 197);
+const COLORREF kUiSelIdle  = RGB(212, 208, 200);
+const COLORREF kUiHeader   = RGB(238, 234, 222);
+
+HFONT CreateUiFont(int weight) {
+    HDC dc = GetDC(nullptr);
+    int h = -MulDiv(8, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    ReleaseDC(nullptr, dc);
+    return CreateFontW(h, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Tahoma");
+}
+
+HFONT UiFont() {
+    static HFONT f = CreateUiFont(FW_NORMAL);
+    return f;
+}
+
+HFONT UiFontBold() {
+    static HFONT f = CreateUiFont(FW_BOLD);
+    return f;
+}
+
+HBRUSH UiBgBrush() {
+    static HBRUSH b = CreateSolidBrush(kUiBg);
+    return b;
+}
+
+HBRUSH UiFieldBrush() {
+    static HBRUSH b = CreateSolidBrush(kUiFieldBg);
+    return b;
+}
+
+void UiFrame(HDC dc, const RECT& rc, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
+// Ownerdraw buttons would otherwise stay flat grey: this subclass tracks the
+// mouse so the button can draw the beige hover of the 1C toolbar.
+LRESULT CALLBACK UiButtonProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    WNDPROC old = (WNDPROC)GetPropW(h, L"v8i.oldBtnProc");
+    switch (msg) {
+    case WM_MOUSEMOVE:
+        if (!GetWindowLongPtrW(h, GWLP_USERDATA)) {
+            SetWindowLongPtrW(h, GWLP_USERDATA, 1);
+            TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+        InvalidateRect(h, nullptr, FALSE);
+        break;
+    }
+    return CallWindowProcW(old, h, msg, wp, lp);
+}
+
+HWND CreateUiButton(HWND parent, int id, const wchar_t* text,
+                    int x, int y, int w, int h) {
+    HWND btn = CreateWindowExW(0, L"BUTTON", text,
+                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                               x, y, w, h, parent, (HMENU)(INT_PTR)id,
+                               (HINSTANCE)GetWindowLongPtrW(parent, GWLP_HINSTANCE),
+                               nullptr);
+    if (!btn) return nullptr;
+    SendMessageW(btn, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+    WNDPROC old = (WNDPROC)SetWindowLongPtrW(btn, GWLP_WNDPROC, (LONG_PTR)UiButtonProc);
+    SetPropW(btn, L"v8i.oldBtnProc", (HANDLE)old);
+    return btn;
+}
+
+bool UiDrawOwnerButton(const DRAWITEMSTRUCT* dis) {
+    if (!dis || dis->CtlType != ODT_BUTTON) return false;
+    wchar_t text[256] = {};
+    GetWindowTextW(dis->hwndItem, text, 256);
+    bool press = (dis->itemState & ODS_SELECTED) != 0;
+    bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    bool hover = !disabled && GetWindowLongPtrW(dis->hwndItem, GWLP_USERDATA) != 0;
+
+    COLORREF face = press ? kUiPress : hover ? kUiHover : kUiBg;
+    HBRUSH b = CreateSolidBrush(face);
+    FillRect(dis->hDC, &dis->rcItem, b);
+    DeleteObject(b);
+    UiFrame(dis->hDC, dis->rcItem, kUiBorder);
+
+    HGDIOBJ oldFont = SelectObject(dis->hDC, UiFont());
+    int oldMode = SetBkMode(dis->hDC, TRANSPARENT);
+    COLORREF oldColor = SetTextColor(dis->hDC, disabled ? kUiDisabled : kUiText);
+    RECT tr = dis->rcItem;
+    DrawTextW(dis->hDC, text, -1, &tr,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SetTextColor(dis->hDC, oldColor);
+    SetBkMode(dis->hDC, oldMode);
+    SelectObject(dis->hDC, oldFont);
+
+    if ((dis->itemState & ODS_FOCUS) && !disabled) {
+        RECT fr = dis->rcItem;
+        InflateRect(&fr, -3, -3);
+        DrawFocusRect(dis->hDC, &fr);
+    }
+    return true;
+}
+
+// Edits and lists sit 1px inside a frame drawn by the parent, so the frame has
+// to be repainted when the focus moves (the border turns blue).
+struct UiField {
+    HWND hwnd = nullptr;
+    RECT cell{};
+};
+std::vector<UiField> g_fields;
+
+LRESULT CALLBACK UiFieldProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    WNDPROC old = (WNDPROC)GetPropW(h, L"v8i.oldFieldProc");
+    if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) {
+        InvalidateRect(h, nullptr, FALSE);   // list selection follows the focus
+        if (HWND parent = GetParent(h)) InvalidateRect(parent, nullptr, FALSE);
+    }
+    return CallWindowProcW(old, h, msg, wp, lp);
+}
+
+void TrackFieldIn(std::vector<UiField>& fields, HWND h, int x, int y, int w, int h2) {
+    WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)UiFieldProc);
+    SetPropW(h, L"v8i.oldFieldProc", (HANDLE)old);
+    fields.push_back({ h, { x, y, x + w, y + h2 } });
+}
+
+void TrackField(HWND h, int x, int y, int w, int h2) {
+    TrackFieldIn(g_fields, h, x, y, w, h2);
+}
+
+void PlaceFieldIn(std::vector<UiField>& fields, HWND h, int x, int y, int w, int h2) {
+    SetWindowPos(h, nullptr, x + 1, y + 1, w - 2, h2 - 2, SWP_NOZORDER);
+    for (auto& f : fields) {
+        if (f.hwnd == h) { f.cell = { x, y, x + w, y + h2 }; break; }
+    }
+}
+
+void PlaceField(HWND h, int x, int y, int w, int h2) {
+    PlaceFieldIn(g_fields, h, x, y, w, h2);
+}
+
+void PaintFieldFramesIn(HDC dc, const std::vector<UiField>& fields) {
+    HWND focus = GetFocus();
+    for (const auto& f : fields) {
+        if (!IsWindowVisible(f.hwnd)) continue;
+        UiFrame(dc, f.cell, f.hwnd == focus ? kUiSel : kUiBorder);
+    }
+}
+
+void PaintFieldFrames(HDC dc) {
+    PaintFieldFramesIn(dc, g_fields);
+}
+
+// Report-mode ListView, painted by hand: the default selection colour and the
+// themed header are the two things that break the 1C look.
+LRESULT UiListCustomDraw(LPNMLVCUSTOMDRAW cd) {
+    switch (cd->nmcd.dwDrawStage) {
+    case CDDS_PREPAINT:
+        return CDRF_NOTIFYITEMDRAW;
+    case CDDS_ITEMPREPAINT:
+        return CDRF_NOTIFYSUBITEMDRAW;
+    case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+        int row = (int)cd->nmcd.dwItemSpec;
+        bool sel = (ListView_GetItemState(g_list, row, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+        bool focus = GetFocus() == g_list;
+        COLORREF bg = sel ? (focus ? kUiSel : kUiSelIdle) : kUiFieldBg;
+        COLORREF fg = (sel && focus) ? RGB(255, 255, 255) : kUiText;
+
+        RECT rc{};
+        if (!ListView_GetSubItemRect(g_list, row, cd->iSubItem, LVIR_BOUNDS, &rc))
+            return CDRF_DODEFAULT;
+        HBRUSH b = CreateSolidBrush(bg);
+        FillRect(cd->nmcd.hdc, &rc, b);
+        DeleteObject(b);
+
+        wchar_t text[512] = {};
+        ListView_GetItemText(g_list, row, cd->iSubItem, text, 512);
+        rc.left += 4;
+        rc.right -= 2;
+        HGDIOBJ oldFont = SelectObject(cd->nmcd.hdc, UiFont());
+        int oldMode = SetBkMode(cd->nmcd.hdc, TRANSPARENT);
+        COLORREF oldColor = SetTextColor(cd->nmcd.hdc, fg);
+        DrawTextW(cd->nmcd.hdc, text, -1, &rc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SetTextColor(cd->nmcd.hdc, oldColor);
+        SetBkMode(cd->nmcd.hdc, oldMode);
+        SelectObject(cd->nmcd.hdc, oldFont);
+        return CDRF_SKIPDEFAULT;
+    }
+    }
+    return CDRF_DODEFAULT;
+}
+
+LRESULT UiHeaderCustomDraw(LPNMCUSTOMDRAW cd) {
+    if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (cd->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+
+    RECT rc = cd->rc;
+    HBRUSH bg = CreateSolidBrush(kUiHeader);
+    FillRect(cd->hdc, &rc, bg);
+    DeleteObject(bg);
+    HBRUSH line = CreateSolidBrush(kUiBorder);
+    RECT bottom{ rc.left, rc.bottom - 1, rc.right, rc.bottom };
+    RECT right{ rc.right - 1, rc.top, rc.right, rc.bottom };
+    FillRect(cd->hdc, &bottom, line);
+    FillRect(cd->hdc, &right, line);
+    DeleteObject(line);
+
+    wchar_t text[128] = {};
+    HDITEMW hi{};
+    hi.mask = HDI_TEXT | HDI_FORMAT;
+    hi.pszText = text;
+    hi.cchTextMax = 128;
+    Header_GetItem((HWND)cd->hdr.hwndFrom, (int)cd->dwItemSpec, &hi);
+
+    RECT tr = rc;
+    tr.left += 4;
+    tr.right -= 4;
+    UINT fmt = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+    if (hi.fmt & HDF_CENTER) fmt = (fmt & ~DT_LEFT) | DT_CENTER;
+    if (hi.fmt & HDF_RIGHT) fmt = (fmt & ~DT_LEFT) | DT_RIGHT;
+
+    HGDIOBJ oldFont = SelectObject(cd->hdc, UiFontBold());
+    int oldMode = SetBkMode(cd->hdc, TRANSPARENT);
+    COLORREF oldColor = SetTextColor(cd->hdc, kUiText);
+    DrawTextW(cd->hdc, text, -1, &tr, fmt);
+    SetTextColor(cd->hdc, oldColor);
+    SetBkMode(cd->hdc, oldMode);
+    SelectObject(cd->hdc, oldFont);
+    return CDRF_SKIPDEFAULT;
+}
+
 std::wstring ExeDir() {
     wchar_t self[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -414,12 +666,47 @@ void DoGitbarHide() {
 // the pump only waits for it to disappear.
 struct GitBarSettingsCtx {
     HWND ed[4] = {};
+    std::vector<UiField> fields;
     bool saved = false;
 };
 
 LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     GitBarSettingsCtx* c = (GitBarSettingsCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
     switch (msg) {
+    case WM_CTLCOLORDLG:
+        return (LRESULT)UiBgBrush();
+
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, kUiText);
+        SetBkMode(dc, TRANSPARENT);
+        return (LRESULT)UiBgBrush();
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, kUiText);
+        SetBkColor(dc, kUiFieldBg);
+        return (LRESULT)UiFieldBrush();
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        if (c) PaintFieldFramesIn(dc, c->fields);
+        EndPaint(h, &ps);
+        return 0;
+    }
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
+        if (dis->CtlType == ODT_BUTTON && UiDrawOwnerButton(dis)) return TRUE;
+        break;
+    }
+
+    case DM_GETDEFID:
+        return MAKELRESULT(IDOK, DC_HASDEFID);
+
     case WM_COMMAND:
         if (c && LOWORD(wp) == IDOK) {
             wchar_t b[4][1024] = {};
@@ -457,7 +744,8 @@ LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 void DoGitbarSettings() {
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", L"GitBar — настройки",
-                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
+                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE |
+                                   WS_CLIPCHILDREN,
                                CW_USEDEFAULT, CW_USEDEFAULT, 460, 226, g_hwnd, nullptr,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) return;
@@ -467,36 +755,34 @@ void DoGitbarSettings() {
     SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
 
     auto Lbl = [&](int y, const wchar_t* t) {
-        CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        12, y, 140, 18, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HWND s = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                 12, y, 140, 18, dlg, nullptr,
+                                 GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(s, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     };
-    auto Edt = [&](int y) {
-        return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                               158, y, 284, 22, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
+    auto Edt = [&](int cellY, int cellW) {
+        HWND e = CreateWindowExW(0, L"EDIT", L"",
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                 159, cellY + 1, cellW - 2, 22, dlg, nullptr,
+                                 GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(e, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+        TrackFieldIn(ctx.fields, e, 158, cellY, cellW, 24);
+        return e;
     };
 
-    ctx.ed[0] = Edt(14);
+    ctx.ed[0] = Edt(13, 286);
     // dumpdir gets a folder-picker button in the same row: narrower edit,
     // standard shell browse dialog on the "..." click (see WM_COMMAND 2001).
-    ctx.ed[1] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                158, 44, 250, 22, dlg, nullptr,
-                                GetModuleHandleW(nullptr), nullptr);
-    ctx.ed[2] = Edt(74);
-    ctx.ed[3] = Edt(104);
+    ctx.ed[1] = Edt(43, 252);
+    ctx.ed[2] = Edt(73, 286);
+    ctx.ed[3] = Edt(103, 286);
     Lbl(15, L"git.exe");
     Lbl(45, L"папка выгрузки");
     Lbl(75, L"комментарий к коммиту");
     Lbl(105, L"remote origin (не обяз.)");
-    CreateWindowExW(0, L"BUTTON", L"...",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                    414, 44, 28, 22, dlg, (HMENU)(INT_PTR)2001,
-                    GetModuleHandleW(nullptr), nullptr);
-    CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                    158, 150, 90, 26, dlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleW(nullptr), nullptr);
-    CreateWindowExW(0, L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    258, 150, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
+    CreateUiButton(dlg, 2001, L"...", 414, 44, 28, 22);
+    CreateUiButton(dlg, IDOK, L"OK", 158, 150, 90, 26);
+    CreateUiButton(dlg, IDCANCEL, L"Отмена", 258, 150, 90, 26);
 
     // Prefill: current values, or a sensible git default.
     std::wstring git = GitBarIniGet(L"gitpath");
@@ -527,22 +813,36 @@ void DoGitbarSettings() {
 void CreateControls(HWND hwnd) {
     HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
 
-    CreateWindowExW(0, L"STATIC", L"Процесс:", WS_CHILD | WS_VISIBLE,
-                    12, 12, 80, 20, hwnd, nullptr, hInst, nullptr);
+    auto Lbl = [&](int y, int w, const wchar_t* t) {
+        HWND s = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                 12, y, w, 20, hwnd, nullptr, hInst, nullptr);
+        SendMessageW(s, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+        return s;
+    };
 
-    g_filter = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                               WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                               96, 9, 220, 24, hwnd, (HMENU)kIdFilter, hInst, nullptr);
+    Lbl(12, 80, L"Процесс:");
+
+    g_filter = CreateWindowExW(0, L"EDIT", L"",
+                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                               97, 10, 218, 22, hwnd, (HMENU)kIdFilter, hInst, nullptr);
+    SendMessageW(g_filter, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_filter, EM_SETCUEBANNER, TRUE, (LPARAM)L"фильтр по имени");
+    TrackField(g_filter, 96, 9, 220, 24);
 
-    CreateWindowExW(0, L"BUTTON", L"Обновить", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    324, 9, 90, 26, hwnd, (HMENU)kIdRefresh, hInst, nullptr);
+    CreateUiButton(hwnd, kIdRefresh, L"Обновить", 324, 9, 90, 26);
 
-    g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                             WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
+    g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
+                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
                                  LVS_SHOWSELALWAYS,
-                             12, 44, 760, 240, hwnd, (HMENU)kIdList, hInst, nullptr);
+                             13, 45, 758, 238, hwnd, (HMENU)kIdList, hInst, nullptr);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    SendMessageW(g_list, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+    ListView_SetBkColor(g_list, kUiFieldBg);
+    ListView_SetTextBkColor(g_list, kUiFieldBg);
+    ListView_SetTextColor(g_list, kUiText);
+    // A 1px image list is only there to keep the rows at 1C-ish 18px.
+    HIMAGELIST rowH = ImageList_Create(1, 18, ILC_COLOR32, 1, 1);
+    if (rowH) ListView_SetImageList(g_list, rowH, LVSIL_SMALL);
 
     struct Col { const wchar_t* text; int width; };
     const Col cols[] = {
@@ -556,53 +856,50 @@ void CreateControls(HWND hwnd) {
         c.iSubItem = i;
         ListView_InsertColumn(g_list, i, &c);
     }
+    SendMessageW(ListView_GetHeader(g_list), WM_SETFONT, (WPARAM)UiFontBold(), TRUE);
+    TrackField(g_list, 12, 44, 760, 240);
 
-    CreateWindowExW(0, L"STATIC", L"Payload DLL:", WS_CHILD | WS_VISIBLE,
-                    12, 294, 80, 20, hwnd, nullptr, hInst, nullptr);
-    g_dllEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                96, 291, 560, 24, hwnd, (HMENU)kIdDllEdit, hInst, nullptr);
+    Lbl(294, 80, L"Payload DLL:");
+    g_dllEdit = CreateWindowExW(0, L"EDIT", L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                97, 292, 558, 22, hwnd, (HMENU)kIdDllEdit, hInst, nullptr);
+    SendMessageW(g_dllEdit, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+    TrackField(g_dllEdit, 96, 291, 560, 24);
 
-    CreateWindowExW(0, L"BUTTON", L"...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    662, 291, 32, 26, hwnd, (HMENU)kIdBrowse, hInst, nullptr);
+    CreateUiButton(hwnd, kIdBrowse, L"...", 662, 291, 32, 26);
 
-    CreateWindowExW(0, L"BUTTON", L"Инжектировать", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    12, 324, 150, 30, hwnd, (HMENU)kIdInject, hInst, nullptr);
+    CreateUiButton(hwnd, kIdInject, L"Инжектировать", 12, 324, 150, 30);
 
-    HWND detach = CreateWindowExW(0, L"BUTTON", L"Отключиться",
-                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  170, 324, 120, 30, hwnd, (HMENU)kIdDetach, hInst, nullptr);
+    HWND detach = CreateUiButton(hwnd, kIdDetach, L"Отключиться", 170, 324, 120, 30);
     EnableWindow(detach, FALSE);
 
-    CreateWindowExW(0, L"BUTTON", L"GitBar: показать",
-                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    298, 324, 130, 30, hwnd, (HMENU)kIdGitbarShow, hInst, nullptr);
-    CreateWindowExW(0, L"BUTTON", L"скрыть",
-                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    434, 324, 70, 30, hwnd, (HMENU)kIdGitbarHide, hInst, nullptr);
-    CreateWindowExW(0, L"BUTTON", L"Настройки",
-                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    510, 324, 100, 30, hwnd, (HMENU)kIdGitbarSettings, hInst, nullptr);
+    CreateUiButton(hwnd, kIdGitbarShow, L"GitBar: показать", 298, 324, 130, 30);
+    CreateUiButton(hwnd, kIdGitbarHide, L"скрыть", 434, 324, 70, 30);
+    CreateUiButton(hwnd, kIdGitbarSettings, L"Настройки", 510, 324, 100, 30);
 
-    g_cmdEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                12, 364, 560, 26, hwnd, (HMENU)kIdCommand, hInst, nullptr);
+    g_cmdEdit = CreateWindowExW(0, L"EDIT", L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                13, 365, 558, 24, hwnd, (HMENU)kIdCommand, hInst, nullptr);
+    SendMessageW(g_cmdEdit, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_cmdEdit, EM_SETCUEBANNER, TRUE,
                  (LPARAM)L"objects | pe | peek <addr> [len] | scan <addr>");
+    TrackField(g_cmdEdit, 12, 364, 560, 26);
 
-    HWND send = CreateWindowExW(0, L"BUTTON", L"Отправить", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                580, 364, 100, 26, hwnd, (HMENU)kIdSend, hInst, nullptr);
+    HWND send = CreateUiButton(hwnd, kIdSend, L"Отправить", 580, 364, 100, 26);
     EnableWindow(send, FALSE);
 
-    g_log = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+    g_log = CreateWindowExW(0, L"EDIT", L"",
                             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
                                 ES_READONLY | WS_VSCROLL,
-                            12, 398, 760, 220, hwnd, (HMENU)kIdLog, hInst, nullptr);
+                            13, 399, 758, 218, hwnd, (HMENU)kIdLog, hInst, nullptr);
+    SendMessageW(g_log, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_log, EM_SETLIMITTEXT, 0, 0);
+    TrackField(g_log, 12, 398, 760, 220);
 
     g_status = CreateWindowExW(0, L"STATIC", L"Не подключено",
                                WS_CHILD | WS_VISIBLE | SS_LEFT,
                                12, 626, 500, 20, hwnd, (HMENU)kIdStatus, hInst, nullptr);
+    SendMessageW(g_status, WM_SETFONT, (WPARAM)UiFont(), TRUE);
 
     // The GUI runs in UTF-8; the payload replies in UTF-8 too.
     SetConsoleOutputCP(CP_UTF8);
@@ -622,18 +919,64 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetClientRect(hwnd, &rc);
             int w = rc.right - rc.left;
             int h = rc.bottom - rc.top;
-            SetWindowPos(g_list, nullptr, 12, 44, w - 24, 240, SWP_NOZORDER);
-            SetWindowPos(g_dllEdit, nullptr, 96, 291, w - 24 - 96 - 44, 24, SWP_NOZORDER);
+            PlaceField(g_list, 12, 44, w - 24, 240);
+            PlaceField(g_dllEdit, 96, 291, w - 24 - 96 - 44, 24);
             SetWindowPos(GetDlgItem(hwnd, kIdBrowse), nullptr, w - 24 - 40, 291, 32, 26,
                          SWP_NOZORDER);
-            SetWindowPos(g_log, nullptr, 12, 398, w - 24, h - 398 - 34, SWP_NOZORDER);
+            PlaceField(g_cmdEdit, 12, 364, w - 24 - 112, 26);
+            SetWindowPos(GetDlgItem(hwnd, kIdSend), nullptr, w - 24 - 100, 364, 100, 26,
+                         SWP_NOZORDER);
+            PlaceField(g_log, 12, 398, w - 24, h - 398 - 34);
             SetWindowPos(g_status, nullptr, 12, h - 26, w - 24, 20, SWP_NOZORDER);
+            InvalidateRect(hwnd, nullptr, TRUE);
         }
         return 0;
 
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        // The 1C form separates its status line with a single border.
+        HPEN pen = CreatePen(PS_SOLID, 1, kUiBorder);
+        HGDIOBJ op = SelectObject(dc, pen);
+        MoveToEx(dc, 12, rc.bottom - 32, nullptr);
+        LineTo(dc, rc.right - 12, rc.bottom - 32);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        PaintFieldFrames(dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, kUiText);
+        if ((HWND)lp == g_log) {
+            SetBkColor(dc, kUiFieldBg);
+            return (LRESULT)UiFieldBrush();
+        }
+        SetBkMode(dc, TRANSPARENT);
+        return (LRESULT)UiBgBrush();
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, kUiText);
+        SetBkColor(dc, kUiFieldBg);
+        return (LRESULT)UiFieldBrush();
+    }
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
+        if (dis->CtlType == ODT_BUTTON && UiDrawOwnerButton(dis)) return TRUE;
+        break;
+    }
+
     case WM_GETMINMAXINFO: {
         auto* mmi = (MINMAXINFO*)lp;
-        mmi->ptMinTrackSize.x = 620;
+        // The button row (12..610) plus the 1C-like side margins.
+        mmi->ptMinTrackSize.x = 640;
         mmi->ptMinTrackSize.y = 560;
         return 0;
     }
@@ -656,6 +999,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_NOTIFY: {
         auto* nm = (LPNMHDR)lp;
+        if (nm->idFrom == kIdList && nm->code == NM_CUSTOMDRAW) {
+            if (nm->hwndFrom == g_list) return UiListCustomDraw((LPNMLVCUSTOMDRAW)lp);
+            if (nm->hwndFrom == ListView_GetHeader(g_list))
+                return UiHeaderCustomDraw((LPNMCUSTOMDRAW)lp);
+        }
         if (nm->idFrom == kIdList && nm->code == LVN_ITEMCHANGED) {
             auto* nv = (LPNMITEMACTIVATE)lp;
             if (nv->iItem >= 0) {
@@ -704,12 +1052,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     wc.hInstance = hInst;
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = UiBgBrush();
     wc.lpszClassName = L"V8InjectGuiWnd";
     RegisterClassExW(&wc);
 
+    // WS_CLIPCHILDREN: the form repaints its own cream background often (focus
+    // frames), and overpainting the fields on every focus change would flicker.
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"v8inject — инжектор DLL",
-                                WS_OVERLAPPEDWINDOW,
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 800, 700,
                                 nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
@@ -719,8 +1069,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        if (!IsDialogMessageW(hwnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
     return (int)msg.wParam;
 }
