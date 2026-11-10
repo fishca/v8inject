@@ -3975,26 +3975,88 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* /*ignored*/) {
 // (cmd 45, preceded by cmd 2 when the configuration is not open yet). Runs on
 // a worker thread because transmitCommand blocks while the modal dialog is up.
 // ---------------------------------------------------------------------------
-// True when a designer dialog window is already up (the dump dialog is a
-// top-level V8NewLocalFrameBaseWnd).  cmd 45 is accepted (rc=1) even when the
-// configuration is closed, so the return code alone cannot confirm the dialog.
-static bool DumpDialogPresent() {
-    return FindWindowW(L"V8NewLocalFrameBaseWnd", nullptr) != nullptr;
+// cmd 45 is accepted (rc=1) even when the configuration is closed, so the
+// return code cannot tell a shown dialog from an ignored command. Looking for
+// the dialog after the call does not work either: on 8.5 the call returns only
+// once the modal dialog is closed (so Cancel/OK would look like "no dialog"
+// and re-trigger the dump). A watcher polls while the command runs instead —
+// any new top-level platform window is the dialog, whatever its class is.
+// 8.3 shows the dialog a little after the call returns, hence the grace period.
+struct DumpWatch {
+    HWND base[32] = {};
+    int n = 0;
+    HANDLE stop = nullptr;
+    volatile LONG seen = 0;
+};
+
+static bool IsPlatformWindow(HWND h) {
+    if (!IsWindowVisible(h)) return false;
+    wchar_t cls[64] = {};
+    if (!GetClassNameW(h, cls, 64)) return false;
+    // 8.3 dialog frame, and 8.5's V8Window0.* windows — the designer frame is
+    // already in the baseline, so only newly appeared ones count.
+    return wcscmp(cls, L"V8NewLocalFrameBaseWnd") == 0 ||
+           wcsncmp(cls, L"V8Window0.", 10) == 0;
+}
+
+static BOOL CALLBACK CollectPlatformWindows(HWND h, LPARAM lp) {
+    DumpWatch* w = (DumpWatch*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == GetCurrentProcessId() && w->n < 32 && IsPlatformWindow(h))
+        w->base[w->n++] = h;
+    return TRUE;
+}
+
+static BOOL CALLBACK FindNewPlatformWindow(HWND h, LPARAM lp) {
+    DumpWatch* w = (DumpWatch*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId() || !IsPlatformWindow(h)) return TRUE;
+    for (int i = 0; i < w->n; ++i) {
+        if (w->base[i] == h) return TRUE;
+    }
+    InterlockedExchange(&w->seen, 1);
+    return FALSE;
+}
+
+static DWORD WINAPI DumpWatchThread(LPVOID lp) {
+    DumpWatch* w = (DumpWatch*)lp;
+    while (WaitForSingleObject(w->stop, 25) == WAIT_TIMEOUT) {
+        EnumWindows(FindNewPlatformWindow, (LPARAM)w);
+        if (w->seen) break;
+    }
+    return 0;
 }
 
 static DWORD WINAPI V8iGitBarDumpThread(LPVOID) {
+    DumpWatch w;
+    EnumWindows(CollectPlatformWindows, (LPARAM)&w);
+    w.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE watch = w.stop ? CreateThread(nullptr, 0, DumpWatchThread, &w, 0, nullptr) : nullptr;
+
     std::string r = CmdCommandToJson(L"45 0");
     LogLine("gitbar: cmd 45 -> %s", r.c_str());
-    // "UI thread did not answer" means the modal dump dialog took over the UI
-    // thread — that IS the success case.
-    bool ok = r.find("did not answer") != std::string::npos;
-    if (!ok && r.find("\"rc\":1") != std::string::npos) {
-        Sleep(400);
-        ok = DumpDialogPresent();
-        LogLine("gitbar: dialog present=%d", ok ? 1 : 0);
+
+    // "UI thread did not answer" already means the modal dialog held the UI
+    // thread for the whole timeout — a success, and nothing to retry.
+    bool timedOut = r.find("did not answer") != std::string::npos;
+    if (!timedOut) {
+        for (int i = 0; i < 50 && !w.seen; ++i) Sleep(30);
     }
-    if (!ok) {
-        // Configuration is not open: open it first, then dump.
+    if (watch) {
+        // The watcher only waits on this event, so the join is immediate; an
+        // unbounded wait keeps it from outliving the stack block below.
+        SetEvent(w.stop);
+        WaitForSingleObject(watch, INFINITE);
+        CloseHandle(watch);
+    }
+    if (w.stop) CloseHandle(w.stop);
+    LogLine("gitbar: dump dialog seen=%d timedOut=%d", (int)w.seen, timedOut ? 1 : 0);
+
+    if (!timedOut && !w.seen) {
+        // No dialog ever showed up: the configuration is closed, so open it
+        // first and dump again.
         std::string r2 = CmdCommandToJson(L"2 0");
         LogLine("gitbar: cmd 2 -> %s", r2.c_str());
         Sleep(800);
