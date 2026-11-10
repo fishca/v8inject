@@ -1,7 +1,9 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "v8inject/diag.h"
@@ -1040,6 +1042,15 @@ void RunPush() {
                   ? RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" })
                   : RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD:" + target });
     }
+    // The merge above records origin/main as the upstream of the local master.
+    // push.default=simple refuses such a pair because the branch names differ,
+    // so the upstream target has to be spelled out.
+    if (out.find(L"upstream branch of your current branch does not match") !=
+        std::wstring::npos) {
+        std::wstring target = PullTarget(dir);
+        if (!target.empty())
+            out = RunGit({ L"-C", dir, L"push", L"origin", L"HEAD:" + target });
+    }
 
     // A repo created on GitHub with a README already has a commit, so the very
     // first push is rejected: the histories are unrelated until they are merged.
@@ -1456,6 +1467,20 @@ struct LogRow {
     int col = 0;           // graph column: 0 for a linear history
 };
 
+// One line of "git show": file headers, hunks and changed lines are kept apart
+// so the pane can draw gutters, colours and the sign column without re-parsing
+// the patch on every paint.
+struct DiffLine {
+    enum Kind { Context, Add, Del, Hunk, FileHead, Meta, Stat, Note };
+    Kind kind = Context;
+    int oldNo = 0;
+    int newNo = 0;
+    std::wstring text;     // prefix character already stripped for +, -, ' '
+    // Changed word ranges: paired -/+ lines emphasise only the fragments that
+    // differ, the way GitExtensions colours the edited words.
+    std::vector<std::pair<int, int>> hl;
+};
+
 struct LogCtx {
     HWND hwnd = nullptr;
     std::vector<LogRow> rows;
@@ -1463,22 +1488,68 @@ struct LogCtx {
     int sel = -1;          // selected row
     int visible = 1;
     std::wstring dir;
-    std::wstring detail;   // expanded commit text for the selected row
-    std::wstring diff;     // patch of the selected commit (git show --patch)
+    std::wstring detail;   // subject and author line for the selected row
+    std::vector<DiffLine> diff;
     int diffTop = 0;       // first visible diff line
     int diffLines = 0;     // total diff lines (for the scroll hint)
     HFONT mono = nullptr;
+    HFONT monoBig = nullptr;   // patch pane: 10 pt reads better than the list's 9
     HFONT ui = nullptr;
+    HFONT bold = nullptr;
     RECT rcClose{};
     bool hoverClose = false;
 };
 
-const int kLogRowH = 17;
+const int kLogRowH = 19;
+const int kLogListTop = 40;   // first commit row, below the column headers
+const int kGraphW = 104;      // graph column, lanes are kColW apart
+const int kColW = 20;
 const COLORREF kLogBg = RGB(245, 242, 221);
 const COLORREF kLogSel = RGB(49, 106, 197);
 const COLORREF kLogBorder = RGB(176, 166, 142);
 const COLORREF kLogGray = RGB(112, 104, 88);
 const COLORREF kLogRefs = RGB(30, 90, 160);
+const COLORREF kLogAddBg = RGB(223, 243, 223);
+const COLORREF kLogAddTx = RGB(20, 100, 20);
+const COLORREF kLogAddHl = RGB(170, 222, 170);
+const COLORREF kLogDelBg = RGB(252, 226, 226);
+const COLORREF kLogDelTx = RGB(160, 30, 30);
+const COLORREF kLogDelHl = RGB(242, 184, 184);
+const COLORREF kLogHunkBg = RGB(226, 235, 249);
+const COLORREF kLogHunkTx = RGB(25, 60, 140);
+const COLORREF kLogHeadBg = RGB(232, 240, 252);   // "diff --git" band
+const COLORREF kLogPatchBg = RGB(252, 251, 247);  // code pane, white like GitExtensions
+const COLORREF kLogLineNo = RGB(138, 129, 108);
+
+int LaneX(int charIdx) { return 4 + (charIdx / 2) * kColW + kColW / 2; }
+
+// Whether a lane continues beyond a row: either the lane character itself or
+// a diagonal in the neighbouring row that starts at the shared edge. Trimming
+// a line to the diamond when nothing follows keeps lane ends from dangling.
+bool LaneJoins(const std::wstring& g, int lane, bool above) {
+    size_t even = (size_t)lane * 2;
+    if (even < g.size() && (g[even] == L'|' || g[even] == L'*')) return true;
+    if (above) {
+        size_t back = even - 1;              // '\' ending at this lane
+        if (lane > 0 && back < g.size() && g[back] == L'\\') return true;
+        size_t fwd = even + 1;               // '/' ending at this lane
+        if (fwd < g.size() && g[fwd] == L'/') return true;
+    } else {
+        size_t fwd = even + 1;               // '\' starting at this lane
+        if (fwd < g.size() && g[fwd] == L'\\') return true;
+        size_t back = even - 1;              // '/' starting at this lane
+        if (lane > 0 && back < g.size() && g[back] == L'/') return true;
+    }
+    return false;
+}
+
+int LogListBottom(const RECT& rc) {
+    int h = rc.bottom - kLogListTop;
+    return kLogListTop + (h > 0 ? h * 50 / 100 : 0);
+}
+
+int LogDetailTop(const RECT& rc) { return LogListBottom(rc) + 22; }
+int LogPatchTop(const RECT& rc) { return LogDetailTop(rc) + 44; }
 
 bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
     // 0x1F (unit separator) between fields: subjects may contain anything.
@@ -1519,13 +1590,201 @@ bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
     return !rows.empty();
 }
 
-HFONT LogFont(int points, const wchar_t* face) {
+HFONT LogFont(int points, const wchar_t* face, int weight, DWORD pitch) {
     HDC dc = GetDC(nullptr);
     int h = -MulDiv(points, GetDeviceCaps(dc, LOGPIXELSY), 72);
     ReleaseDC(nullptr, dc);
-    return CreateFontW(h, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                       FIXED_PITCH | FF_MODERN, face);
+    // ClearType at the point size the window is designed for: the list and the
+    // patch are read for a long time, so they use 9 pt instead of Tahoma's
+    // usual 8 pt.
+    return CreateFontW(h, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                       pitch, face);
+}
+
+// "@@ -a,b +c,d @@" -- the counts are optional, so four format variants cover
+// every hunk git prints.
+void ParseHunkHeader(const std::wstring& line, int* oldNo, int* newNo) {
+    int a = 0, b = 0, c = 0, d = 0;
+    *oldNo = 0;
+    *newNo = 0;
+    if (swscanf_s(line.c_str(), L"@@ -%d,%d +%d,%d @@", &a, &b, &c, &d) == 4 ||
+        swscanf_s(line.c_str(), L"@@ -%d,%d +%d @@", &a, &b, &c) == 3 ||
+        swscanf_s(line.c_str(), L"@@ -%d +%d,%d @@", &a, &c, &d) == 3 ||
+        swscanf_s(line.c_str(), L"@@ -%d +%d @@", &a, &c) == 2) {
+        *oldNo = a - 1;   // the first line of the hunk increments these
+        *newNo = c - 1;
+    }
+}
+
+// Word-level diff of one deleted/added line pair. Tokens are runs of letters,
+// digits and non-ASCII (Cyrillic paths and messages stay whole), single other
+// characters and whitespace runs. The LCS keeps identical fragments plain and
+// marks the rest, so a one-character edit lights up one character and not the
+// whole line.
+struct WordTok {
+    int start;
+    int end;
+};
+
+bool IsWordChar(wchar_t c) {
+    return (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') ||
+           (c >= L'a' && c <= L'z') || c == L'_' || c >= 0x80;
+}
+
+void TokenizeWords(const std::wstring& s, std::vector<WordTok>& t) {
+    t.clear();
+    for (size_t i = 0; i < s.size();) {
+        size_t j = i;
+        if (IsWordChar(s[i])) {
+            while (j < s.size() && IsWordChar(s[j])) ++j;
+        } else if (s[i] == L' ' || s[i] == L'\t') {
+            while (j < s.size() && (s[j] == L' ' || s[j] == L'\t')) ++j;
+        } else {
+            ++j;
+        }
+        t.push_back({ (int)i, (int)j });
+        i = j;
+    }
+}
+
+bool SameTok(const std::wstring& a, const WordTok& x, const std::wstring& b, const WordTok& y) {
+    int la = x.end - x.start, lb = y.end - y.start;
+    return la == lb && a.compare((size_t)x.start, (size_t)la, b, (size_t)y.start,
+                                 (size_t)lb) == 0;
+}
+
+void MarkUnmatched(const std::vector<WordTok>& t, const std::vector<char>& matched,
+                   std::vector<std::pair<int, int>>& out) {
+    int start = -1;
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (!matched[i]) {
+            if (start < 0) start = t[i].start;
+        } else if (start >= 0) {
+            out.push_back({ start, t[i - 1].end });
+            start = -1;
+        }
+    }
+    if (start >= 0) out.push_back({ start, t.back().end });
+}
+
+void PairHighlight(DiffLine& del, DiffLine& add) {
+    std::vector<WordTok> a, b;
+    TokenizeWords(del.text, a);
+    TokenizeWords(add.text, b);
+    if (a.empty() || b.empty()) return;
+    size_t n = a.size(), m = b.size();
+    if (n * m > 400000) return;   // pathological line: keep the plain line tint
+    std::vector<int> dp((n + 1) * (m + 1), 0);
+    for (size_t i = 1; i <= n; ++i)
+        for (size_t j = 1; j <= m; ++j)
+            dp[i * (m + 1) + j] = SameTok(del.text, a[i - 1], add.text, b[j - 1])
+                ? dp[(i - 1) * (m + 1) + (j - 1)] + 1
+                : std::max(dp[(i - 1) * (m + 1) + j], dp[i * (m + 1) + (j - 1)]);
+    std::vector<char> ma(n, 0), mb(m, 0);
+    size_t i = n, j = m;
+    while (i > 0 && j > 0) {
+        if (SameTok(del.text, a[i - 1], add.text, b[j - 1]) &&
+            dp[i * (m + 1) + j] == dp[(i - 1) * (m + 1) + (j - 1)] + 1) {
+            ma[i - 1] = mb[j - 1] = 1;
+            --i;
+            --j;
+        } else if (dp[(i - 1) * (m + 1) + j] >= dp[i * (m + 1) + (j - 1)]) {
+            --i;
+        } else {
+            --j;
+        }
+    }
+    MarkUnmatched(a, ma, del.hl);
+    MarkUnmatched(b, mb, add.hl);
+}
+
+void ParseDiff(const std::wstring& patch, std::vector<DiffLine>& out) {
+    int oldNo = 0, newNo = 0;
+    bool inHunk = false;
+    size_t pos = 0;
+    while (pos < patch.size()) {
+        size_t e = patch.find_first_of(L"\r\n", pos);
+        if (e == std::wstring::npos) e = patch.size();
+        std::wstring line = patch.substr(pos, e - pos);
+        pos = e;
+        while (pos < patch.size() && (patch[pos] == L'\r' || patch[pos] == L'\n')) ++pos;
+
+        DiffLine dl;
+        if (line.rfind(L"diff --git ", 0) == 0) {
+            inHunk = false;
+            std::wstring path = line.substr(11);
+            size_t b = path.rfind(L" b/");
+            if (b != std::wstring::npos) path = path.substr(b + 3);
+            dl.kind = DiffLine::FileHead;
+            dl.text = path;
+            out.push_back(dl);
+            continue;
+        }
+        if (line.rfind(L"@@", 0) == 0) {
+            inHunk = true;
+            ParseHunkHeader(line, &oldNo, &newNo);
+            dl.kind = DiffLine::Hunk;
+            dl.text = line;
+            out.push_back(dl);
+            continue;
+        }
+        if (inHunk) {
+            if (line.empty()) { inHunk = false; continue; }
+            wchar_t ch = line[0];
+            if (ch == L'+') {
+                dl.kind = DiffLine::Add;
+                dl.newNo = ++newNo;
+                dl.text = line.substr(1);
+            } else if (ch == L'-') {
+                dl.kind = DiffLine::Del;
+                dl.oldNo = ++oldNo;
+                dl.text = line.substr(1);
+            } else if (ch == L' ') {
+                dl.kind = DiffLine::Context;
+                dl.oldNo = ++oldNo;
+                dl.newNo = ++newNo;
+                dl.text = line.substr(1);
+            } else if (ch == L'\\') {
+                dl.kind = DiffLine::Note;
+                dl.text = line;
+            } else {
+                dl.kind = DiffLine::Context;
+                dl.text = line;
+            }
+            out.push_back(dl);
+            continue;
+        }
+
+        // Outside a hunk: index/---/+++/mode lines belong to the file header,
+        // the --stat block and its "N files changed" summary are stat lines.
+        if (line.empty()) continue;
+        if (line.rfind(L"index ", 0) == 0 || line.rfind(L"--- ", 0) == 0 ||
+            line.rfind(L"+++ ", 0) == 0 || line.rfind(L"new file mode", 0) == 0 ||
+            line.rfind(L"deleted file mode", 0) == 0 ||
+            line.rfind(L"old mode", 0) == 0 || line.rfind(L"new mode", 0) == 0 ||
+            line.rfind(L"similarity index", 0) == 0 ||
+            line.rfind(L"rename from", 0) == 0 || line.rfind(L"rename to", 0) == 0 ||
+            line.rfind(L"Binary files", 0) == 0) {
+            dl.kind = DiffLine::Meta;
+        } else {
+            dl.kind = DiffLine::Stat;
+        }
+        dl.text = line;
+        out.push_back(dl);
+    }
+
+    // git prints each hunk's removals before its additions; pair them line by
+    // line so PairHighlight can mark the changed words.
+    for (size_t i = 0; i < out.size();) {
+        if (out[i].kind != DiffLine::Del) { ++i; continue; }
+        size_t d0 = i;
+        while (i < out.size() && out[i].kind == DiffLine::Del) ++i;
+        size_t a0 = i;
+        while (i < out.size() && out[i].kind == DiffLine::Add) ++i;
+        size_t pairs = std::min(i - a0, a0 - d0);
+        for (size_t k = 0; k < pairs; ++k) PairHighlight(out[d0 + k], out[a0 + k]);
+    }
 }
 
 // Gantt-style graph column: a diamond on the commit's date and a "today" line.
@@ -1566,37 +1825,38 @@ void LogPaint(LogCtx* c) {
     SelectObject(dc, obp);
     DeleteObject(border);
 
-    HGDIOBJ oldFont = SelectObject(dc, c->ui);
+    const int kHashW = 82;
+    const int kDateW = 88;
+    const int kAuthorW = 210;
+    const int kRight = rc.right - 6;
+
+    HGDIOBJ oldFont = SelectObject(dc, c->bold);
     SetTextColor(dc, RGB(0, 0, 0));
-    RECT head{ 8, 4, rc.right - 34, 20 };
+    RECT head{ 8, 3, rc.right - 34, 22 };
     DrawTextW(dc, (L"История: " + c->dir).c_str(), -1, &head,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
     // column headers: graph | commit | subject | date | author
     {
-        const int kGraphW = 100;
-        const int kHashW = 78;
-        const int kDateW = 84;
-        const int kAuthorW = 210;
         int right = rc.right - 4;
         SetTextColor(dc, kLogGray);
-        RECT hG{ 4, 20, 4 + kGraphW, 34 };
+        RECT hG{ 4, 22, 4 + kGraphW, kLogListTop - 2 };
         DrawTextW(dc, L"Граф", -1, &hG, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        RECT hH{ 4 + kGraphW, 20, 4 + kGraphW + kHashW, 34 };
+        RECT hH{ 4 + kGraphW, 22, 4 + kGraphW + kHashW, kLogListTop - 2 };
         DrawTextW(dc, L"Коммит", -1, &hH, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        RECT hSubj{ 4 + kGraphW + kHashW, 20, right - kDateW - kAuthorW, 34 };
+        RECT hSubj{ 4 + kGraphW + kHashW, 22, right - kDateW - kAuthorW, kLogListTop - 2 };
         DrawTextW(dc, L"Комментарий", -1, &hSubj,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        RECT hDate{ right - kDateW - kAuthorW, 20, right - kAuthorW, 34 };
+        RECT hDate{ right - kDateW - kAuthorW, 22, right - kAuthorW, kLogListTop - 2 };
         DrawTextW(dc, L"Дата", -1, &hDate,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        RECT hAuth{ right - kAuthorW, 20, right, 34 };
+        RECT hAuth{ right - kAuthorW, 22, right, kLogListTop - 2 };
         DrawTextW(dc, L"Автор", -1, &hAuth,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         HPEN hl = CreatePen(PS_SOLID, 1, kLogBorder);
         HPEN ohl = (HPEN)SelectObject(dc, hl);
-        MoveToEx(dc, 4, 34, nullptr);
-        LineTo(dc, right, 34);
+        MoveToEx(dc, 4, kLogListTop - 2, nullptr);
+        LineTo(dc, right, kLogListTop - 2);
         SelectObject(dc, ohl);
         DeleteObject(hl);
     }
@@ -1613,81 +1873,110 @@ void LogPaint(LogCtx* c) {
     DrawTextW(dc, L"X", -1, &c->rcClose, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     // rows — top half; details + patch below
-    int listTop = 36;
-    int listBottom = 36 + (rc.bottom - 36) * 45 / 100;
+    int listTop = kLogListTop;
+    int listBottom = LogListBottom(rc);
     c->visible = (listBottom - listTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
-    // graph column: diamonds at the commit's column, vertical line for a
-    // linear history, slanted joins where branches diverge
-    const int kGraphW = 100;
-    const int kColW = 18;
 
-    HGDIOBJ oldMono = SelectObject(dc, c->mono);
-    std::vector<POINT> ganttPts;  // diamond centres, joined by a polyline
+    // Graph lines follow the lane characters git prints ("|", "\", "/"):
+    // vertical lanes and 45-degree joins instead of one polyline through the
+    // commit diamonds, which crossed several lanes in a single jagged stroke.
+    // A 2 px round pen keeps the joins smooth.
+    LOGBRUSH lbN{ BS_SOLID, RGB(49, 106, 197), 0 };
+    LOGBRUSH lbS{ BS_SOLID, RGB(255, 255, 255), 0 };
+    HPEN laneN = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+                              2, &lbN, 0, nullptr);
+    HPEN laneS = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+                              2, &lbS, 0, nullptr);
+
     for (int i = 0; i < c->visible; ++i) {
         int idx = c->top + i;
         if (idx >= (int)c->rows.size()) break;
-        RECT row{ 4, listTop + i * kLogRowH, rc.right - 4, listTop + (i + 1) * kLogRowH - 1 };
+        int yTop = listTop + i * kLogRowH;
+        int yBot = yTop + kLogRowH;
+        RECT row{ 4, yTop, rc.right - 4, yBot - 1 };
         const LogRow& r = c->rows[idx];
         bool selected = (idx == c->sel);
         if (selected) {
             HBRUSH sb = CreateSolidBrush(kLogSel);
             FillRect(dc, &row, sb);
             DeleteObject(sb);
-            SetTextColor(dc, RGB(255, 255, 255));
-        } else {
-            SetTextColor(dc, RGB(0, 0, 0));
         }
-        // columns: graph | commit | subject | date | author
-        const int kHashW2 = 78;
-        const int kDateW2 = 84;
-        const int kAuthorW2 = 210;
-        int right = row.right - 2;
-        // diamond at the commit's graph column
-        if (!r.hash.empty()) {
-            int dx = 4 + r.col * kColW + kColW / 2;
-            if (dx >= 4 && dx <= 4 + kGraphW) {
-                int cy = (row.top + row.bottom) / 2;
-                ganttPts.push_back({ dx, cy });
-                DrawDiamond(dc, dx, cy,
-                            selected ? 3 : 4, selected ? RGB(255, 255, 255)
-                                                       : RGB(49, 106, 197));
+
+        HPEN oldPen = (HPEN)SelectObject(dc, selected ? laneS : laneN);
+        int mid = (yTop + yBot) / 2;
+        for (size_t j = 0; j < r.graph.size(); ++j) {
+            wchar_t ch = r.graph[j];
+            if ((j & 1) == 0) {
+                if (ch != L'|' && ch != L'*') continue;
+                int x = LaneX((int)j);
+                if (x > 4 + kGraphW) break;
+                int lane = (int)j / 2;
+                bool up = idx > 0 && LaneJoins(c->rows[idx - 1].graph, lane, true);
+                bool down = idx + 1 < (int)c->rows.size() &&
+                            LaneJoins(c->rows[idx + 1].graph, lane, false);
+                int y0 = up ? yTop : mid;
+                int y1 = down ? yBot : mid;
+                if (y1 > y0) {
+                    MoveToEx(dc, x, y0, nullptr);
+                    LineTo(dc, x, y1);
+                }
+            } else {
+                int lane = (int)j / 2;
+                int xl = LaneX((int)j - 1);
+                int xr = xl + kColW;
+                if (xr > 4 + kGraphW) break;
+                if (ch == L'\\') {
+                    bool up = idx > 0 && LaneJoins(c->rows[idx - 1].graph, lane, true);
+                    bool down = idx + 1 < (int)c->rows.size() &&
+                                LaneJoins(c->rows[idx + 1].graph, lane + 1, false);
+                    MoveToEx(dc, xl, up ? yTop : mid, nullptr);
+                    LineTo(dc, xr, down ? yBot : mid);
+                } else if (ch == L'/') {
+                    bool up = idx > 0 && LaneJoins(c->rows[idx - 1].graph, lane + 1, true);
+                    bool down = idx + 1 < (int)c->rows.size() &&
+                                LaneJoins(c->rows[idx + 1].graph, lane, false);
+                    MoveToEx(dc, xr, up ? yTop : mid, nullptr);
+                    LineTo(dc, xl, down ? yBot : mid);
+                }
             }
         }
+        SelectObject(dc, oldPen);
+        size_t star = r.hash.empty() ? std::wstring::npos : r.graph.find(L'*');
+        if (star != std::wstring::npos && LaneX((int)star) <= 4 + kGraphW) {
+            DrawDiamond(dc, LaneX((int)star), mid, 4,
+                        selected ? RGB(255, 255, 255) : RGB(49, 106, 197));
+        }
+
+        // columns: graph | commit | subject | date | author
+        int subjRight = kRight - kDateW - kAuthorW;
         SetTextColor(dc, selected ? RGB(255, 255, 255) : kLogGray);
         if (!r.hash.empty()) {
-            RECT hr{ 4 + kGraphW, row.top, 4 + kGraphW + kHashW2, row.bottom };
+            RECT hr{ 4 + kGraphW, yTop, 4 + kGraphW + kHashW, yBot - 1 };
+            HGDIOBJ om = SelectObject(dc, c->mono);
             DrawTextW(dc, r.hash.c_str(), (int)r.hash.size(), &hr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dc, om);
         }
-        int subjRight = right - kDateW2 - kAuthorW2;
-        RECT sr{ 4 + kGraphW + kHashW2, row.top, subjRight, row.bottom };
+        RECT sr{ 4 + kGraphW + kHashW, yTop, subjRight, yBot - 1 };
+        SelectObject(dc, c->ui);
         SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
         DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        RECT dr{ subjRight, row.top, subjRight + kDateW2, row.bottom };
-        SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
+        RECT dr{ subjRight, yTop, subjRight + kDateW, yBot - 1 };
+        SetTextColor(dc, selected ? RGB(232, 232, 232) : kLogGray);
         DrawTextW(dc, r.date.c_str(), (int)r.date.size(), &dr,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        RECT ar{ subjRight + kDateW2, row.top, right, row.bottom };
-        SetTextColor(dc, selected ? RGB(240, 240, 240) : kLogGray);
+        RECT ar{ subjRight + kDateW, yTop, kRight, yBot - 1 };
+        SetTextColor(dc, selected ? RGB(232, 232, 232) : kLogGray);
         DrawTextW(dc, r.author.c_str(), (int)r.author.size(), &ar,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
-    // connecting line through the commit diamonds
-    if (ganttPts.size() >= 2) {
-        HPEN gp = CreatePen(PS_SOLID, 1, RGB(49, 106, 197));
-        HPEN ogp = (HPEN)SelectObject(dc, gp);
-        HGDIOBJ obrp = (HGDIOBJ)SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Polyline(dc, ganttPts.data(), (int)ganttPts.size());
-        SelectObject(dc, obrp);
-        SelectObject(dc, ogp);
-        DeleteObject(gp);
-    }
-    SelectObject(dc, oldMono);
+    if (laneN) DeleteObject(laneN);
+    if (laneS) DeleteObject(laneS);
 
     // separator, status line, commit details and the patch pane
-    SelectObject(dc, oldFont);
+    SelectObject(dc, c->ui);
     HPEN sep = CreatePen(PS_SOLID, 1, kLogBorder);
     HPEN osep = (HPEN)SelectObject(dc, sep);
     MoveToEx(dc, 4, listBottom + 2, nullptr);
@@ -1699,22 +1988,49 @@ void LogPaint(LogCtx* c) {
     wchar_t st[160] = {};
     int shown = c->visible;
     if (shown > (int)c->rows.size() - c->top) shown = (int)c->rows.size() - c->top;
-    _snwprintf_s(st, _TRUNCATE, L"коммитов: %d  ▸ %d…%d   (↑↓ — коммиты, колесо в диффе — прокрутка, Enter — закрыть)",
+    _snwprintf_s(st, _TRUNCATE, L"коммитов: %d  ▸ %d…%d",
                  (int)c->rows.size(), c->top + 1, c->top + shown);
-    RECT sr{ 8, listBottom + 4, rc.right - 8, listBottom + 20 };
+    RECT sr{ 8, listBottom + 4, rc.right - 390, listBottom + 22 };
     DrawTextW(dc, st, -1, &sr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-    int detTop = listBottom + 22;
-    int detBottom = detTop + 34;
-    if (!c->detail.empty()) {
-        RECT det{ 8, detTop, rc.right - 8, detBottom };
-        SetTextColor(dc, RGB(0, 0, 0));
-        DrawTextW(dc, c->detail.c_str(), -1, &det,
-                  DT_LEFT | DT_TOP | DT_NOPREFIX | DT_END_ELLIPSIS | DT_WORDBREAK);
+    {
+        wchar_t hint[128] = {};
+        if (c->diffLines > 0)
+            _snwprintf_s(hint, _TRUNCATE,
+                         L"изменений: %d   ·   ↑↓ / колесо — прокрутка, Enter — закрыть",
+                         c->diffLines);
+        else
+            _snwprintf_s(hint, _TRUNCATE,
+                         L"↑↓ / колесо — прокрутка, Enter — закрыть");
+        RECT hr{ rc.right - 380, listBottom + 4, rc.right - 8, listBottom + 22 };
+        DrawTextW(dc, hint, -1, &hr,
+                  DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
 
-    // patch pane: one line per diff row, coloured by its first character
-    int patchTop = detBottom + 4;
+    // Commit details: the subject stands out, author/date is secondary.
+    int detTop = LogDetailTop(rc);
+    if (!c->detail.empty()) {
+        size_t nl = c->detail.find(L'\n');
+        std::wstring subj = nl == std::wstring::npos ? c->detail : c->detail.substr(0, nl);
+        std::wstring rest = nl == std::wstring::npos ? L"" : TrimWs(c->detail.substr(nl + 1));
+        SetTextColor(dc, RGB(0, 0, 0));
+        RECT sjr{ 8, detTop, rc.right - 8, detTop + 19 };
+        SelectObject(dc, c->bold);
+        DrawTextW(dc, subj.c_str(), (int)subj.size(), &sjr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, c->ui);
+        if (!rest.empty()) {
+            SetTextColor(dc, kLogGray);
+            RECT rr{ 8, detTop + 19, rc.right - 8, detTop + 38 };
+            DrawTextW(dc, rest.c_str(), (int)rest.size(), &rr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+    }
+
+    // Patch pane: a line-number gutter, a sign column and full-width tints for
+    // added/removed lines, hunk headers and file headers. The numbers come from
+    // the hunk ranges parsed in LogSelect, so long files stay easy to follow.
+    int patchTop = LogPatchTop(rc);
     int patchBottom = rc.bottom - 6;
     if (patchBottom > patchTop && !c->diff.empty()) {
         int rowsFit = (patchBottom - patchTop) / kLogRowH;
@@ -1724,52 +2040,113 @@ void LogPaint(LogCtx* c) {
         if (c->diffTop > maxTop) c->diffTop = maxTop;
         if (c->diffTop < 0) c->diffTop = 0;
 
-        HGDIOBJ oldMono2 = SelectObject(dc, c->mono);
-        size_t pos = 0;
-        int lineIdx = 0;
-        while (pos <= c->diff.size()) {
-            size_t e = c->diff.find_first_of(L"\r\n", pos);
-            if (e == std::wstring::npos) e = c->diff.size();
-            std::wstring line = c->diff.substr(pos, e - pos);
-            pos = e;
-            while (pos < c->diff.size() && (c->diff[pos] == L'\r' || c->diff[pos] == L'\n')) ++pos;
-            if (lineIdx >= c->diffTop && lineIdx < c->diffTop + rowsFit) {
-                int y = patchTop + (lineIdx - c->diffTop) * kLogRowH;
-                RECT lr{ 6, y, rc.right - 6, y + kLogRowH - 1 };
-                wchar_t first = line.empty() ? L' ' : line[0];
-                if (first == L'+' && !(line.size() > 2 && line[1] == L'+')) {
-                    HBRUSH gb = CreateSolidBrush(RGB(228, 245, 228));
-                    FillRect(dc, &lr, gb);
-                    DeleteObject(gb);
-                    SetTextColor(dc, RGB(20, 110, 20));
-                } else if (first == L'-' && !(line.size() > 2 && line[1] == L'-')) {
-                    HBRUSH rb = CreateSolidBrush(RGB(252, 232, 232));
-                    FillRect(dc, &lr, rb);
-                    DeleteObject(rb);
-                    SetTextColor(dc, RGB(160, 30, 30));
-                } else if (line.rfind(L"@@", 0) == 0) {
-                    SetTextColor(dc, RGB(40, 80, 160));
-                } else if (line.rfind(L"diff --git", 0) == 0 ||
-                           line.rfind(L"index ", 0) == 0 ||
-                           line.rfind(L"--- ", 0) == 0 ||
-                           line.rfind(L"+++ ", 0) == 0) {
-                    SetTextColor(dc, kLogGray);
-                } else {
-                    SetTextColor(dc, RGB(0, 0, 0));
-                }
-                DrawTextW(dc, line.c_str(), (int)line.size(), &lr,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            }
-            ++lineIdx;
-            if (pos >= c->diff.size()) break;
-        }
-        SelectObject(dc, oldMono2);
+        HPEN psep = CreatePen(PS_SOLID, 1, kLogBorder);
+        HPEN opsep = (HPEN)SelectObject(dc, psep);
+        MoveToEx(dc, 4, patchTop - 4, nullptr);
+        LineTo(dc, rc.right - 4, patchTop - 4);
+        SelectObject(dc, opsep);
+        DeleteObject(psep);
 
-        wchar_t dh[64] = {};
-        _snwprintf_s(dh, _TRUNCATE, L"дифф: %d строк ▸ %d", c->diffLines, c->diffTop + 1);
-        RECT dhr{ rc.right - 200, listBottom + 4, rc.right - 8, listBottom + 20 };
-        SetTextColor(dc, kLogGray);
-        DrawTextW(dc, dh, -1, &dhr, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
+        const int kNoW = 36;
+        const int kSignW = 12;
+        int gutter = 6 + kNoW * 2 + kSignW;
+
+        RECT pane{ 4, patchTop - 1, rc.right - 4, patchBottom + 1 };
+        HBRUSH pb = CreateSolidBrush(kLogPatchBg);
+        FillRect(dc, &pane, pb);
+        DeleteObject(pb);
+
+        for (int i = c->diffTop; i < c->diffTop + rowsFit && i < (int)c->diff.size(); ++i) {
+            const DiffLine& d = c->diff[i];
+            int y = patchTop + (i - c->diffTop) * kLogRowH;
+            RECT lr{ 6, y, rc.right - 6, y + kLogRowH - 1 };
+            COLORREF fg = RGB(45, 45, 45);
+            COLORREF bgc = kLogPatchBg;
+            switch (d.kind) {
+            case DiffLine::Add:      fg = kLogAddTx;  bgc = kLogAddBg;  break;
+            case DiffLine::Del:      fg = kLogDelTx;  bgc = kLogDelBg;  break;
+            case DiffLine::Hunk:     fg = kLogHunkTx; bgc = kLogHunkBg; break;
+            case DiffLine::FileHead: fg = RGB(26, 60, 120); bgc = kLogHeadBg; break;
+            case DiffLine::Meta:
+                fg = kLogGray;
+                if (d.text.rfind(L"--- ", 0) == 0) fg = RGB(150, 45, 45);
+                else if (d.text.rfind(L"+++ ", 0) == 0) fg = RGB(30, 110, 30);
+                break;
+            case DiffLine::Stat:
+            case DiffLine::Note:     fg = kLogGray; break;
+            default: break;
+            }
+            if (bgc != kLogPatchBg) {
+                HBRUSH b = CreateSolidBrush(bgc);
+                FillRect(dc, &lr, b);
+                DeleteObject(b);
+            }
+            if (d.kind == DiffLine::FileHead) {
+                HPEN fp = CreatePen(PS_SOLID, 1, kLogBorder);
+                HPEN ofp = (HPEN)SelectObject(dc, fp);
+                MoveToEx(dc, 6, y, nullptr);
+                LineTo(dc, rc.right - 6, y);
+                SelectObject(dc, ofp);
+                DeleteObject(fp);
+                // GitExtensions prints the raw command line: diff --git a/x b/x
+                std::wstring hdr = L"diff --git a/" + d.text + L" b/" + d.text;
+                RECT tr{ 8, y, rc.right - 8, y + kLogRowH - 1 };
+                SelectObject(dc, c->bold);
+                SetTextColor(dc, fg);
+                DrawTextW(dc, hdr.c_str(), (int)hdr.size(), &tr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                continue;
+            }
+
+            SelectObject(dc, c->monoBig ? c->monoBig : c->mono);
+            if (!d.hl.empty() &&
+                (d.kind == DiffLine::Add || d.kind == DiffLine::Del)) {
+                HBRUSH hb = CreateSolidBrush(d.kind == DiffLine::Add ? kLogAddHl : kLogDelHl);
+                int limit = rc.right - 8;
+                for (const std::pair<int, int>& h : d.hl) {
+                    SIZE sz{};
+                    int x1 = gutter;
+                    if (h.first > 0) {
+                        GetTextExtentPoint32W(dc, d.text.c_str(), h.first, &sz);
+                        x1 += sz.cx;
+                    }
+                    int x2 = gutter;
+                    GetTextExtentPoint32W(dc, d.text.c_str(), h.second, &sz);
+                    x2 += sz.cx;
+                    if (x1 >= limit) break;
+                    if (x2 > limit) x2 = limit;
+                    RECT hr{ x1, y + 2, x2, y + kLogRowH - 3 };
+                    FillRect(dc, &hr, hb);
+                }
+                DeleteObject(hb);
+            }
+            wchar_t nb[16] = {};
+            if (d.oldNo) {
+                SetTextColor(dc, kLogLineNo);
+                _snwprintf_s(nb, _TRUNCATE, L"%d", d.oldNo);
+                RECT nr{ 6, y, 6 + kNoW - 4, y + kLogRowH - 1 };
+                DrawTextW(dc, nb, -1, &nr,
+                          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            if (d.newNo) {
+                SetTextColor(dc, kLogLineNo);
+                _snwprintf_s(nb, _TRUNCATE, L"%d", d.newNo);
+                RECT nr{ 6 + kNoW, y, 6 + kNoW * 2 - 4, y + kLogRowH - 1 };
+                DrawTextW(dc, nb, -1, &nr,
+                          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            if (d.kind == DiffLine::Add || d.kind == DiffLine::Del) {
+                SetTextColor(dc, fg);
+                RECT signr{ 6 + kNoW * 2 + 2, y, 6 + kNoW * 2 + kSignW, y + kLogRowH - 1 };
+                DrawTextW(dc, d.kind == DiffLine::Add ? L"+" : L"-", 1, &signr,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            SetTextColor(dc, fg);
+            int textLeft = (d.kind == DiffLine::Hunk) ? 8 : gutter;
+            RECT tr{ textLeft, y, rc.right - 8, y + kLogRowH - 1 };
+            DrawTextW(dc, d.text.c_str(), (int)d.text.size(), &tr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
     }
     EndPaint(c->hwnd, &ps);
 }
@@ -1794,19 +2171,19 @@ void LogSelect(LogCtx* c, int idx) {
     c->diffTop = 0;
     c->diffLines = 0;
     if (!r.hash.empty()) {
-        std::wstring body = RunGit({ L"-C", c->dir, L"show", L"-s",
-                                     L"--format=%an <%ae>, %ad%n%B", r.hash });
+        std::wstring body = RunGit({ L"-c", L"core.quotepath=false",
+                                     L"-C", c->dir, L"show", L"-s",
+                                     L"--format=%s%n%an <%ae>, %ad", r.hash });
         c->detail = TrimWs(body);
         if (c->detail.empty()) c->detail = r.author + L", " + r.date;
 
         // Patch for the diff pane: stat first (one line per file), then the
-        // unified diff itself. Colour comes from the line prefix in LogPaint.
-        std::wstring patch = RunGit({ L"-C", c->dir, L"show", L"--format=",
+        // unified diff itself. ParseDiff turns it into rows with line numbers.
+        std::wstring patch = RunGit({ L"-c", L"core.quotepath=false",
+                                      L"-C", c->dir, L"show", L"--format=",
                                       L"--stat", L"--patch", L"--no-color", r.hash });
-        c->diff = patch;
-        for (wchar_t ch : patch)
-            if (ch == L'\n') ++c->diffLines;
-        if (c->diffLines == 0 && !patch.empty()) c->diffLines = 1;
+        ParseDiff(patch, c->diff);
+        c->diffLines = (int)c->diff.size();
     }
     InvalidateRect(c->hwnd, nullptr, FALSE);
 }
@@ -1817,8 +2194,8 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         if (mmi) {
-            mmi->ptMinTrackSize.x = 620;
-            mmi->ptMinTrackSize.y = 420;
+            mmi->ptMinTrackSize.x = 640;
+            mmi->ptMinTrackSize.y = 460;
         }
         return 0;
     }
@@ -1831,7 +2208,7 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (c) {
             RECT rc{};
             GetClientRect(h, &rc);
-            SetRect(&c->rcClose, rc.right - 26, 2, rc.right - 2, 22);
+            SetRect(&c->rcClose, rc.right - 28, 2, rc.right - 2, 24);
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
@@ -1841,11 +2218,10 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ScreenToClient(h, &pt);
         RECT rc{};
         GetClientRect(h, &rc);
-        int listBottom = 24 + (rc.bottom - 24) * 45 / 100;
         int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 3;
-        if (pt.y > listBottom + 22) {
+        if (pt.y > LogPatchTop(rc)) {
             // cursor over the patch pane — scroll the diff
-            int rowsFit = (rc.bottom - 6 - (listBottom + 60)) / kLogRowH;
+            int rowsFit = (rc.bottom - 6 - LogPatchTop(rc)) / kLogRowH;
             if (rowsFit < 1) rowsFit = 1;
             int maxTop = c->diffLines - rowsFit;
             if (maxTop < 0) maxTop = 0;
@@ -1869,8 +2245,10 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!c) break;
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         if (PtInRect(&c->rcClose, pt)) { DestroyWindow(h); return 0; }
-        if (pt.y >= 36) {
-            int idx = c->top + (pt.y - 36) / kLogRowH;
+        RECT rc{};
+        GetClientRect(h, &rc);
+        if (pt.y >= kLogListTop && pt.y < LogListBottom(rc)) {
+            int idx = c->top + (pt.y - kLogListTop) / kLogRowH;
             if (idx >= 0 && idx < (int)c->rows.size()) LogSelect(c, idx);
         }
         return 0;
@@ -1926,22 +2304,24 @@ void ShowGitLog(HWND owner) {
                     L"История Git", MB_ICONINFORMATION);
         return;
     }
-    c->mono = LogFont(8, L"Consolas");
-    c->ui = LogFont(8, L"Tahoma");
+    c->mono = LogFont(9, L"Consolas", FW_NORMAL, FIXED_PITCH | FF_MODERN);
+    c->monoBig = LogFont(10, L"Consolas", FW_NORMAL, FIXED_PITCH | FF_MODERN);
+    c->ui = LogFont(9, L"Tahoma", FW_NORMAL, DEFAULT_PITCH | FF_SWISS);
+    c->bold = LogFont(9, L"Tahoma", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
 
     HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitLog",
                              L"История Git — v8inject",
                              WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX |
                              WS_OVERLAPPED | WS_VISIBLE,
-                             CW_USEDEFAULT, CW_USEDEFAULT, 940, 660, owner, nullptr,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 960, 700, owner, nullptr,
                              GetModuleHandleW(nullptr), nullptr);
     if (!h) { delete c; return; }
     SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)c);
     c->hwnd = h;
     RECT rc{};
     GetClientRect(h, &rc);
-    SetRect(&c->rcClose, rc.right - 26, 2, rc.right - 2, 22);
-    c->visible = (rc.bottom - 60 - 24) / kLogRowH;
+    SetRect(&c->rcClose, rc.right - 28, 2, rc.right - 2, 24);
+    c->visible = (LogListBottom(rc) - kLogListTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
     SetForegroundWindow(h);
     LogSelect(c, 0);
@@ -1958,7 +2338,9 @@ void ShowGitLog(HWND owner) {
     }
     if (IsWindow(h)) DestroyWindow(h);
     if (c->mono) DeleteObject(c->mono);
+    if (c->monoBig) DeleteObject(c->monoBig);
     if (c->ui) DeleteObject(c->ui);
+    if (c->bold) DeleteObject(c->bold);
     delete c;
 }
 
