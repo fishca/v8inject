@@ -105,6 +105,11 @@ add_executable(v8inject-gui WIN32
     src/host/procs.cpp
 )
 target_link_libraries(v8inject-gui PRIVATE v8i_common psapi comctl32 comdlg32 shell32)
+# Injecting into 1C:Enterprise needs PROCESS_VM_* and CREATE_THREAD on the
+# target. When 1C runs elevated a Medium-IL injector gets ACCESS_DENIED (5),
+# so the GUI asks for administrator rights.
+target_link_options(v8inject-gui PRIVATE
+    "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
 v8i_set_output(v8inject-gui)
 
 # ---- agent: tray service that auto-injects into 1C on launch ----
