@@ -13,6 +13,7 @@
 #include <cstring>
 
 extern "C" void V8iGitBarDump();  // v8i_export.cpp
+extern "C" void V8iGitBarDumpExtension();
 
 // Git toolbar ("GitBar") for the running 1C configurator.
 //
@@ -273,6 +274,9 @@ const int kWinIdDump = 1, kWinIdInit = 2, kWinIdCommit = 3,
 // to git init (init for an empty folder, clone for a repository already on the
 // server).
 const int kWinIdClone = 13;
+// Extension dump has no cell of its own either: it only makes sense with the
+// «Расширения конфигурации» window active, so it lives in the action list.
+const int kWinIdDumpExt = 14;
 const int kWinIdMenu = 100; // overflow/compact chevron; opens the action list
 
 int MenuCellX() { return 2 + kCells * kCell; }
@@ -2684,6 +2688,7 @@ void ShowActionMenu(HWND owner) {
     struct Item { int id; const wchar_t* text; bool sepBefore; };
     static const Item kItems[] = {
         { kWinIdDump,     L"Выгрузить исходники (команда 45)", true },
+        { kWinIdDumpExt,  L"Выгрузить расширение в файлы (команда 205)", false },
         { kWinIdInit,     L"git init в папке выгрузки", false },
         { kWinIdClone,    L"Клонировать репозиторий…", false },
         { kWinIdCommit,   L"Коммит изменений…", false },
@@ -2723,6 +2728,11 @@ void DoAction(int id) {
     case kWinIdDump: {
         ShowTip(L"выгрузка конфигурации в файлы…");
         V8iGitBarDump();
+        break;
+    }
+    case kWinIdDumpExt: {
+        ShowTip(L"выгрузка расширения: активным должно быть окно «Расширения конфигурации»");
+        V8iGitBarDumpExtension();
         break;
     }
     case kWinIdInit: RunInit(); break;
@@ -2972,5 +2982,11 @@ std::string GitBarCommandToJson(const std::wstring& args) {
                 g_bar.hwnd ? "true" : "false", (unsigned long long)g_bar.threadId);
     return buf;
 }
+
+// Called from the extension-dump worker thread (v8i_export.cpp) with the
+// "wrong active window" hint. The tip control belongs to the bar thread, which
+// is pumping messages after DoAction returned, so the cross-thread SendMessage
+// inside ShowTip is safe.
+void GitBarTipFromWorker(const wchar_t* text) { ShowTip(text ? text : L""); }
 
 }  // namespace v8i

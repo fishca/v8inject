@@ -1404,6 +1404,27 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
 }
 #endif
 
+// A heap page can be freed between VirtualQuery and the read (1C allocates
+// constantly), and a vtable near the end of .rdata can overrun into a page the
+// loader did not commit. Both faults used to take down the payload io thread.
+static bool ReadU32Safe(uintptr_t addr, uint32_t* out) {
+    __try {
+        *out = *(uint32_t*)addr;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool ReadPtrSafe(uintptr_t addr, uintptr_t* out) {
+    __try {
+        *out = *(uintptr_t*)addr;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 #if !defined(_WIN64)
 // x86 runtime calibration: find the ITopLevelFrame vtable without hardcoded
 // constants. Returns 0 when not found. POD-only reads; no calls into 1C.
@@ -1443,7 +1464,6 @@ static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
 
     // walk heap once, remember (object -> vtable) where vtable is in config .rdata
     std::vector<uintptr_t> objs;
-    std::vector<uintptr_t> vts;  // parallel; dedupe vts
     uintptr_t addr = 0x10000;
     while (addr < 0x7FFFFFFF) {
         MEMORY_BASIC_INFORMATION mi = {};
@@ -1455,17 +1475,18 @@ static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
         if (usable) {
             const uintptr_t cap = mi.RegionSize > 64 * 1024 * 1024 ? 64 * 1024 * 1024 : (uintptr_t)mi.RegionSize;
             for (uintptr_t p = (uintptr_t)mi.BaseAddress; p < (uintptr_t)mi.BaseAddress + cap; p += 4) {
-                uint32_t v = *(uint32_t*)p;
+                uint32_t v = 0;
+                if (!ReadU32Safe(p, &v)) continue;
                 if (v < (uint32_t)rdataLo || v >= (uint32_t)rdataHi) continue;
                 // vtable start must satisfy: no header dwords (IUnknown trio) — slots 3..40 in .text
                 bool ok = true;
                 for (int s = 3; s <= 40; ++s) {
-                    uint32_t fn = *(uint32_t*)((uintptr_t)v + s * 4);
-                    if (fn < (uint32_t)textLo || fn >= (uint32_t)textHi) { ok = false; break; }
+                    uint32_t fn = 0;
+                    if (!ReadU32Safe((uintptr_t)v + s * 4, &fn) ||
+                        fn < (uint32_t)textLo || fn >= (uint32_t)textHi) { ok = false; break; }
                 }
                 if (!ok) continue;
                 objs.push_back(p);
-                vts.push_back((uintptr_t)v);
             }
         }
         addr = end == addr ? addr + 4 : end;
@@ -1475,16 +1496,18 @@ static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
     static const uintptr_t kRecvOffs[] = {0x10, 0x20, 0x1C, 0x18, 0x14, 0x24, 0x28,
                                           0x0C, 0x08, 0x04, 0x30, 0x34, 0x38, 0x3C, 0x40};
     for (size_t i = 0; i < objs.size(); ++i) {
-        uintptr_t v = vts[i];
-        uintptr_t core = *(uint32_t*)(objs[i] + 4);
+        uint32_t core32 = 0;
+        if (!ReadU32Safe(objs[i] + 4, &core32) || !core32) continue;
+        uintptr_t core = core32;
         if (!IsReadable((void*)core, 4)) continue;
         for (size_t off = 0; off < sizeof(kRecvOffs) / sizeof(kRecvOffs[0]); ++off) {
             uintptr_t recv = core - kRecvOffs[off];
-            if (!IsReadable((void*)recv, 4)) continue;
-            uint32_t recvVt = *(uint32_t*)recv;
+            uint32_t recvVt = 0;
+            if (!ReadU32Safe(recv, &recvVt)) continue;
             if (!haveFrame) continue;
             if (recvVt < (uint32_t)frameRdataLo || recvVt >= (uint32_t)frameRdataHi) continue;
-            uint32_t tr = *(uint32_t*)((uintptr_t)recvVt + 3 * 4);
+            uint32_t tr = 0;
+            if (!ReadU32Safe((uintptr_t)recvVt + 3 * 4, &tr)) continue;
             if (tr < (uint32_t)frameTextLo || tr >= (uint32_t)frameTextHi) continue;
             // transmitCommand is a real method (thiscall, 2 stack args -> ret 8),
             // NOT a 6-byte property getter `mov eax,[ebp+8]; mov eax,[eax+off]; pop ebp; ret 4`
@@ -3279,6 +3302,10 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     if (!FindModule(L"config.dll", cfg))
         return "{\"status\":\"error\",\"message\":\"config.dll not loaded\"}";
 
+    // True when this call reused the cached x86 frame instead of discovering
+    // it; only then is a second pass (cache invalidation) worth trying.
+    bool usedCachedFrame = false;
+
 #if defined(_WIN64)
     // Re-validate the runtime-discovered frame on every use: 1C destroys
     // transient frames, and a stale object poisons all later calls (its freed
@@ -3311,14 +3338,19 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     // dword points into config.dll .rdata, whose vtable slots 3..40 all point
     // into config.dll .text, and whose receiver chain (core = obj+4,
     // recv = core - off, recv vtable in frame.dll .rdata) is consistent is the
-    // main frame. See CmdDiscoverFrameVtblX86 below.
+    // main frame. Discovered once: the scan walks the whole address space, so
+    // repeating it per command was both slow and racy (freed pages).
     static const uintptr_t kCoreOffset = sizeof(void*);
     static const int kTransmitSlot = 3;
-    g_x86FrameObj = DiscoverFrameVtblX86(cfg);
+    usedCachedFrame = g_x86FrameObj != 0;
+    if (!g_x86FrameObj) g_x86FrameObj = DiscoverFrameVtblX86(cfg);
     if (!g_x86FrameObj)
         return "{\"status\":\"error\",\"message\":\"no frame vtable found on x86\"}";
     const uintptr_t kRecvBackOffset = g_x86RecvOffset;
-    const uintptr_t vtblPtr = *(uint32_t*)g_x86FrameObj;   // vtable of the discovered frame
+    uint32_t vtblVal = 0;
+    if (!ReadU32Safe(g_x86FrameObj, &vtblVal) || !vtblVal)
+        return "{\"status\":\"error\",\"message\":\"frame vtable unreadable\"}";
+    const uintptr_t vtblPtr = vtblVal;   // vtable of the discovered frame
 #endif
 
     char numBuf[256];
@@ -3338,11 +3370,10 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
         // would pick objects with a different receiver layout).
         frame = g_x86FrameObj;
         cached = true;
-        candidates.push_back(frame);
     }
 #endif
-    if (frame && IsReadable((void*)frame, sizeof(void*)) &&
-        *(uintptr_t*)frame == vtblPtr) {
+    uintptr_t frameVt = 0;
+    if (frame && ReadPtrSafe(frame, &frameVt) && frameVt == vtblPtr) {
         cached = true;
         candidates.push_back(frame);
     } else {
@@ -3372,13 +3403,15 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
                 for (uintptr_t p = (uintptr_t)mi.BaseAddress; p < (uintptr_t)mi.BaseAddress + cap;
                      p += sizeof(void*)) {
                     ++scanned;
-                    if (*(uintptr_t*)p == vtblPtr) {
-                        uintptr_t core = *(uintptr_t*)(p + kCoreOffset);
-                        if (IsReadable((void*)core, sizeof(void*)) &&
-                            IsReadable((void*)*(uintptr_t*)core, 32 * sizeof(void*))) {
-                            candidates.push_back(p);
-                            if (candidates.size() >= 16) break;
-                        }
+                    uintptr_t val = 0;
+                    if (!ReadPtrSafe(p, &val) || val != vtblPtr) continue;
+                    uintptr_t core = 0;
+                    uintptr_t coreVt = 0;
+                    if (ReadPtrSafe(p + kCoreOffset, &core) &&
+                        ReadPtrSafe(core, &coreVt) &&
+                        IsReadable((void*)coreVt, 32 * sizeof(void*))) {
+                        candidates.push_back(p);
+                        if (candidates.size() >= 16) break;
                     }
                 }
             }
@@ -3428,11 +3461,11 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
         void* bestRecv = nullptr; void* bestTr = nullptr; uintptr_t bestVt = 0;
         void* aliveRecv = nullptr; void* aliveTr = nullptr; uintptr_t aliveVt = 0;
         for (uintptr_t cand : candidates) {
-            uintptr_t core = *(uintptr_t*)(cand + kCoreOffset);
-            if (!IsReadable((void*)core, sizeof(void*))) continue;
+            uintptr_t core = 0;
+            if (!ReadPtrSafe(cand + kCoreOffset, &core) || !core) continue;
             uintptr_t candRecv = core - kRecvBackOffset;
-            if (!IsReadable((void*)candRecv, sizeof(void*))) continue;
-            uintptr_t recvVt = *(uintptr_t*)candRecv;
+            uintptr_t recvVt = 0;
+            if (!ReadPtrSafe(candRecv, &recvVt)) continue;
             if (!IsReadable((void*)(recvVt + 6 * sizeof(void*)), sizeof(void*))) continue;
             void* candTr = ((void**)recvVt)[kTransmitSlot];
             if (!IsReadable(candTr, 1)) continue;
@@ -3507,6 +3540,14 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
             g_x64DiscoveryTick = now;
             g_x64FrameObj = DiscoverFrameVtblX64(cfg);
             if (g_x64FrameObj) return CmdCommandToJson(args0);
+        }
+#else
+        // The cached frame no longer answers: it was freed/recreated with the
+        // window. Drop it and rediscover once (the retry starts uncached, so a
+        // second failure returns the error instead of recursing forever).
+        if (usedCachedFrame) {
+            g_x86FrameObj = 0;
+            return CmdCommandToJson(args0);
         }
 #endif
         return j + ",\"error\":\"no working receiver chain\"}";
@@ -3626,13 +3667,21 @@ typedef std::string (*CommandFn)(const std::wstring&);
 // thunk that writes into a raw buffer and reports a status code.
 typedef int (*PackedFn)(const wchar_t* text, char* out, size_t outCap, size_t* outLen);
 
+// GetExceptionInformation() is only legal inside the filter expression, so the
+// record is captured there and the handler body stays a plain assignment.
+static int RecordException(EXCEPTION_POINTERS* ep, unsigned* code, uintptr_t* faultAt) {
+    *code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    *faultAt = ep && ep->ExceptionRecord
+                   ? (uintptr_t)ep->ExceptionRecord->ExceptionAddress : 0;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static int GuardCall(PackedFn fn, const wchar_t* text, char* out, size_t outCap,
-                     size_t* outLen, unsigned* code) {
+                     size_t* outLen, unsigned* code, uintptr_t* faultAt) {
     int ok = 0;
     __try {
         ok = fn(text, out, outCap, outLen);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        *code = GetExceptionCode();
+    } __except (RecordException(GetExceptionInformation(), code, faultAt)) {
         ok = 0;
     }
     return ok;
@@ -3671,15 +3720,16 @@ static std::string Guarded(const wchar_t* what, CommandFn fn, const std::wstring
     g_thunk.fn = fn;
     size_t len = 0;
     unsigned code = 0;
-    if (GuardCall(PackedThunk, safe, buffer.data(), buffer.size(), &len, &code))
+    uintptr_t faultAt = 0;
+    if (GuardCall(PackedThunk, safe, buffer.data(), buffer.size(), &len, &code, &faultAt))
         return std::string(buffer.data(), len);
 
     char buf[320];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "{\"status\":\"error\",\"message\":\"command crashed\","
-                "\"command\":\"%ls\",\"exception\":\"0x%08X\"}",
-                what ? what : L"?", code);
-    LogLine("command raised 0x%08X", code);
+                "\"command\":\"%ls\",\"exception\":\"0x%08X\",\"at\":\"0x%llX\"}",
+                what ? what : L"?", code, (unsigned long long)faultAt);
+    LogLine("command raised 0x%08X at 0x%llX", code, (unsigned long long)faultAt);
     return buf;
 }
 
@@ -3946,6 +3996,34 @@ static int RunPayload(const wchar_t* sharedName) {
     return 0;
 }
 
+// One command loop per process. Every attach injects the payload again, and a
+// second loop would pick up the same request as the first one: two designer
+// commands run in parallel (two dialogs, the second one crashes 8.5 after the
+// first command's frames went away). Later probes answer the host handshake
+// only; the flag is reset when the loop finishes so a new attach can restart
+// it after an "exit".
+static volatile LONG g_probeActive = 0;
+
+// A skipping probe still has to report "loaded" to the host that started it,
+// but must not touch g_io (the running loop owns it), so write the readiness
+// reply through a private mapping of the same block.
+static int ReportLoadedOnly(const wchar_t* sharedName) {
+    HANDLE hMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, sharedName);
+    if (!hMap) return -2;
+    SharedIo* io = (SharedIo*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0,
+                                            sizeof(SharedIo));
+    if (!io) { CloseHandle(hMap); return -3; }
+    static const char kLoaded[] = "{\"status\":\"loaded\"}";
+    const size_t n = sizeof(kLoaded) - 1;
+    memcpy(io->response, kLoaded, n);
+    io->response[n] = 0;
+    InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)n);
+    InterlockedExchange((volatile LONG*)&io->ready, kStateResponse);
+    UnmapViewOfFile(io);
+    CloseHandle(hMap);
+    return 0;
+}
+
 // The host starts this on a remote thread. The shared-memory name is derived
 // from our own PID, so nothing has to be marshalled across the process
 // boundary: a bad pointer in a remote thread is the classic way to lose the
@@ -3956,6 +4034,14 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* /*ignored*/) {
     wchar_t name[64] = {};
     _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\v8inject.%lu",
                  GetCurrentProcessId());
+
+    if (InterlockedCompareExchange(&g_probeActive, 1, 0) != 0) {
+        LogLine("v8i_probe: command loop already running, reporting loaded");
+        int rc = ReportLoadedOnly(name);
+        LogLine("v8i_probe leaving (secondary), rc=%d", rc);
+        return rc;
+    }
+
     LogLine("v8i_probe entered, pid=%lu block=%ls",
             GetCurrentProcessId(), name);
 
@@ -3967,6 +4053,7 @@ V8I_API int V8I_CALL v8i_probe(const wchar_t* /*ignored*/) {
 
     int rc = RunPayload(name);
     LogLine("v8i_probe leaving, rc=%d", rc);
+    InterlockedExchange(&g_probeActive, 0);
     return rc;
 }
 
@@ -3987,6 +4074,9 @@ struct DumpWatch {
     int n = 0;
     HANDLE stop = nullptr;
     volatile LONG seen = 0;
+    wchar_t title[256] = {};
+    unsigned num = 45;        // 45 = main config, 205 = extension (contextual)
+    volatile LONG wrong = 0;  // 205 opened the main-configuration dialog
 };
 
 static bool IsPlatformWindow(HWND h) {
@@ -4008,6 +4098,11 @@ static BOOL CALLBACK CollectPlatformWindows(HWND h, LPARAM lp) {
     return TRUE;
 }
 
+namespace v8i {
+// Defined in gitbar.cpp: shows the bar's status tip from any thread.
+void GitBarTipFromWorker(const wchar_t* text);
+}
+
 static BOOL CALLBACK FindNewPlatformWindow(HWND h, LPARAM lp) {
     DumpWatch* w = (DumpWatch*)lp;
     DWORD pid = 0;
@@ -4015,6 +4110,23 @@ static BOOL CALLBACK FindNewPlatformWindow(HWND h, LPARAM lp) {
     if (pid != GetCurrentProcessId() || !IsPlatformWindow(h)) return TRUE;
     for (int i = 0; i < w->n; ++i) {
         if (w->base[i] == h) return TRUE;
+    }
+    // The title tells the two dump dialogs apart: «Выгрузить файлы
+    // конфигурации - ...» (main) vs «... расширения конфигурации - ...».
+    GetWindowTextW(h, w->title, _countof(w->title));
+    if (w->num == 205 && wcscmp(w->title, L"") != 0 &&
+        wcsstr(w->title, L"Выгрузить файлы") && !wcsstr(w->title, L"расширения")) {
+        // Command 205 dumps whatever the ACTIVE window shows; the main dialog
+        // means the extension window was not active — cancel it right away so
+        // a mistaken click cannot dump the whole configuration into the
+        // extension's repository. On 8.5 the platform processes the close only
+        // when its dump command finally returns, so warn the user immediately
+        // instead of waiting for the command channel to time out.
+        InterlockedExchange(&w->wrong, 1);
+        PostMessageW(h, WM_CLOSE, 0, 0);
+        v8i::GitBarTipFromWorker(
+            L"Выгрузка расширения отменена: активным было окно конфигурации. "
+            L"Откройте «Расширения конфигурации», выберите расширение и повторите.");
     }
     InterlockedExchange(&w->seen, 1);
     return FALSE;
@@ -4029,17 +4141,22 @@ static DWORD WINAPI DumpWatchThread(LPVOID lp) {
     return 0;
 }
 
-static DWORD WINAPI V8iGitBarDumpThread(LPVOID) {
+// Shared dump-to-files flow: the platform shows a modal dialog with XML/archive
+// options and the target directory; GitBar only triggers it (the user confirms).
+// "UI thread did not answer" already means the modal dialog held the UI thread
+// for the whole timeout — a success, and nothing to retry.
+static DWORD GitBarDumpVia(unsigned num) {
     DumpWatch w;
+    w.num = num;
     EnumWindows(CollectPlatformWindows, (LPARAM)&w);
     w.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE watch = w.stop ? CreateThread(nullptr, 0, DumpWatchThread, &w, 0, nullptr) : nullptr;
 
-    std::string r = CmdCommandToJson(L"45 0");
-    LogLine("gitbar: cmd 45 -> %s", r.c_str());
+    wchar_t cmd[16];
+    swprintf_s(cmd, L"%u 0", num);
+    std::string r = CmdCommandToJson(cmd);
+    LogLine("gitbar: cmd %u -> %s", num, r.c_str());
 
-    // "UI thread did not answer" already means the modal dialog held the UI
-    // thread for the whole timeout — a success, and nothing to retry.
     bool timedOut = r.find("did not answer") != std::string::npos;
     if (!timedOut) {
         for (int i = 0; i < 50 && !w.seen; ++i) Sleep(30);
@@ -4052,11 +4169,21 @@ static DWORD WINAPI V8iGitBarDumpThread(LPVOID) {
         CloseHandle(watch);
     }
     if (w.stop) CloseHandle(w.stop);
-    LogLine("gitbar: dump dialog seen=%d timedOut=%d", (int)w.seen, timedOut ? 1 : 0);
+    LogLine("gitbar: cmd %u dialog seen=%d timedOut=%d", num, (int)w.seen, timedOut ? 1 : 0);
+    if (w.seen) {
+        char title[512] = {};
+        WideCharToMultiByte(CP_UTF8, 0, w.title, -1, title, sizeof(title), nullptr, nullptr);
+        LogLine("gitbar: cmd %u dialog title \"%s\"", num, title);
+        if (w.wrong) {
+            LogLine("gitbar: 205 opened the MAIN configuration dialog: the "
+                    "«Расширения конфигурации» window was not active (dialog closed)");
+        }
+    }
 
-    if (!timedOut && !w.seen) {
+    if (num == 45 && !timedOut && !w.seen) {
         // No dialog ever showed up: the configuration is closed, so open it
-        // first and dump again.
+        // first and dump again. (205 needs an active extensions window; opening
+        // the main configuration would move the context away from it.)
         std::string r2 = CmdCommandToJson(L"2 0");
         LogLine("gitbar: cmd 2 -> %s", r2.c_str());
         Sleep(800);
@@ -4066,7 +4193,20 @@ static DWORD WINAPI V8iGitBarDumpThread(LPVOID) {
     return 0;
 }
 
+static DWORD WINAPI V8iGitBarDumpThread(LPVOID) { return GitBarDumpVia(45); }
+static DWORD WINAPI V8iGitBarDumpExtThread(LPVOID) { return GitBarDumpVia(205); }
+
 extern "C" __declspec(dllexport) void V8iGitBarDump() {
     HANDLE h = CreateThread(nullptr, 0, V8iGitBarDumpThread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
+// Extension dump: the same dialog flow, but 1C resolves the dump target from
+// the ACTIVE window — command 205 while «Расширения конфигурации» is focused
+// dumps the selected extension, while any other active window makes it dump
+// the main configuration. GitBar therefore only sends the command; the user
+// opens/selects the extension first.
+extern "C" __declspec(dllexport) void V8iGitBarDumpExtension() {
+    HANDLE h = CreateThread(nullptr, 0, V8iGitBarDumpExtThread, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
 }
