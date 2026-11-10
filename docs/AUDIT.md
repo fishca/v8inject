@@ -107,12 +107,16 @@ Payload-сторона жива (`wcsncmp(request, "cmd ", 4)` — `v8i_export.c
 → Либо добавить четыре имени в список форварда (2 строки), либо осознанно
 документировать «только через attach» — но тогда убрать их из README-примеров.
 
-### A4 · P0 · У вендоренного Capstone нет файла лицензии
+### A4 · P0-закрыто · У вендоренного Capstone не было файла лицензии
 
 `cmake/capstone.cmake:3` обещает «see LICENSE.TXT in the upstream tree», но
-файл в `third_party/capstone/` не скопирован. BSD-3-Clause требует сохранения
-уведомления при редистрибуции — для открытого репозитория это надо закрыть
-(добавить LICENSE.TXT + NOTICE-строку в README).
+файла в `third_party/capstone/` не было — BSD-3-Clause требует сохранения
+уведомления при редистрибуции.
+
+→ Закрыто 2026-11-10: заведены `third_party/capstone/LICENSE.TXT` (3-clause
+BSD, Copyright (c) 2013, COSEINC) и `third_party/capstone/LICENSE_LLVM.TXT`
+(University of Illinois/NCSA — X86-дизассемблер LLVM-производный), в README
+добавлена NOTICE-строка в раздел «Лицензия».
 
 ### A5 · P1 · 6 коммитов не опубликованы
 

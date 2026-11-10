@@ -255,3 +255,11 @@ v8inject-gui.exe, v8inject-agent.exe и v8i_payload.dll). Заметки бер�
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE).
+
+Зависимости:
+
+- Capstone (`third_party/capstone`, только x86/x64) — 3-clause BSD
+  (Copyright (c) 2013, COSEINC); X86-дизассемблер основан на коде LLVM
+  (University of Illinois/NCSA Open Source License). Тексты лицензий
+  заведены рядом с исходниками: `third_party/capstone/LICENSE.TXT`
+  и `third_party/capstone/LICENSE_LLVM.TXT`.
