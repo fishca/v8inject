@@ -7,6 +7,7 @@
 #include "v8inject/diag.h"
 #include "icons.h"
 
+#include <cstdlib>
 #include <cstring>
 
 extern "C" void V8iGitBarDump();  // v8i_export.cpp
@@ -34,6 +35,8 @@ extern "C" void V8iGitBarDump();  // v8i_export.cpp
 //        dumpdir=<folder the user dumps the config into>
 //        commitmsg=<default commit message, asked at every commit>
 //        remote=<origin URL, used by 'init' (optional)>
+//        compactwidth=<client width below which the bar collapses to a menu
+//                      button; default 900, 0 disables the compact mode>
 
 #ifndef TTM_POPUP
 #define TTM_POPUP (WM_USER + 34)
@@ -59,6 +62,18 @@ std::wstring IniGet(const wchar_t* key) {
 
 void IniSet(const wchar_t* key, const wchar_t* value) {
     WritePrivateProfileStringW(L"git", key, value, kIniPath());
+}
+
+// Client width below which the full strip would cover the designer's own
+// toolbar buttons; the bar then collapses to a single menu button instead.
+// 0 disables the compact mode. Read on every reposition, so a hand-edited
+// ini takes effect without restarting 1C.
+int CompactThreshold() {
+    wchar_t buf[32] = {};
+    GetPrivateProfileStringW(L"git", L"compactwidth", L"900", buf, 32, kIniPath());
+    int v = (int)wcstol(buf, nullptr, 10);
+    if (v < 0) v = 0;
+    return v > 10000 ? 10000 : v;
 }
 
 std::wstring GitExe() {
@@ -90,6 +105,13 @@ std::wstring TrimForTip(const std::wstring& s, size_t maxLen = 160) {
         if (out.size() >= maxLen) { out += L"…"; break; }
     }
     return out;
+}
+
+std::wstring TrimWs(const std::wstring& s) {
+    size_t b = s.find_first_not_of(L" \t\r\n");
+    if (b == std::wstring::npos) return L"";
+    size_t e = s.find_last_not_of(L" \t\r\n");
+    return s.substr(b, e - b + 1);
 }
 
 // LogLine takes a narrow printf format and vfprintf converts %ls with the "C"
@@ -233,14 +255,43 @@ HWND FindFrame() {
 // ---------------------------------------------------------------------------
 
 const int kCell = 24;       // per-button cell width
-const int kCells = 12;
-const int kBarW = 2 + kCells * kCell + 2;
+const int kCells = 12;      // action cells
+// The strip ends with an overflow cell (the same ellipsis as in compact mode):
+// the popup menu is the only place where clone lives, and on a wide window the
+// full strip has no other way to open it.
+const int kBarW = 2 + (kCells + 1) * kCell + 2;
+const int kCompactW = 2 + kCell + 2;   // collapsed: one chevron cell
 const int kBarH = 24;
 const int kDockY = 28;      // toolbar row, just under the menu
 const int kWinIdDump = 1, kWinIdInit = 2, kWinIdCommit = 3,
           kWinIdPush = 4, kWinIdSettings = 5, kWinIdLog = 6,
           kWinIdPull = 7, kWinIdFetch = 8, kWinIdBranches = 9,
           kWinIdStash = 10, kWinIdTags = 11, kWinIdStatus = 12;
+// Clone has no cell of its own: it only exists in the popup action list, next
+// to git init (init for an empty folder, clone for a repository already on the
+// server).
+const int kWinIdClone = 13;
+const int kWinIdMenu = 100; // overflow/compact chevron; opens the action list
+
+int MenuCellX() { return 2 + kCells * kCell; }
+
+// Indexed by cell id - 1, so the table must stay aligned with the ids.
+const wchar_t* kCellTexts[kCells] = {
+    L"Выгрузить исходники: конфигурация в файлы (команда 45)",
+    L"git init в папке выгрузки (+ origin из настроек)",
+    L"Коммит изменений (спросит комментарий)",
+    L"Пуш в удалённый репозиторий",
+    L"Настройки: git.exe, папка выгрузки, комментарий, remote",
+    L"История коммитов (git log --graph)",
+    L"Забрать изменения из удалённого репозитория (git pull)",
+    L"Получить изменения без слияния (git fetch --all --prune)",
+    L"Ветки: переключить или удалить (git branch -a)",
+    L"Отложенные изменения: применить или удалить (git stash list)",
+    L"Теги: удалить или отправить в origin (git tag -n1)",
+    L"Рабочая копия: индексировать, снять, коммит (git status)",
+};
+const wchar_t* kCompactTip = L"GitBar свёрнута: все команды — в меню";
+const wchar_t* kMenuTip = L"Все команды GitBar: клонирование, ветки, теги, stash, настройки";
 
 struct GitBar {
     HWND hwnd = nullptr;
@@ -249,6 +300,8 @@ struct GitBar {
     int hover = 0;          // cell index under the cursor (1..kCells), 0 = none
     bool pressed = false;
     bool dragging = false;
+    bool compact = false;   // one chevron instead of the 12 cells
+    bool menuOpen = false;  // TrackPopupMenu is modal: pause repositioning
     POINT pressPt{};
     RECT lastFrame{};
     DWORD threadId = 0;
@@ -264,12 +317,32 @@ int CellX(int id) { return 2 + (id - 1) * kCell; }
 
 int IdFromPoint(POINT pt) {
     if (pt.y < 0 || pt.y >= kBarH) return 0;
+    if (g_bar.compact) return pt.x >= 0 && pt.x < kCompactW ? kWinIdMenu : 0;
     for (int id = 1; id <= kCells; ++id) {
         int x = CellX(id);
         if (pt.x >= x && pt.x < x + kCell) return id;
     }
+    int mx = MenuCellX();
+    if (pt.x >= mx && pt.x < mx + kCell) return kWinIdMenu;
     return 0;
 }
+
+void SetCompact(bool compact) {
+    if (g_bar.compact == compact) return;
+    g_bar.compact = compact;
+    g_bar.hover = 0;
+    if (g_bar.tooltip && g_bar.hwnd) {
+        // Tool 1 covers the chevron once the bar shrinks to one cell.
+        TOOLINFOW ti{ sizeof(ti) };
+        ti.hwnd = g_bar.hwnd;
+        ti.uId = 1;
+        ti.lpszText = (LPWSTR)(compact ? kCompactTip : kCellTexts[0]);
+        SendMessageW(g_bar.tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    }
+    if (g_bar.hwnd) InvalidateRect(g_bar.hwnd, nullptr, FALSE);
+}
+
+int BarW() { return g_bar.compact ? kCompactW : kBarW; }
 
 // Every glyph is a 1C toolbar picture, baked to premultiplied BGRA by
 // tools/gen_icons.py: hand-drawn GDI shapes never matched the platform's look,
@@ -320,6 +393,24 @@ void DrawIcon(HDC dc, const unsigned char* px, int ox, int oy) {
     DeleteObject(bmp);
 }
 
+// The overflow cell: three dots, the same glyph in the compact bar and at the
+// end of the full strip.
+void PaintMenuCell(HDC dc, const RECT& cell) {
+    if (g_bar.hover == kWinIdMenu) {
+        HBRUSH hl = CreateSolidBrush(g_bar.pressed ? RGB(226, 216, 178)
+                                                   : RGB(250, 244, 214));
+        FillRect(dc, &cell, hl);
+        DeleteObject(hl);
+    }
+    HBRUSH dot = CreateSolidBrush(RGB(74, 70, 60));
+    int cx = (cell.left + cell.right) / 2, cy = (cell.top + cell.bottom) / 2;
+    for (int i = -1; i <= 1; ++i) {
+        RECT r{ cx + i * 6 - 1, cy - 1, cx + i * 6 + 2, cy + 2 };
+        FillRect(dc, &r, dot);
+    }
+    DeleteObject(dot);
+}
+
 void Paint(HWND hwnd) {
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(hwnd, &ps);
@@ -335,6 +426,14 @@ void Paint(HWND hwnd) {
     SelectObject(dc, GetStockObject(NULL_BRUSH));
     Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
     DeleteObject(border);
+
+    if (g_bar.compact) {
+        // One cell with an ellipsis: the actions live in its popup menu.
+        RECT cell{ 0, 1, kCompactW, kBarH - 1 };
+        PaintMenuCell(dc, cell);
+        EndPaint(hwnd, &ps);
+        return;
+    }
 
     for (int id = 1; id <= kCells; ++id) {
         int x = CellX(id);
@@ -353,6 +452,8 @@ void Paint(HWND hwnd) {
         DrawIcon(dc, IconFor(id), x + (kCell - icons::kSize) / 2,
                  (kBarH - icons::kSize) / 2);
     }
+    RECT menuCell{ MenuCellX(), 1, MenuCellX() + kCell, kBarH - 1 };
+    PaintMenuCell(dc, menuCell);
     EndPaint(hwnd, &ps);
 }
 
@@ -369,6 +470,16 @@ void Reposition(bool forceDock) {
     int w = cr.right - cr.left;
     int h = cr.bottom - cr.top;
 
+    // The full strip is ~300px wide; on a narrow designer window it would sit
+    // on top of 1C's own toolbar buttons, so below the ini threshold it
+    // collapses into a single chevron cell.
+    int threshold = CompactThreshold();
+    bool compact = threshold > 0 && w < threshold;
+    bool modeChanged = (compact != g_bar.compact);
+    SetCompact(compact);
+    if (g_bar.menuOpen) return;   // the popup follows the bar on the next tick
+    int barW = BarW();
+
     RECT cur{};
     GetWindowRect(g_bar.hwnd, &cur);
     POINT tl{ cur.left, cur.top };
@@ -379,7 +490,8 @@ void Reposition(bool forceDock) {
         // follow the frame in screen coordinates and hide with it.
         POINT origin{ 0, 0 };
         ClientToScreen(frame, &origin);      // client (0,0) in screen space
-        tl.x = origin.x + (w - kBarW - 4);
+        tl.x = origin.x + (w - barW - 4);
+        if (tl.x < origin.x) tl.x = origin.x;
         tl.y = origin.y + kDockY;
         if (!IsWindowVisible(frame)) { ShowWindow(g_bar.hwnd, SW_HIDE); hiddenMinimized = true; }
         else if (!IsWindowVisible(g_bar.hwnd)) { ShowWindow(g_bar.hwnd, SW_SHOWNOACTIVATE); }
@@ -388,18 +500,22 @@ void Reposition(bool forceDock) {
         bool frameChanged = (cr.right != g_bar.lastFrame.right ||
                              cr.bottom != g_bar.lastFrame.bottom);
         g_bar.lastFrame = cr;
-        if (forceDock || frameChanged) {
-            tl.x = w - kBarW - 4;
+        if (forceDock || frameChanged || modeChanged) {
+            tl.x = w - barW - 4;
             tl.y = kDockY;
         }
         if (tl.x < 0) tl.x = 0;
         if (tl.y < 0) tl.y = 0;
-        if (tl.x > w - kBarW) tl.x = w - kBarW;
-        if (tl.y > h - kBarH) tl.y = h - kBarH;
+        int maxX = w - barW; if (maxX < 0) maxX = 0;
+        int maxY = h - kBarH; if (maxY < 0) maxY = 0;
+        if (tl.x > maxX) tl.x = maxX;
+        if (tl.y > maxY) tl.y = maxY;
     }
     if (hiddenMinimized) return;
-    SetWindowPos(g_bar.hwnd, HWND_TOP, tl.x, tl.y, 0, 0,
-                 SWP_NOSIZE | SWP_NOACTIVATE | (g_topLevelDwm ? 0 : SWP_SHOWWINDOW));
+    // The size is always passed along: a mode switch while the frame was
+    // minimized must still resize the (hidden) window.
+    SetWindowPos(g_bar.hwnd, HWND_TOP, tl.x, tl.y, barW, kBarH,
+                 SWP_NOACTIVATE | (g_topLevelDwm ? 0 : SWP_SHOWWINDOW));
 }
 
 // The per-button tools are TTF_SUBCLASS and must stay silent unless hovered, so
@@ -687,6 +803,169 @@ std::wstring DoCommit(const std::wstring& dir, const std::wstring& msg) {
     return RunGit({ L"-C", dir, L"commit", L"-m", msg });
 }
 
+std::wstring LocalBranch(const std::wstring& dir) {
+    std::wstring b = TrimWs(RunGit({ L"-C", dir, L"rev-parse", L"--abbrev-ref", L"HEAD" }));
+    return b == L"HEAD" ? std::wstring() : b;
+}
+
+// GitHub names the first branch either main or master, and a repository created
+// with a README has its commit on that branch. Pull requests must use that name,
+// not the local one: pulling origin/master from a main-only repository fails.
+std::wstring RemoteDefaultBranch(const std::wstring& dir) {
+    std::wstring refs = RunGit({ L"-C", dir, L"ls-remote", L"--symref", L"origin", L"HEAD" });
+    const std::wstring prefix = L"ref: refs/heads/";
+    size_t p = refs.find(prefix);
+    if (p == std::wstring::npos) return std::wstring();
+    size_t start = p + prefix.size();
+    size_t end = refs.find_first_of(L"\r\n\t ", start);
+    return refs.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+}
+
+std::wstring UpstreamBranch(const std::wstring& dir) {
+    std::wstring u = TrimWs(RunGit({ L"-C", dir, L"rev-parse", L"--abbrev-ref",
+                                     L"--symbolic-full-name", L"@{u}" }));
+    const std::wstring prefix = L"origin/";
+    if (u.rfind(prefix, 0) != 0) return std::wstring();
+    return u.substr(prefix.size());
+}
+
+// The branch to pull from and push to: the upstream once it exists, then the
+// branch GitHub already has, then the local name.
+std::wstring PullTarget(const std::wstring& dir) {
+    std::wstring b = UpstreamBranch(dir);
+    if (!b.empty()) return b;
+    b = RemoteDefaultBranch(dir);
+    if (!b.empty()) return b;
+    return LocalBranch(dir);
+}
+
+// Pull that also works right after git init (no upstream yet) and against a
+// repository with an unrelated history — GitHub's initial README commit.
+std::wstring PullOrigin(const std::wstring& dir, bool allowUnrelated) {
+    std::wstring target = PullTarget(dir);
+
+    if (!allowUnrelated) {
+        std::wstring out = TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit" }));
+        if (out.find(L"no tracking information") == std::wstring::npos &&
+            out.find(L"no configured push destination") == std::wstring::npos) {
+            return out;
+        }
+        if (target.empty()) return out;
+        out = TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit", L"origin", target }));
+        if (out.find(L"unrelated histories") == std::wstring::npos) return out;
+    }
+    if (target.empty()) return L"не удалось определить ветку origin";
+    return TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit",
+                           L"--allow-unrelated-histories", L"origin", target }));
+}
+
+bool DirHasEntries(const std::wstring& dir) {
+    std::wstring pattern = dir;
+    if (pattern.empty() || pattern.back() != L'\\') pattern += L'\\';
+    pattern += L'*';
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool any = false;
+    do {
+        if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+            any = true;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return any;
+}
+
+int CALLBACK BrowseInitProc(HWND h, UINT msg, LPARAM, LPARAM data) {
+    if (msg == BFFM_INITIALIZED && data)
+        SendMessageW(h, BFFM_SETSELECTIONW, TRUE, data);
+    return 0;
+}
+
+bool PickFolder(HWND owner, const wchar_t* title, const std::wstring& initial,
+                std::wstring* out) {
+    BROWSEINFOW bi{};
+    bi.hwndOwner = owner;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+    bi.lpfn = BrowseInitProc;
+    bi.lParam = (LPARAM)(initial.empty() ? nullptr : initial.c_str());
+    LPITEMIDLIST idl = SHBrowseForFolderW(&bi);
+    if (!idl) return false;
+    wchar_t path[MAX_PATH] = {};
+    bool ok = SHGetPathFromIDListW(idl, path) != FALSE;
+    CoTaskMemFree(idl);
+    if (ok) *out = path;
+    return ok;
+}
+
+// A repository created on GitHub (with README, .gitignore, license) exists
+// before the configuration is dumped anywhere. Cloning it into the dump folder
+// makes the folder a normal clone, so the first push is a fast-forward and the
+// unrelated-histories merge is not needed at all.
+void RunClone() {
+    std::wstring def = IniGet(L"remote");
+    std::wstring remote;
+    if (!PromptText(g_bar.hwnd, L"GitBar — клонирование репозитория",
+                    L"URL репозитория (git clone):", def, &remote)) {
+        ShowTip(L"клонирование отменено");
+        return;
+    }
+    if (remote.empty()) { ShowTip(L"не указан URL репозитория"); return; }
+
+    std::wstring dir;
+    for (;;) {
+        // BIF_NEWDIALOGSTYLE needs COM on this thread; the bar thread never
+        // initializes it for anything else.
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        std::wstring pick;
+        bool picked = PickFolder(g_bar.hwnd, L"Куда клонировать (папка должна быть пустой)",
+                                 IniGet(L"dumpdir"), &pick);
+        if (SUCCEEDED(hr)) CoUninitialize();
+        if (!picked) { ShowTip(L"клонирование отменено"); return; }
+
+        if (DirHasEntries(pick)) {
+            if (MessageBoxW(g_bar.hwnd,
+                            (L"Папка не пуста:\n" + pick +
+                             L"\n\ngit clone разворачивается только в пустую "
+                             L"или ещё не созданную папку. Выбрать другую?").c_str(),
+                            L"GitBar — клонирование",
+                            MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
+                ShowTip(L"клонирование отменено");
+                return;
+            }
+            continue;
+        }
+        dir = pick;
+        break;
+    }
+
+    ShowTip(L"git clone…");
+    std::wstring out = RunGit({ L"clone", remote, dir }, 600000);
+    LogGit(L"clone", TrimForTip(out, 400));
+    std::wstring gitDir = dir;
+    if (gitDir.empty() || gitDir.back() != L'\\') gitDir += L'\\';
+    if (GetFileAttributesW((gitDir + L".git").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::wstring tip = TrimForTip(out, 200);
+        ShowTip(tip.empty() ? L"clone: ошибка" : tip);
+        return;
+    }
+
+    IniSet(L"dumpdir", dir.c_str());
+    IniSet(L"remote", remote.c_str());
+    ShowTip(L"клонировано: " + dir);
+
+    // The clone is only the container for the dump: offer the next step at once.
+    if (MessageBoxW(g_bar.hwnd,
+                    (L"Репозиторий склонирован в:\n" + dir +
+                     L"\n\nВыгрузить конфигурацию в файлы сейчас?").c_str(),
+                    L"GitBar — клонирование", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        ShowTip(L"выгрузка конфигурации в файлы…");
+        V8iGitBarDump();
+    }
+}
+
 void RunInit() {
     std::wstring dir = IniGet(L"dumpdir");
     if (dir.empty()) { ShowTip(L"нет папки выгрузки (Настройки)"); return; }
@@ -754,7 +1033,37 @@ void RunPush() {
     std::wstring out = RunGit({ L"-C", dir, L"push" });
     if (out.find(L"no upstream") != std::wstring::npos ||
         out.find(L"no configured push destination") != std::wstring::npos) {
-        out = RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" });
+        // First push: land on the branch the remote already has (main/master),
+        // otherwise a README's branch and the dump would become two heads.
+        std::wstring target = PullTarget(dir);
+        out = target.empty()
+                  ? RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" })
+                  : RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD:" + target });
+    }
+
+    // A repo created on GitHub with a README already has a commit, so the very
+    // first push is rejected: the histories are unrelated until they are merged.
+    bool rejected = out.find(L"rejected") != std::wstring::npos ||
+                    out.find(L"non-fast-forward") != std::wstring::npos ||
+                    out.find(L"remote contains work") != std::wstring::npos;
+    if (rejected &&
+        MessageBoxW(g_bar.hwnd,
+                    L"В удалённом репозитории уже есть коммиты, которых нет локально "
+                    L"(обычно README).\n\n"
+                    L"Слить истории (git pull --allow-unrelated-histories) и повторить push?",
+                    L"GitBar — пуш", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        ShowTip(L"git pull --allow-unrelated-histories…");
+        std::wstring merge = PullOrigin(dir, true);
+        LogGit(L"pull before push", TrimForTip(merge, 400));
+        if (merge.find(L"CONFLICT") != std::wstring::npos ||
+            merge.find(L"Automatic merge failed") != std::wstring::npos) {
+            out = merge;   // the conflict is what the user needs to see
+        } else {
+            std::wstring target = PullTarget(dir);
+            out = target.empty()
+                      ? RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" })
+                      : RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD:" + target });
+        }
     }
     LogGit(L"push", TrimForTip(out, 400));
     std::wstring tip = TrimForTip(out);
@@ -1170,13 +1479,6 @@ const COLORREF kLogSel = RGB(49, 106, 197);
 const COLORREF kLogBorder = RGB(176, 166, 142);
 const COLORREF kLogGray = RGB(112, 104, 88);
 const COLORREF kLogRefs = RGB(30, 90, 160);
-
-std::wstring TrimWs(const std::wstring& s) {
-    size_t b = s.find_first_not_of(L" \t\r\n");
-    if (b == std::wstring::npos) return L"";
-    size_t e = s.find_last_not_of(L" \t\r\n");
-    return s.substr(b, e - b + 1);
-}
 
 bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
     // 0x1F (unit separator) between fields: subjects may contain anything.
@@ -1668,7 +1970,7 @@ void RunPull() {
         return;
     }
     ShowTip(L"git pull…");
-    std::wstring out = TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit" }));
+    std::wstring out = PullOrigin(dir, false);
     MessageBoxW(g_bar.hwnd, out.empty() ? L"Уже актуально." : out.c_str(),
                 L"Git pull", MB_ICONINFORMATION);
     Reposition(false);
@@ -1989,6 +2291,51 @@ void ShowList(int kind) {
     Reposition(false);
 }
 
+void DoAction(int id);
+
+// Compact mode hides the twelve cells; the same actions come from this popup.
+// TPM_RETURNCMD makes TrackPopupMenu return the selection to this loop instead
+// of posting WM_COMMAND, so the bar's own DoAction runs the command.
+void ShowActionMenu(HWND owner) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    struct Item { int id; const wchar_t* text; bool sepBefore; };
+    static const Item kItems[] = {
+        { kWinIdDump,     L"Выгрузить исходники (команда 45)", true },
+        { kWinIdInit,     L"git init в папке выгрузки", false },
+        { kWinIdClone,    L"Клонировать репозиторий…", false },
+        { kWinIdCommit,   L"Коммит изменений…", false },
+        { kWinIdPush,     L"Пуш в удалённый репозиторий", false },
+        { kWinIdPull,     L"Забрать изменения (git pull)", true },
+        { kWinIdFetch,    L"Получить изменения (git fetch)", false },
+        { kWinIdBranches, L"Ветки…", true },
+        { kWinIdStash,    L"Отложенные изменения…", false },
+        { kWinIdTags,     L"Теги…", false },
+        { kWinIdStatus,   L"Рабочая копия…", false },
+        { kWinIdLog,      L"История коммитов", false },
+        { kWinIdSettings, L"Настройки…", true },
+    };
+    for (const Item& it : kItems) {
+        if (it.sepBefore) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, (UINT_PTR)it.id, it.text);
+    }
+    POINT pt{ 0, kBarH };
+    ClientToScreen(owner, &pt);
+    // The owner must be foreground, otherwise the menu does not dismiss on an
+    // outside click; the trailing WM_NULL is the documented follow-up. On 8.3
+    // the bar is a child window, so foreground the frame instead.
+    HWND top = GetAncestor(owner, GA_ROOT);
+    SetForegroundWindow(top ? top : owner);
+    g_bar.menuOpen = true;
+    int cmd = (int)TrackPopupMenu(
+        menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+        pt.x, pt.y, 0, owner, nullptr);
+    g_bar.menuOpen = false;
+    PostMessageW(owner, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    if (cmd) DoAction(cmd);
+}
+
 void DoAction(int id) {
     switch (id) {
     case kWinIdDump: {
@@ -1997,6 +2344,7 @@ void DoAction(int id) {
         break;
     }
     case kWinIdInit: RunInit(); break;
+    case kWinIdClone: RunClone(); break;
     case kWinIdCommit: RunCommit(); break;
     case kWinIdPush: RunPush(); break;
     case kWinIdPull: RunPull(); break;
@@ -2007,6 +2355,7 @@ void DoAction(int id) {
     case kWinIdStatus: ShowList(0); break;
     case kWinIdSettings: ShowSettings(g_bar.hwnd); break;
     case kWinIdLog: ShowGitLog(g_bar.hwnd); break;
+    case kWinIdMenu: ShowActionMenu(g_bar.hwnd); break;
     }
 }
 
@@ -2019,6 +2368,15 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;  // WM_PAINT fills everything
 
+    // Right-click anywhere on the strip opens the action list too: clone has no
+    // cell of its own and lives only in that menu. WM_CONTEXTMENU is handled
+    // for the keyboard menu key; the mouse path is WM_RBUTTONUP because the
+    // designer's frame swallows the DefWindowProc translation on 8.3.
+    case WM_RBUTTONUP:
+    case WM_CONTEXTMENU:
+        ShowActionMenu(hwnd);
+        return 0;
+
     case WM_MOUSEMOVE: {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         if (g_bar.dragging && (wp & MK_LBUTTON)) {
@@ -2028,8 +2386,9 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 GetClientRect(frame, &cr);
                 int w = cr.right - cr.left;
                 int x = pt.x - g_bar.pressPt.x;
+                int maxX = w - BarW(); if (maxX < 0) maxX = 0;
                 if (x < 0) x = 0;
-                if (x > w - kBarW) x = w - kBarW;
+                if (x > maxX) x = maxX;
                 int y = pt.y - g_bar.pressPt.y;
                 if (y < 0) y = 0;
                 SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0,
@@ -2147,21 +2506,6 @@ DWORD WINAPI BarThread(LPVOID) {
                                     WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                     CW_USEDEFAULT, CW_USEDEFAULT, 0, 0,
                                     g_bar.hwnd, nullptr, hInst, nullptr);
-    // Indexed by cell id - 1, so the table must stay aligned with the ids.
-    const wchar_t* texts[kCells] = {
-        L"Выгрузить исходники: конфигурация в файлы (команда 45)",
-        L"git init в папке выгрузки (+ origin из настроек)",
-        L"Коммит изменений (спросит комментарий)",
-        L"Пуш в удалённый репозиторий",
-        L"Настройки: git.exe, папка выгрузки, комментарий, remote",
-        L"История коммитов (git log --graph)",
-        L"Забрать изменения из удалённого репозитория (git pull)",
-        L"Получить изменения без слияния (git fetch --all --prune)",
-        L"Ветки: переключить или удалить (git branch -a)",
-        L"Отложенные изменения: применить или удалить (git stash list)",
-        L"Теги: удалить или отправить в origin (git tag -n1)",
-        L"Рабочая копия: индексировать, снять, коммит (git status)",
-    };
     if (g_bar.tooltip) {
         SendMessageW(g_bar.tooltip, TTM_SETMAXTIPWIDTH, 0, 360);
         for (int i = 0; i < kCells; ++i) {
@@ -2170,9 +2514,17 @@ DWORD WINAPI BarThread(LPVOID) {
             ti.uId = (UINT_PTR)(i + 1);
             int x = CellX(i + 1);
             ti.rect = { x, 1, x + kCell, kBarH - 1 };
-            ti.lpszText = (LPWSTR)texts[i];
+            ti.lpszText = (LPWSTR)kCellTexts[i];
             SendMessageW(g_bar.tooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
         }
+        // Overflow cell: the same popup menu as the compact chevron.
+        TOOLINFOW mi{ sizeof(mi), TTF_SUBCLASS };
+        mi.hwnd = g_bar.hwnd;
+        mi.uId = (UINT_PTR)(kCells + 1);
+        int mx = MenuCellX();
+        mi.rect = { mx, 1, mx + kCell, kBarH - 1 };
+        mi.lpszText = (LPWSTR)kMenuTip;
+        SendMessageW(g_bar.tooltip, TTM_ADDTOOLW, 0, (LPARAM)&mi);
     }
     // Action feedback lives in its own tracking tool (see ShowTip): a subclass
     // tool spanning the whole bar would mask the per-cell tools.
