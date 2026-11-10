@@ -107,12 +107,16 @@ Payload-сторона жива (`wcsncmp(request, "cmd ", 4)` — `v8i_export.c
 → Либо добавить четыре имени в список форварда (2 строки), либо осознанно
 документировать «только через attach» — но тогда убрать их из README-примеров.
 
-### A4 · P0 · У вендоренного Capstone нет файла лицензии
+### A4 · P0-закрыто · У вендоренного Capstone не было файла лицензии
 
 `cmake/capstone.cmake:3` обещает «see LICENSE.TXT in the upstream tree», но
-файл в `third_party/capstone/` не скопирован. BSD-3-Clause требует сохранения
-уведомления при редистрибуции — для открытого репозитория это надо закрыть
-(добавить LICENSE.TXT + NOTICE-строку в README).
+файла в `third_party/capstone/` не было — BSD-3-Clause требует сохранения
+уведомления при редистрибуции.
+
+→ Закрыто 2026-11-10: заведены `third_party/capstone/LICENSE.TXT` (3-clause
+BSD, Copyright (c) 2013, COSEINC) и `third_party/capstone/LICENSE_LLVM.TXT`
+(University of Illinois/NCSA — X86-дизассемблер LLVM-производный), в README
+добавлена NOTICE-строка в раздел «Лицензия».
 
 ### A5 · P1 · 6 коммитов не опубликованы
 
@@ -171,7 +175,10 @@ ERROR_ALREADY_EXISTS`. Любой процесс того же пользова�
 ### A12 · P2 · Прочее
 
 - `docs/plan_inj_ext.md` §12 требует подписи коммитов `fishca <sergrud@mail.ru>`
-  — в конфиге git указан только `fishca`; сверить `user.email`.
+  — в конфиге git указан только `fishca`; сверить `user.email`. **→ Закрыто
+  2026-11-10:** `user.email` установлен локально для репозитория
+  (`sergrud@mail.ru`), глобальный конфиг не тронут; автор коммитов —
+  `fishca <sergrud@mail.ru>`.
 - `RECON-85.md` и `plan_inj_ext.md` пересекаются по теме слотов: после
   приёмки Фазы 1 стоит слить фактические находки в RECON-85 (план —
   исторический документ).

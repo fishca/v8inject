@@ -2,7 +2,10 @@
 #
 # Vendored rather than fetched: the build must stay hermetic and offline, and we
 # only ever disassemble x86/x64 — the other architectures are 30 MB of dead
-# weight. Capstone is BSD-3-Clause (see LICENSE.TXT in the upstream tree).
+# weight. Capstone is 3-clause BSD (Copyright (c) 2013, COSEINC); the X86
+# decoder is derived from LLVM, so its license rides along too. Texts from the
+# upstream tree are vendored next to the sources: LICENSE.TXT and
+# LICENSE_LLVM.TXT.
 
 set(CAPSTONE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/capstone)
 
