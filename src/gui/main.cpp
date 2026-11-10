@@ -106,6 +106,16 @@ bool MatchesFilter(const v8i::ProcessEntry& e, const std::wstring& filter) {
     return name.find(f) != std::wstring::npos;
 }
 
+// The picker is for 1C:Предприятие only — any other process in the list just
+// clutters it. All three image names are legitimate 1C processes (thick client
+// / configurator, thin client, server).
+bool Is1C(const v8i::ProcessEntry& e) {
+    if (e.name.empty()) return false;
+    return _wcsicmp(e.name.c_str(), L"1cv8.exe") == 0 ||
+           _wcsicmp(e.name.c_str(), L"1cv8c.exe") == 0 ||
+           _wcsicmp(e.name.c_str(), L"1cv8s.exe") == 0;
+}
+
 void FillList() {
     std::wstring filter;
     wchar_t fbuf[128] = {};
@@ -116,8 +126,11 @@ void FillList() {
     ListView_DeleteAllItems(g_list);
 
     int row = 0;
+    int total = 0;
     for (const auto& p : g_procs) {
         if (p.session0) continue;          // services: not injectable targets
+        if (!Is1C(p)) continue;            // the picker shows 1C processes only
+        ++total;
         if (!MatchesFilter(p, filter)) continue;
         wchar_t pidBuf[16];
         _snwprintf_s(pidBuf, _countof(pidBuf), _TRUNCATE, L"%lu", p.pid);
@@ -138,10 +151,13 @@ void FillList() {
     SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_list, nullptr, TRUE);
 
-    wchar_t status[128];
-    _snwprintf_s(status, _countof(status), _TRUNCATE, L"Процессов: %d (показано %d)",
-                 (int)g_procs.size(), row);
-    SetStatus(status);
+    if (total == 0) {
+        SetStatus(L"1С не запущена — процессы 1cv8.exe / 1cv8c.exe / 1cv8s.exe не найдены");
+    } else {
+        wchar_t status[128];
+        _snwprintf_s(status, _countof(status), _TRUNCATE, L"1С: %d (показано %d)", total, row);
+        SetStatus(status);
+    }
 }
 
 void RefreshProcesses() {
