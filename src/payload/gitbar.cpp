@@ -421,6 +421,18 @@ const COLORREF kDlgSelIdle = RGB(212, 208, 200);
 const COLORREF kDlgCaption = RGB(204, 204, 204);   // CCCCCC classic caption band
 const int kCapH = 22;                              // caption height, as in 1C dialogs
 
+// Main-menu row and dropdown-submenu palette, sampled from the live designer.
+const COLORREF kMenuBg         = RGB(245, 242, 221);  // F5F2DD menu-row face
+const COLORREF kMenuText       = RGB(65, 48, 3);      // 413003 dark-brown item
+const COLORREF kMenuHoverFill  = RGB(214, 233, 255);  // D6E9FF pale-blue box
+const COLORREF kMenuHoverBorder = RGB(158, 182, 233); // 9EB6E9
+const COLORREF kMenuHoverText  = RGB(61, 78, 143);    // 3D4E8F
+const COLORREF kSubShortcut    = RGB(179, 128, 0);    // B38000 shortcut column
+const COLORREF kSubSep         = RGB(217, 213, 194);  // D9D5C2 separator line
+const int kSubItemH = 22;
+const int kSubSepH = 7;
+const int kSubGutter = 28;   // icon column, as in 1C submenus
+
 RECT CapCloseRect(const RECT& rc) {
     RECT r{ rc.right - 26, 3, rc.right - 4, 21 };
     return r;
@@ -3140,30 +3152,103 @@ void DoAction(int id);
 // Compact mode hides the twelve cells; the same actions come from this popup.
 // TPM_RETURNCMD makes TrackPopupMenu return the selection to this loop instead
 // of posting WM_COMMAND, so the bar's own DoAction runs the command.
+// The popup is owner-drawn to match the designer's own submenus (cream face,
+// brown items, rust shortcuts, pale-blue rounded hover); TrackPopupMenu still
+// provides the modal dismiss / keyboard behaviour.
+struct ActionItem { int id; const wchar_t* text; bool sepBefore; };
+const ActionItem kActionItems[] = {
+    { kWinIdDump,     L"Выгрузить исходники (команда 45)", true },
+    { kWinIdDumpExt,  L"Выгрузить расширение в файлы (команда 205)", false },
+    { kWinIdInit,     L"git init в папке выгрузки", false },
+    { kWinIdClone,    L"Клонировать репозиторий…", false },
+    { kWinIdCommit,   L"Коммит изменений…", false },
+    { kWinIdPush,     L"Пуш в удалённый репозиторий", false },
+    { kWinIdPull,     L"Забрать изменения (git pull)", true },
+    { kWinIdFetch,    L"Получить изменения (git fetch)", false },
+    { kWinIdBranches, L"Ветки…", true },
+    { kWinIdStash,    L"Отложенные изменения…", false },
+    { kWinIdTags,     L"Теги…", false },
+    { kWinIdStatus,   L"Рабочая копия…", false },
+    { kWinIdLog,      L"История коммитов", false },
+    { kWinIdSettings, L"Настройки…", true },
+};
+
+HFONT SubFont() {
+    static HFONT f = CreateDlgFont();
+    return f;
+}
+
+// Pale-blue rounded hover with a vertical gradient, as in 1C submenus.
+void DrawSubHover(HDC dc, const RECT& rc) {
+    HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, 7, 7);
+    SelectClipRgn(dc, rgn);
+    TRIVERTEX v[2] = {
+        { rc.left, rc.top, 0xE300, 0xF000, 0xFF00, 0 },
+        { rc.right, rc.bottom, 0xCC00, 0xE300, 0xFF00, 0 },
+    };
+    GRADIENT_RECT g{ 0, 1 };
+    GradientFill(dc, v, 2, &g, 1, GRADIENT_FILL_RECT_V);
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(rgn);
+    HPEN pen = CreatePen(PS_SOLID, 1, kMenuHoverBorder);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, rc.left, rc.top, rc.right + 1, rc.bottom + 1, 7, 7);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(pen);
+}
+
+void ActionMenuMeasure(LPMEASUREITEMSTRUCT m) {
+    if (!m->itemData) { m->itemWidth = 0; m->itemHeight = kSubSepH; return; }
+    const ActionItem* it = (const ActionItem*)m->itemData;
+    HDC dc = GetDC(nullptr);
+    HFONT old = (HFONT)SelectObject(dc, SubFont());
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, it->text, (int)wcslen(it->text), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+    m->itemWidth = kSubGutter + sz.cx + 24;
+    m->itemHeight = kSubItemH;
+}
+
+void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    FillRect(dc, &rc, UiBgBrush());
+    if (!d->itemData) {
+        RECT line{ rc.left + 8, (rc.top + rc.bottom) / 2, rc.right - 8,
+                   (rc.top + rc.bottom) / 2 + 1 };
+        HBRUSH sb = CreateSolidBrush(kSubSep);
+        FillRect(dc, &line, sb);
+        DeleteObject(sb);
+        return;
+    }
+    const ActionItem* it = (const ActionItem*)d->itemData;
+    bool sel = (d->itemState & ODS_SELECTED) != 0;
+    if (sel) DrawSubHover(dc, rc);
+    const unsigned char* px = IconFor(it->id);
+    if (px) DrawIcon(dc, px, rc.left + (kSubGutter - icons::kSize) / 2,
+                     rc.top + (kSubItemH - icons::kSize) / 2);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, sel ? kMenuHoverText : kMenuText);
+    HFONT old = (HFONT)SelectObject(dc, SubFont());
+    RECT tr{ rc.left + kSubGutter, rc.top, rc.right - 8, rc.bottom };
+    DrawTextW(dc, it->text, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    SelectObject(dc, old);
+}
+
 void ShowActionMenu(HWND owner) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    struct Item { int id; const wchar_t* text; bool sepBefore; };
-    static const Item kItems[] = {
-        { kWinIdDump,     L"Выгрузить исходники (команда 45)", true },
-        { kWinIdDumpExt,  L"Выгрузить расширение в файлы (команда 205)", false },
-        { kWinIdInit,     L"git init в папке выгрузки", false },
-        { kWinIdClone,    L"Клонировать репозиторий…", false },
-        { kWinIdCommit,   L"Коммит изменений…", false },
-        { kWinIdPush,     L"Пуш в удалённый репозиторий", false },
-        { kWinIdPull,     L"Забрать изменения (git pull)", true },
-        { kWinIdFetch,    L"Получить изменения (git fetch)", false },
-        { kWinIdBranches, L"Ветки…", true },
-        { kWinIdStash,    L"Отложенные изменения…", false },
-        { kWinIdTags,     L"Теги…", false },
-        { kWinIdStatus,   L"Рабочая копия…", false },
-        { kWinIdLog,      L"История коммитов", false },
-        { kWinIdSettings, L"Настройки…", true },
-    };
-    for (const Item& it : kItems) {
-        if (it.sepBefore) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, (UINT_PTR)it.id, it.text);
+    for (const ActionItem& it : kActionItems) {
+        if (it.sepBefore) AppendMenuW(menu, MF_OWNERDRAW | MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_OWNERDRAW, (UINT_PTR)it.id, (LPCWSTR)&it);
     }
+    MENUINFO mi{ sizeof(mi) };
+    mi.fMask = MIM_BACKGROUND;
+    mi.hbrBack = UiBgBrush();
+    SetMenuInfo(menu, &mi);
     POINT pt{ 0, kBarH };
     ClientToScreen(owner, &pt);
     // The owner must be foreground, otherwise the menu does not dismiss on an
@@ -3220,12 +3305,6 @@ void DoAction(int id) {
 // patterns, so they cannot be invoked programmatically). If UIA finds no menu
 // toolbar the feature stays absent.
 // ---------------------------------------------------------------------------
-
-const COLORREF kMenuBg         = RGB(245, 242, 221);  // F5F2DD menu-row face
-const COLORREF kMenuText       = RGB(65, 48, 3);      // 413003 dark-brown item
-const COLORREF kMenuHoverFill  = RGB(214, 233, 255);  // D6E9FF pale-blue box
-const COLORREF kMenuHoverBorder = RGB(158, 182, 233); // 9EB6E9
-const COLORREF kMenuHoverText  = RGB(61, 78, 143);    // 3D4E8F
 
 struct MenuButton {
     std::wstring text;
@@ -3468,6 +3547,16 @@ LRESULT CALLBACK MenuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_ERASEBKGND:
         return 1;
+    case WM_MEASUREITEM: {
+        LPMEASUREITEMSTRUCT m = (LPMEASUREITEMSTRUCT)lp;
+        if (m->CtlType == ODT_MENU) { ActionMenuMeasure(m); return TRUE; }
+        break;
+    }
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
+        if (d->CtlType == ODT_MENU) { ActionMenuDraw(d); return TRUE; }
+        break;
+    }
     case WM_MOUSEMOVE: {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         int hit = MenuHitTest(pt);
@@ -3560,6 +3649,17 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_ERASEBKGND:
         return 1;  // WM_PAINT fills everything
+
+    case WM_MEASUREITEM: {
+        LPMEASUREITEMSTRUCT m = (LPMEASUREITEMSTRUCT)lp;
+        if (m->CtlType == ODT_MENU) { ActionMenuMeasure(m); return TRUE; }
+        break;
+    }
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
+        if (d->CtlType == ODT_MENU) { ActionMenuDraw(d); return TRUE; }
+        break;
+    }
 
     // Right-click anywhere on the strip opens the action list too: clone has no
     // cell of its own and lives only in that menu. WM_CONTEXTMENU is handled
