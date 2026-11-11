@@ -399,16 +399,117 @@ void DrawIcon(HDC dc, const unsigned char* px, int ox, int oy) {
     DeleteObject(bmp);
 }
 
+// ---------------------------------------------------------------------------
+// Shared 1C-style window theme: the classic cream platform-dialog skin measured
+// from a live «Выгрузить файлы конфигурации» dialog — cream face, beige buttons
+// with a 1px #B3AC86 frame, white fields, rust field captions and a light-blue
+// list selection. Used by the bar, settings, prompt, list and history windows.
+// ---------------------------------------------------------------------------
+
+const COLORREF kDlgBg      = RGB(252, 250, 235);   // FCFAEB dialog face
+const COLORREF kDlgBorder  = RGB(179, 172, 134);   // B3AC86 group / button frame
+const COLORREF kDlgFieldBg = RGB(255, 255, 255);
+const COLORREF kDlgFieldBorder = RGB(141, 141, 141);  // 8D8D8D edit frame
+const COLORREF kDlgBtnFace = RGB(215, 211, 189);   // D7D3BD button face
+const COLORREF kDlgHover   = RGB(252, 250, 196);   // FCFAC4 pale-yellow hover
+const COLORREF kDlgPress   = RGB(205, 199, 171);
+const COLORREF kDlgText    = RGB(51, 51, 51);      // 333333
+const COLORREF kDlgLabel   = RGB(158, 82, 42);     // 9E522A rust field caption
+const COLORREF kDlgSel     = RGB(158, 216, 235);   // 9ED8EB light-blue selection
+const COLORREF kDlgSelIdle = RGB(212, 208, 200);
+const COLORREF kDlgCaption = RGB(204, 204, 204);   // CCCCCC classic caption band
+const int kCapH = 22;                              // caption height, as in 1C dialogs
+
+RECT CapCloseRect(const RECT& rc) {
+    RECT r{ rc.right - 26, 3, rc.right - 4, 21 };
+    return r;
+}
+
+// The platform draws its dialog captions itself; our windows are plain Win32,
+// so the gray band with the title and the X is painted in the client area.
+void DrawCaption(HDC dc, HWND h, HFONT font, bool hoverX) {
+    RECT rc{};
+    GetClientRect(h, &rc);
+    RECT band{ 0, 0, rc.right, kCapH };
+    HBRUSH cb = CreateSolidBrush(kDlgCaption);
+    FillRect(dc, &band, cb);
+    DeleteObject(cb);
+    HPEN lp = CreatePen(PS_SOLID, 1, kDlgBorder);
+    HPEN olp = (HPEN)SelectObject(dc, lp);
+    MoveToEx(dc, 0, kCapH - 1, nullptr);
+    LineTo(dc, rc.right, kCapH - 1);
+    SelectObject(dc, olp);
+    DeleteObject(lp);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, kDlgText);
+    HFONT of = (HFONT)SelectObject(dc, font);
+    wchar_t t[256] = {};
+    GetWindowTextW(h, t, 256);
+    RECT tr{ 8, 0, rc.right - 30, kCapH - 1 };
+    DrawTextW(dc, t, -1, &tr,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(dc, of);
+    RECT xr = CapCloseRect(rc);
+    if (hoverX) {
+        HBRUSH hb = CreateSolidBrush(kDlgPress);
+        FillRect(dc, &xr, hb);
+        DeleteObject(hb);
+    }
+    HPEN xp = CreatePen(PS_SOLID, 1, kDlgText);
+    HPEN oxp = (HPEN)SelectObject(dc, xp);
+    MoveToEx(dc, xr.left + 6, xr.top + 5, nullptr);
+    LineTo(dc, xr.right - 6, xr.bottom - 5);
+    MoveToEx(dc, xr.right - 6, xr.top + 5, nullptr);
+    LineTo(dc, xr.left + 6, xr.bottom - 5);
+    SelectObject(dc, oxp);
+    DeleteObject(xp);
+}
+
+// WS_POPUP ignores CW_USEDEFAULT, so place the dialog over its owner frame.
+void CenterOnOwner(HWND h, HWND owner) {
+    HWND root = owner ? GetAncestor(owner, GA_ROOTOWNER) : nullptr;
+    if (!root || root == h) root = GetDesktopWindow();
+    RECT ro{};
+    GetWindowRect(root, &ro);
+    RECT rd{};
+    GetWindowRect(h, &rd);
+    int w = rd.right - rd.left, hh = rd.bottom - rd.top;
+    int x = ro.left + ((ro.right - ro.left) - w) / 2;
+    int y = ro.top + ((ro.bottom - ro.top) - hh) / 2;
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    if (x + w > wa.right) x = wa.right - w;
+    if (y + hh > wa.bottom) y = wa.bottom - hh;
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top) y = wa.top;
+    SetWindowPos(h, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Dragging by the painted caption; the X stays a client hit so the window proc
+// can close on WM_LBUTTONDOWN. Sizing borders keep their default hit codes.
+LRESULT CapHitTest(HWND h, WPARAM wp, LPARAM lp) {
+    LRESULT r = DefWindowProcW(h, WM_NCHITTEST, wp, lp);
+    if (r != HTCLIENT) return r;
+    POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+    ScreenToClient(h, &pt);
+    RECT rc{};
+    GetClientRect(h, &rc);
+    if (pt.y >= 0 && pt.y < kCapH) {
+        RECT xr = CapCloseRect(rc);
+        if (!PtInRect(&xr, pt)) return HTCAPTION;
+    }
+    return r;
+}
+
 // The overflow cell: three dots, the same glyph in the compact bar and at the
 // end of the full strip.
 void PaintMenuCell(HDC dc, const RECT& cell) {
     if (g_bar.hover == kWinIdMenu) {
-        HBRUSH hl = CreateSolidBrush(g_bar.pressed ? RGB(226, 216, 178)
-                                                   : RGB(250, 244, 214));
+        HBRUSH hl = CreateSolidBrush(g_bar.pressed ? kDlgPress : kDlgHover);
         FillRect(dc, &cell, hl);
         DeleteObject(hl);
     }
-    HBRUSH dot = CreateSolidBrush(RGB(74, 70, 60));
+    HBRUSH dot = CreateSolidBrush(kDlgText);
     int cx = (cell.left + cell.right) / 2, cy = (cell.top + cell.bottom) / 2;
     for (int i = -1; i <= 1; ++i) {
         RECT r{ cx + i * 6 - 1, cy - 1, cx + i * 6 + 2, cy + 2 };
@@ -424,10 +525,10 @@ void Paint(HWND hwnd) {
     GetClientRect(hwnd, &rc);
 
     // Panel background and a 1C-ish border, so the strip reads as a toolbar.
-    HBRUSH bg = CreateSolidBrush(RGB(238, 234, 222));
+    HBRUSH bg = CreateSolidBrush(kDlgBg);
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
-    HPEN border = CreatePen(PS_SOLID, 1, RGB(176, 166, 142));
+    HPEN border = CreatePen(PS_SOLID, 1, kDlgBorder);
     SelectObject(dc, border);
     SelectObject(dc, GetStockObject(NULL_BRUSH));
     Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
@@ -445,11 +546,10 @@ void Paint(HWND hwnd) {
         int x = CellX(id);
         RECT cell{ x, 1, x + kCell, kBarH - 1 };
         if (id == g_bar.hover) {
-            HBRUSH hl = CreateSolidBrush(g_bar.pressed ? RGB(226, 216, 178)
-                                                       : RGB(250, 244, 214));
+            HBRUSH hl = CreateSolidBrush(g_bar.pressed ? kDlgPress : kDlgHover);
             FillRect(dc, &cell, hl);
             DeleteObject(hl);
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(198, 184, 148));
+            HPEN pen = CreatePen(PS_SOLID, 1, kDlgBorder);
             SelectObject(dc, pen);
             SelectObject(dc, GetStockObject(NULL_BRUSH));
             Rectangle(dc, cell.left, cell.top, cell.right, cell.bottom);
@@ -553,21 +653,6 @@ void ShowTip(const std::wstring& text) {
     LogGit(L"tip", text);
 }
 
-// ---------------------------------------------------------------------------
-// Shared 1C-style window theme: cream dialog face, 1px #B0A68E frames, white
-// fields and a flat blue list selection — the palette measured from a live
-// designer and already used by the settings and history windows.
-// ---------------------------------------------------------------------------
-
-const COLORREF kDlgBg      = RGB(245, 242, 221);
-const COLORREF kDlgBorder  = RGB(176, 166, 142);
-const COLORREF kDlgFieldBg = RGB(255, 255, 255);
-const COLORREF kDlgHover   = RGB(252, 246, 199);
-const COLORREF kDlgPress   = RGB(226, 216, 178);
-const COLORREF kDlgText    = RGB(0, 0, 0);
-const COLORREF kDlgSel     = RGB(49, 106, 197);
-const COLORREF kDlgSelIdle = RGB(212, 208, 200);
-
 HFONT CreateDlgFont() {
     HDC dc = GetDC(nullptr);
     int h = -MulDiv(8, GetDeviceCaps(dc, LOGPIXELSY), 72);
@@ -599,7 +684,7 @@ void UiFrame(HDC dc, const RECT& rc, COLORREF color) {
 
 void UiDrawButton(HDC dc, const RECT& rc, const wchar_t* text, HFONT font,
                   bool hover, bool press) {
-    HBRUSH face = CreateSolidBrush(press ? kDlgPress : hover ? kDlgHover : kDlgBg);
+    HBRUSH face = CreateSolidBrush(press ? kDlgPress : hover ? kDlgHover : kDlgBtnFace);
     FillRect(dc, &rc, face);
     DeleteObject(face);
     UiFrame(dc, rc, kDlgBorder);
@@ -671,6 +756,8 @@ struct PromptCtx {
     HWND ed = nullptr;
     HFONT font = nullptr;
     bool accepted = false;
+    bool hoverX = false;
+    bool trackedLeave = false;
 };
 
 LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -681,7 +768,7 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, kDlgText);
+        SetTextColor(dc, kDlgLabel);
         return (LRESULT)UiBgBrush();
     }
     case WM_CTLCOLOREDIT: {
@@ -696,11 +783,42 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rc;
         GetClientRect(h, &rc);
         FillRect(dc, &rc, UiBgBrush());
+        if (c) DrawCaption(dc, h, c->font, c->hoverX);
         // the edit sits 1px inside this frame and erases its own interior
-        RECT field = { 12, 34, 442, 58 };
-        UiFrame(dc, field, kDlgBorder);
+        RECT field = { 12, 34 + kCapH, 442, 58 + kCapH };
+        UiFrame(dc, field, kDlgFieldBorder);
         EndPaint(h, &ps);
         return 0;
+    }
+    case WM_NCHITTEST:
+        return CapHitTest(h, wp, lp);
+    case WM_MOUSEMOVE: {
+        if (!c) break;
+        if (!c->trackedLeave) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            c->trackedLeave = true;
+        }
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        RECT rc;
+        GetClientRect(h, &rc);
+        bool hv = PtInRect(&CapCloseRect(rc), pt) != 0;
+        if (hv != c->hoverX) { c->hoverX = hv; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (c) {
+            c->trackedLeave = false;
+            if (c->hoverX) { c->hoverX = false; InvalidateRect(h, nullptr, FALSE); }
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        if (!c) break;
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        RECT rc;
+        GetClientRect(h, &rc);
+        if (PtInRect(&CapCloseRect(rc), pt)) { DestroyWindow(h); return 0; }
+        break;
     }
     case WM_DRAWITEM:
         if (c && UiDrawOwnerButton((const DRAWITEMSTRUCT*)lp, c->font)) return TRUE;
@@ -728,10 +846,11 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
                 const std::wstring& initial, std::wstring* out) {
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", title,
-                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 470, 160, owner, nullptr,
+                               WS_POPUP | WS_VISIBLE,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 470, 160 + kCapH, owner, nullptr,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) return false;
+    CenterOnOwner(dlg, owner);
 
     PromptCtx ctx;
     ctx.out = out;
@@ -740,13 +859,13 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
     SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
 
     HWND label1 = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                  12, 12, 430, 18, dlg, nullptr,
+                                  12, 12 + kCapH, 430, 18, dlg, nullptr,
                                   GetModuleHandleW(nullptr), nullptr);
     SendMessageW(label1, WM_SETFONT, (WPARAM)ctx.font, TRUE);
     // borderless: PromptDlgProc paints the 1C field frame around it
     HWND ed = CreateWindowExW(0, L"EDIT", L"",
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                              13, 35, 428, 22, dlg, (HMENU)1001,
+                              13, 35 + kCapH, 428, 22, dlg, (HMENU)1001,
                               GetModuleHandleW(nullptr), nullptr);
     SendMessageW(ed, WM_SETFONT, (WPARAM)ctx.font, TRUE);
     SendMessageW(ed, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
@@ -757,11 +876,11 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
     HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                               BS_DEFPUSHBUTTON | BS_OWNERDRAW,
-                              252, 72, 90, 26, dlg, (HMENU)(INT_PTR)IDOK,
+                              252, 72 + kCapH, 90, 26, dlg, (HMENU)(INT_PTR)IDOK,
                               GetModuleHandleW(nullptr), nullptr);
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"Отмена",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                  352, 72, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL,
+                                  352, 72 + kCapH, 90, 26, dlg, (HMENU)(INT_PTR)IDCANCEL,
                                   GetModuleHandleW(nullptr), nullptr);
     ThemedButton(ok, ctx.font);
     ThemedButton(cancel, ctx.font);
@@ -1131,6 +1250,7 @@ struct SettingsCtx {
     int    pressBtn = -1;
     HFONT  font = nullptr;
     bool   trackedLeave = false;
+    bool   hoverX = false;
 };
 
 void SettingsLayout(HWND h, SettingsCtx* c) {
@@ -1138,13 +1258,13 @@ void SettingsLayout(HWND h, SettingsCtx* c) {
     GetClientRect(h, &rc);
     const int fx = 150, fw = rc.right - fx - 14, fh = 22;
     for (int i = 0; i < 4; ++i)
-        SetRect(&c->fieldRects[i], fx, 20 + i * 34, fx + fw, 20 + i * 34 + fh);
+        SetRect(&c->fieldRects[i], fx, kCapH + 20 + i * 34, fx + fw, kCapH + 20 + i * 34 + fh);
     // The dumpdir row shrinks to make room for the folder-picker button in
     // the same line (the button rect covers the freed gap, no overlap).
     c->fieldRects[1].right -= 32;
-    SetRect(&c->browseRect, fx + fw - 28, 20 + 1 * 34, fx + fw, 20 + 1 * 34 + fh);
-    SetRect(&c->okRect,     fx, 166, fx + 84, 190);
-    SetRect(&c->cancelRect, fx + 94, 166, fx + 178, 190);
+    SetRect(&c->browseRect, fx + fw - 28, kCapH + 20 + 1 * 34, fx + fw, kCapH + 20 + 1 * 34 + fh);
+    SetRect(&c->okRect,     fx, kCapH + 166, fx + 84, kCapH + 190);
+    SetRect(&c->cancelRect, fx + 94, kCapH + 166, fx + 178, kCapH + 190);
 }
 
 int TextWidthTo(HDC dc, HFONT f, const std::wstring& s, size_t n) {
@@ -1223,13 +1343,14 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         SelectObject(dc, oldPen);
         DeleteObject(border);
         SelectObject(dc, oldBrush);
+        DrawCaption(dc, h, c->font, c->hoverX);
         // fields + labels
         for (int i = 0; i < 4; ++i) {
             RECT& fr = c->fieldRects[i];
             HBRUSH fb = CreateSolidBrush(kDlgFieldBg);
             FillRect(dc, &fr, fb);
             DeleteObject(fb);
-            HPEN fp = CreatePen(PS_SOLID, 1, kDlgBorder);
+            HPEN fp = CreatePen(PS_SOLID, 1, kDlgFieldBorder);
             HPEN ofp = (HPEN)SelectObject(dc, fp);
             HBRUSH ofb = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
             Rectangle(dc, fr.left, fr.top, fr.right, fr.bottom);
@@ -1242,8 +1363,10 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             DrawTextW(dc, c->fields[i].c_str(), (int)c->fields[i].size(), &tr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             RECT lr = { 12, fr.top, 146, fr.bottom };
+            SetTextColor(dc, kDlgLabel);
             DrawTextW(dc, kFieldLabels[i], -1, &lr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SetTextColor(dc, kDlgText);
         }
         // buttons
         for (int b = 0; b < 2; ++b) {
@@ -1346,6 +1469,9 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!c) break;
         SetFocus(h);
         POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+        RECT rc;
+        GetClientRect(h, &rc);
+        if (PtInRect(&CapCloseRect(rc), pt)) { DestroyWindow(h); return 0; }
         for (int i = 0; i < 4; ++i) {
             if (PtInRect(&c->fieldRects[i], pt)) {
                 if (c->active != i) {
@@ -1393,11 +1519,20 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
         int b = SettingsHitButton(c, pt);
         if (b != c->hoverBtn) { c->hoverBtn = b; InvalidateRect(h, nullptr, FALSE); }
+        RECT rc;
+        GetClientRect(h, &rc);
+        bool hv = PtInRect(&CapCloseRect(rc), pt) != 0;
+        if (hv != c->hoverX) { c->hoverX = hv; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     }
     case WM_MOUSELEAVE:
-        if (c) { c->hoverBtn = -1; c->trackedLeave = false; InvalidateRect(h, nullptr, FALSE); }
+        if (c) {
+            c->hoverBtn = -1; c->trackedLeave = false; c->hoverX = false;
+            InvalidateRect(h, nullptr, FALSE);
+        }
         return 0;
+    case WM_NCHITTEST:
+        return CapHitTest(h, wp, lp);
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;
@@ -1432,10 +1567,11 @@ void ShowSettings(HWND owner) {
     ctx.fields[3] = IniGet(L"remote");
 
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitBarSettings", L"GitBar — настройки",
-                               WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 460, 232, owner, nullptr,
+                               WS_POPUP | WS_VISIBLE,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 460, 232 + kCapH, owner, nullptr,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) { DeleteObject(ctx.font); return; }
+    CenterOnOwner(dlg, owner);
     SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
     SettingsLayout(dlg, &ctx);
 
@@ -1511,36 +1647,34 @@ struct LogCtx {
     RECT rcPatchSb{};
 };
 
-const int kLogRowH = 28;      // commit rows: breathing room like Fork / GitKraken
-const int kDiffRowH = 20;     // patch rows stay compact
-const int kLogListTop = 58;   // first commit row, below title + column headers
+const int kLogRowH = 20;      // dense classic list rows, like the platform dialogs
+const int kDiffRowH = 16;     // patch rows stay compact
+const int kLogListTop = 42;   // first commit row, below title + column headers
 const int kGraphW = 100;      // graph column, lanes are kColW apart
 const int kColW = 16;
 const int kSbW = 10;          // thin overlay scrollbar width
-// Modern light theme: warm near-white canvas (a nod to the 1C cream chrome),
-// neutral hairlines, dark primary text and a single calm blue accent instead of
-// the old saturated fill. Diff tints follow GitHub's pale green / pink.
-const COLORREF kLogBg = RGB(250, 250, 248);
-const COLORREF kLogPanel = RGB(246, 248, 250);
-const COLORREF kLogSel = RGB(232, 240, 254);
-const COLORREF kLogSelBar = RGB(47, 111, 237);
-const COLORREF kLogHover = RGB(240, 239, 234);
-const COLORREF kLogBorder = RGB(228, 228, 224);
-const COLORREF kLogText = RGB(36, 41, 47);
-const COLORREF kLogGray = RGB(110, 118, 129);
-const COLORREF kLogRefs = RGB(47, 111, 237);
-const COLORREF kLogAddBg = RGB(230, 255, 236);
-const COLORREF kLogAddTx = RGB(26, 127, 55);
-const COLORREF kLogAddHl = RGB(171, 242, 188);
-const COLORREF kLogDelBg = RGB(255, 235, 233);
-const COLORREF kLogDelTx = RGB(207, 34, 46);
-const COLORREF kLogDelHl = RGB(255, 201, 201);
-const COLORREF kLogHunkBg = RGB(241, 248, 255);
-const COLORREF kLogHunkTx = RGB(87, 96, 106);
-const COLORREF kLogHeadBg = RGB(246, 248, 250);   // "diff --git" band
-const COLORREF kLogPatchBg = RGB(255, 255, 255);  // code pane, white like GitHub
-const COLORREF kLogLineNo = RGB(154, 160, 166);
-const COLORREF kLogGutter = RGB(246, 248, 250);
+// Classic 1C skin: cream chrome, white list / code fields, beige header bands,
+// rust captions and refs, light-blue selection — same palette as the dialogs.
+const COLORREF kLogBg = kDlgBg;
+const COLORREF kLogPanel = kDlgBg;
+const COLORREF kLogSel = kDlgSel;
+const COLORREF kLogHover = kDlgHover;
+const COLORREF kLogBorder = kDlgBorder;
+const COLORREF kLogText = kDlgText;
+const COLORREF kLogGray = kDlgFieldBorder;
+const COLORREF kLogRefs = kDlgLabel;
+const COLORREF kLogAddBg = kDlgFieldBg;
+const COLORREF kLogAddTx = RGB(0, 128, 0);
+const COLORREF kLogAddHl = kDlgHover;
+const COLORREF kLogDelBg = kDlgFieldBg;
+const COLORREF kLogDelTx = RGB(192, 0, 0);
+const COLORREF kLogDelHl = kDlgHover;
+const COLORREF kLogHunkBg = kDlgBg;
+const COLORREF kLogHunkTx = kDlgLabel;
+const COLORREF kLogHeadBg = kDlgBtnFace;   // "diff --git" band
+const COLORREF kLogPatchBg = kDlgFieldBg;  // code pane, white
+const COLORREF kLogLineNo = kDlgFieldBorder;
+const COLORREF kLogGutter = kDlgBg;
 
 // Lane palette: calm, desaturated hues (Git Graph's defaults are oversaturated),
 // cycled by lane index so parallel branches stay easy to tell apart.
@@ -1579,7 +1713,7 @@ int LogListBottom(const RECT& rc) {
 }
 
 int LogDetailTop(const RECT& rc) { return LogListBottom(rc) + 24; }
-int LogPatchTop(const RECT& rc) { return LogDetailTop(rc) + 64; }
+int LogPatchTop(const RECT& rc) { return LogDetailTop(rc) + 52; }
 
 bool LoadLog(const std::wstring& dir, std::vector<LogRow>& rows) {
     // 0x1F (unit separator) between fields: subjects may contain anything.
@@ -1629,9 +1763,8 @@ HFONT LogFont(int points, const wchar_t* face, int weight, DWORD pitch) {
     HDC dc = GetDC(nullptr);
     int h = -MulDiv(points, GetDeviceCaps(dc, LOGPIXELSY), 72);
     ReleaseDC(nullptr, dc);
-    // ClearType at the point size the window is designed for: Segoe UI 9 pt
-    // (12 px) for prose, Consolas 9 pt for hashes and code, so long reading
-    // sessions stay comfortable.
+    // Tahoma 8 pt matches the platform dialog font; Consolas 9 pt keeps
+    // hashes and code readable.
     return CreateFontW(h, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                        pitch, face);
@@ -1832,129 +1965,23 @@ static int DaysFromYmd(const std::wstring& s) {
 // Commit node: a coloured dot with a background-colour halo ring, the way
 // Fork / GitKraken draw it. HEAD (solid) reads as "you are here"; merges and
 // ordinary commits get the ring so the lane line shows through.
-static void DrawNode(HDC dc, int cx, int cy, COLORREF color, COLORREF bg, bool solid) {
-    HBRUSH ring = CreateSolidBrush(color);
+// Commit node: a plain filled dot in the lane colour, as in classic git graphs.
+static void DrawNode(HDC dc, int cx, int cy, COLORREF color) {
+    HBRUSH br = CreateSolidBrush(color);
     HPEN np = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
-    HBRUSH ob = (HBRUSH)SelectObject(dc, ring);
-    Ellipse(dc, cx - 5, cy - 5, cx + 6, cy + 6);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    Ellipse(dc, cx - 4, cy - 4, cx + 5, cy + 5);
     SelectObject(dc, ob);
-    DeleteObject(ring);
-    if (!solid) {
-        HBRUSH inner = CreateSolidBrush(bg);
-        HBRUSH ob2 = (HBRUSH)SelectObject(dc, inner);
-        Ellipse(dc, cx - 3, cy - 3, cx + 4, cy + 4);
-        SelectObject(dc, ob2);
-        DeleteObject(inner);
-    }
     SelectObject(dc, np);
+    DeleteObject(br);
 }
 
-// " (HEAD -> main, tag: v1.1, origin/main)" -> individual pills.
-struct RefPill { std::wstring text; int kind; };  // 0 branch 1 tag 2 HEAD 3 remote
-static void ParseRefs(const std::wstring& refs, std::vector<RefPill>& out) {
-    out.clear();
+// " (HEAD -> main, tag: v1.1)" -> plain display text without the outer parens.
+static std::wstring RefsText(const std::wstring& refs) {
     std::wstring s = TrimWs(refs);
     if (s.size() >= 2 && s.front() == L'(' && s.back() == L')')
         s = s.substr(1, s.size() - 2);
-    size_t p = 0;
-    while (p < s.size()) {
-        size_t e = s.find(L", ", p);
-        if (e == std::wstring::npos) e = s.size();
-        std::wstring tok = TrimWs(s.substr(p, e - p));
-        p = e + 2;
-        if (tok.empty()) continue;
-        if (tok.rfind(L"HEAD -> ", 0) == 0) {
-            out.push_back({ L"HEAD", 2 });
-            out.push_back({ tok.substr(8), 0 });
-        } else if (tok == L"HEAD") {
-            out.push_back({ L"HEAD", 2 });
-        } else if (tok.rfind(L"tag: ", 0) == 0) {
-            out.push_back({ tok.substr(5), 1 });
-        } else if (tok.find(L'/') != std::wstring::npos) {
-            out.push_back({ tok, 3 });
-        } else {
-            out.push_back({ tok, 0 });
-        }
-    }
-}
-
-static void PillColors(int kind, COLORREF* bg, COLORREF* fg, COLORREF* bd) {
-    switch (kind) {
-    case 2: *bg = kLogSelBar; *fg = RGB(255, 255, 255); *bd = kLogSelBar; break;
-    case 1: *bg = RGB(255, 248, 197); *fg = RGB(154, 103, 0); *bd = RGB(212, 167, 44); break;
-    case 3: *bg = kLogPanel; *fg = kLogGray; *bd = kLogBorder; break;
-    default: *bg = kLogSel; *fg = kLogRefs; *bd = RGB(160, 190, 245); break;
-    }
-}
-
-static int PillWidth(HDC dc, const std::wstring& text, HFONT font) {
-    HGDIOBJ of = SelectObject(dc, font);
-    SIZE sz{};
-    GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
-    SelectObject(dc, of);
-    return sz.cx + 12;
-}
-
-// Rounded ref pill; returns its width so callers can chain them.
-static int DrawPill(HDC dc, int x, int cy, const std::wstring& text, int kind, HFONT font) {
-    int w = PillWidth(dc, text, font);
-    int h = 16, t = cy - h / 2, b = t + h;
-    COLORREF bg, fg, bd;
-    PillColors(kind, &bg, &fg, &bd);
-    HBRUSH br = CreateSolidBrush(bg);
-    HPEN pen = CreatePen(PS_SOLID, 1, bd);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
-    HPEN op = (HPEN)SelectObject(dc, pen);
-    RoundRect(dc, x, t, x + w, b, h, h);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    DeleteObject(br);
-    DeleteObject(pen);
-    HGDIOBJ of = SelectObject(dc, font);
-    SetTextColor(dc, fg);
-    RECT tr{ x, t, x + w, b };
-    DrawTextW(dc, text.c_str(), (int)text.size(), &tr,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    SelectObject(dc, of);
-    return w;
-}
-
-static COLORREF AvatarColor(const std::wstring& name) {
-    unsigned h = 2166136261u;
-    for (wchar_t ch : name) { h ^= (unsigned)ch; h *= 16777619u; }
-    return kLaneColors[h % kLaneCount];
-}
-
-// Circular initials chip (GitLens / GitHub style), colour derived from the name.
-static void DrawAvatar(HDC dc, int cx, int cy, const std::wstring& author, HFONT font) {
-    std::wstring name = author;
-    size_t lt = name.find(L" <");
-    if (lt != std::wstring::npos) name = name.substr(0, lt);
-    name = TrimWs(name);
-    std::wstring ini;
-    size_t i = 0;
-    while (i < name.size() && ini.size() < 2) {
-        while (i < name.size() && (name[i] == L' ' || name[i] == L'\t')) ++i;
-        if (i >= name.size()) break;
-        wchar_t up[2] = { name[i], 0 };
-        CharUpperBuffW(up, 1);
-        ini += up[0];
-        while (i < name.size() && name[i] != L' ' && name[i] != L'\t') ++i;
-    }
-    if (ini.empty()) ini = L"?";
-    HBRUSH br = CreateSolidBrush(AvatarColor(name));
-    HPEN np = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
-    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
-    Ellipse(dc, cx - 9, cy - 9, cx + 10, cy + 10);
-    SelectObject(dc, ob);
-    SelectObject(dc, np);
-    DeleteObject(br);
-    HGDIOBJ of = SelectObject(dc, font);
-    SetTextColor(dc, RGB(255, 255, 255));
-    RECT tr{ cx - 9, cy - 9, cx + 10, cy + 10 };
-    DrawTextW(dc, ini.c_str(), (int)ini.size(), &tr,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    SelectObject(dc, of);
+    return s;
 }
 
 static int PatchRowsFit(const RECT& rc) {
@@ -1981,17 +2008,19 @@ static void SbGeom(int trackTop, int trackBottom, int total, int fit, int top,
 
 static void DrawScrollbar(HDC dc, const RECT& track, int thumbH, int thumbY, bool active) {
     if (thumbH <= 0) return;
-    HBRUSH tb = CreateSolidBrush(kLogPanel);
+    HBRUSH tb = CreateSolidBrush(kLogGutter);
     FillRect(dc, &track, tb);
     DeleteObject(tb);
-    RECT th{ track.left + 2, thumbY, track.right - 2, thumbY + thumbH };
-    HBRUSH hb = CreateSolidBrush(active ? kLogGray : kLogBorder);
-    HPEN np = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+    RECT th{ track.left + 1, thumbY, track.right - 1, thumbY + thumbH };
+    HBRUSH hb = CreateSolidBrush(active ? kDlgPress : kDlgBtnFace);
+    HPEN bp = CreatePen(PS_SOLID, 1, kDlgBorder);
     HBRUSH ob = (HBRUSH)SelectObject(dc, hb);
-    RoundRect(dc, th.left, th.top, th.right, th.bottom, 6, 6);
+    HPEN op = (HPEN)SelectObject(dc, bp);
+    Rectangle(dc, th.left, th.top, th.right, th.bottom);
     SelectObject(dc, ob);
-    SelectObject(dc, np);
+    SelectObject(dc, op);
     DeleteObject(hb);
+    DeleteObject(bp);
 }
 
 void LogPaint(LogCtx* c) {
@@ -2002,6 +2031,10 @@ void LogPaint(LogCtx* c) {
     HBRUSH bg = CreateSolidBrush(kLogBg);
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
+    DrawCaption(dc, c->hwnd, c->title, c->hoverClose);
+    // The body keeps its own coordinate space below the painted caption.
+    SetWindowOrgEx(dc, 0, -kCapH, nullptr);
+    rc.bottom -= kCapH;
     SetBkMode(dc, TRANSPARENT);
 
     const int contentRight = rc.right - kSbW - 4;
@@ -2014,65 +2047,54 @@ void LogPaint(LogCtx* c) {
     const int authorLeft = dateLeft - kAuthorW;
     const int subjRight = authorLeft;
 
-    // Header band: repo path on a calm panel, close affordance at the right.
-    RECT hdr{ 0, 0, rc.right, 40 };
+    // Header band: repo path on the cream face under the caption.
+    RECT hdr{ 0, 0, rc.right, 24 };
     HBRUSH hbr = CreateSolidBrush(kLogPanel);
     FillRect(dc, &hdr, hbr);
     DeleteObject(hbr);
     SelectObject(dc, c->title);
     SetTextColor(dc, kLogText);
-    RECT dr{ 12, 0, rc.right - 40, 40 };
+    RECT dr{ 12, 0, rc.right - 12, 24 };
     DrawTextW(dc, c->dir.c_str(), -1, &dr,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
     HPEN border = CreatePen(PS_SOLID, 1, kLogBorder);
     HPEN obp = (HPEN)SelectObject(dc, border);
-    MoveToEx(dc, 0, 40, nullptr);
-    LineTo(dc, rc.right, 40);
+    MoveToEx(dc, 0, 24, nullptr);
+    LineTo(dc, rc.right, 24);
     MoveToEx(dc, 0, kLogListTop - 1, nullptr);
     LineTo(dc, rc.right, kLogListTop - 1);
     SelectObject(dc, obp);
     DeleteObject(border);
 
-    // Column headers: graph | subject | author | date | hash.
+    // Column headers on a beige band: graph | subject | author | date | hash.
+    RECT hband{ 0, 24, rc.right, kLogListTop - 1 };
+    HBRUSH hbb = CreateSolidBrush(kDlgBtnFace);
+    FillRect(dc, &hband, hbb);
+    DeleteObject(hbb);
     SelectObject(dc, c->ui);
-    SetTextColor(dc, kLogGray);
-    RECT hG{ 8, 40, subjLeft, kLogListTop - 1 };
+    SetTextColor(dc, kLogText);
+    RECT hG{ 8, 24, subjLeft, kLogListTop - 1 };
     DrawTextW(dc, L"Граф", -1, &hG, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    RECT hS{ subjLeft, 40, subjRight, kLogListTop - 1 };
+    RECT hS{ subjLeft, 24, subjRight, kLogListTop - 1 };
     DrawTextW(dc, L"Комментарий", -1, &hS, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    RECT hA{ authorLeft, 40, dateLeft, kLogListTop - 1 };
+    RECT hA{ authorLeft, 24, dateLeft, kLogListTop - 1 };
     DrawTextW(dc, L"Автор", -1, &hA, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    RECT hD{ dateLeft, 40, hashLeft, kLogListTop - 1 };
+    RECT hD{ dateLeft, 24, hashLeft, kLogListTop - 1 };
     DrawTextW(dc, L"Дата", -1, &hD, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    RECT hH{ hashLeft, 40, contentRight, kLogListTop - 1 };
+    RECT hH{ hashLeft, 24, contentRight, kLogListTop - 1 };
     DrawTextW(dc, L"Коммит", -1, &hH, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-    // Close button: soft rounded square, red tint on hover.
-    {
-        COLORREF cbg = c->hoverClose ? kLogDelBg : kLogPanel;
-        COLORREF cfg = c->hoverClose ? kLogDelTx : kLogGray;
-        HBRUSH b = CreateSolidBrush(cbg);
-        HPEN np = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
-        HBRUSH ob = (HBRUSH)SelectObject(dc, b);
-        RoundRect(dc, c->rcClose.left, c->rcClose.top, c->rcClose.right, c->rcClose.bottom, 6, 6);
-        SelectObject(dc, ob);
-        SelectObject(dc, np);
-        DeleteObject(b);
-        HPEN xp = CreatePen(PS_SOLID, 1, cfg);
-        HPEN ox = (HPEN)SelectObject(dc, xp);
-        MoveToEx(dc, c->rcClose.left + 8, c->rcClose.top + 7, nullptr);
-        LineTo(dc, c->rcClose.right - 8, c->rcClose.bottom - 7);
-        MoveToEx(dc, c->rcClose.right - 8, c->rcClose.top + 7, nullptr);
-        LineTo(dc, c->rcClose.left + 8, c->rcClose.bottom - 7);
-        SelectObject(dc, ox);
-        DeleteObject(xp);
-    }
 
     int listTop = kLogListTop;
     int listBottom = LogListBottom(rc);
     c->visible = (listBottom - listTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
+
+    // The commit list is a white field on the cream chrome, like a 1C list box.
+    RECT listArea{ 4, listTop, contentRight, listBottom };
+    HBRUSH lbr = CreateSolidBrush(kDlgFieldBg);
+    FillRect(dc, &listArea, lbr);
+    DeleteObject(lbr);
 
     // One round-cap pen per lane colour; verticals stay straight, lane changes
     // become smooth bezier elbows instead of the old 45-degree jagged joins.
@@ -2093,10 +2115,6 @@ void LogPaint(LogCtx* c) {
             HBRUSH sb = CreateSolidBrush(kLogSel);
             FillRect(dc, &row, sb);
             DeleteObject(sb);
-            RECT bar{ 4, yTop, 7, yTop + kLogRowH };
-            HBRUSH ab = CreateSolidBrush(kLogSelBar);
-            FillRect(dc, &bar, ab);
-            DeleteObject(ab);
         } else if (idx == c->hover) {
             HBRUSH hb2 = CreateSolidBrush(kLogHover);
             FillRect(dc, &row, hb2);
@@ -2118,7 +2136,6 @@ void LogPaint(LogCtx* c) {
         bool hasNext = idx + 1 < (int)c->rows.size();
         const std::wstring& aboveG = idx > 0 ? c->rows[idx - 1].below : noGraph;
         const std::wstring& belowG = r.below;
-        COLORREF rowBg = idx == c->sel ? kLogSel : (idx == c->hover ? kLogHover : kLogBg);
 
         for (size_t j = 0; j < r.graph.size(); j += 2) {
             wchar_t ch = r.graph[j];
@@ -2171,47 +2188,45 @@ void LogPaint(LogCtx* c) {
             }
         }
         size_t star = r.graph.find(L'*');
-        if (star != std::wstring::npos && LaneX((int)star) <= 4 + kGraphW) {
-            bool isHead = r.refs.find(L"HEAD") != std::wstring::npos;
-            DrawNode(dc, LaneX((int)star), mid, LaneColor((int)star / 2), rowBg, isHead);
-        }
+        if (star != std::wstring::npos && LaneX((int)star) <= 4 + kGraphW)
+            DrawNode(dc, LaneX((int)star), mid, LaneColor((int)star / 2));
     }
 
-    // Pass 3: subject + ref pills, author chip, date and hash.
+    // Pass 3: subject with plain refs, author, date and hash.
     for (int i = 0; i < c->visible; ++i) {
         int idx = c->top + i;
         if (idx >= (int)c->rows.size()) break;
         int yTop = listTop + i * kLogRowH;
         int yBot = yTop + kLogRowH;
-        int mid = (yTop + yBot) / 2;
         const LogRow& r = c->rows[idx];
 
-        // Subject with ref pills trailing it (ellipsised to leave pill room).
-        std::vector<RefPill> pills;
-        ParseRefs(r.refs, pills);
-        int pw = 0;
-        for (size_t k = 0; k < pills.size(); ++k)
-            pw += PillWidth(dc, pills[k].text, c->ui) + (k ? 4 : 0);
+        // Subject with plain rust refs trailing it (ellipsised to leave room).
+        std::wstring rt = RefsText(r.refs);
         SelectObject(dc, c->ui);
+        SIZE rw{};
+        if (!rt.empty()) GetTextExtentPoint32W(dc, rt.c_str(), (int)rt.size(), &rw);
         SIZE sw{};
         GetTextExtentPoint32W(dc, r.subject.c_str(), (int)r.subject.size(), &sw);
-        int avail = subjRight - subjLeft - (pw > 0 ? pw + 8 : 0);
+        int avail = subjRight - subjLeft - (rw.cx > 0 ? rw.cx + 8 : 0);
         if (avail < 20) avail = 20;
         SetTextColor(dc, kLogText);
         RECT sr{ subjLeft, yTop, subjLeft + avail, yBot };
         DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        int px = subjLeft + (sw.cx < avail ? sw.cx : avail) + 8;
-        for (const RefPill& p : pills) px += DrawPill(dc, px, mid, p.text, p.kind, c->ui) + 4;
+        if (!rt.empty()) {
+            SetTextColor(dc, kLogRefs);
+            RECT rr{ subjLeft + (sw.cx < avail ? sw.cx : avail) + 8, yTop, subjRight, yBot };
+            DrawTextW(dc, rt.c_str(), (int)rt.size(), &rr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
 
-        // Author: initials chip + muted name.
+        // Author, date and hash as plain classic columns.
         std::wstring aname = r.author;
         size_t lt = aname.find(L" <");
         if (lt != std::wstring::npos) aname = aname.substr(0, lt);
-        DrawAvatar(dc, authorLeft + 10, mid, r.author, c->ui);
         SelectObject(dc, c->ui);
-        SetTextColor(dc, kLogGray);
-        RECT ar{ authorLeft + 24, yTop, dateLeft - 4, yBot };
+        SetTextColor(dc, kLogText);
+        RECT ar{ authorLeft + 4, yTop, dateLeft - 4, yBot };
         DrawTextW(dc, aname.c_str(), (int)aname.size(), &ar,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         RECT dtr{ dateLeft, yTop, hashLeft - 8, yBot };
@@ -2254,56 +2269,50 @@ void LogPaint(LogCtx* c) {
         DrawTextW(dc, hint, -1, &hr, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
 
-    // Details card: white rounded panel, subject as a title, refs at the right,
-    // author chip + date + hash on the second line.
+    // Details panel: flat cream group with subject, refs, author, date and hash.
     int detTop = LogDetailTop(rc);
     {
-        RECT card{ 8, detTop, rc.right - 8, detTop + 56 };
-        HBRUSH cb = CreateSolidBrush(kLogPatchBg);
-        HPEN cp = CreatePen(PS_SOLID, 1, kLogBorder);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, cb);
-        HPEN op = (HPEN)SelectObject(dc, cp);
-        RoundRect(dc, card.left, card.top, card.right, card.bottom, 12, 12);
-        SelectObject(dc, ob);
-        SelectObject(dc, op);
+        RECT card{ 8, detTop, rc.right - 8, detTop + 44 };
+        HBRUSH cb = CreateSolidBrush(kDlgBg);
+        FillRect(dc, &card, cb);
         DeleteObject(cb);
-        DeleteObject(cp);
+        UiFrame(dc, card, kDlgBorder);
         if (c->sel >= 0 && c->sel < (int)c->rows.size()) {
             const LogRow& r = c->rows[c->sel];
-            std::vector<RefPill> pills;
-            ParseRefs(r.refs, pills);
-            int pw = 0;
-            for (size_t k = 0; k < pills.size(); ++k)
-                pw += PillWidth(dc, pills[k].text, c->ui) + (k ? 4 : 0);
-            SelectObject(dc, c->title);
+            std::wstring rt = RefsText(r.refs);
+            SelectObject(dc, c->ui);
+            SIZE rw{};
+            if (!rt.empty()) GetTextExtentPoint32W(dc, rt.c_str(), (int)rt.size(), &rw);
+            SelectObject(dc, c->uiSemi);
             SetTextColor(dc, kLogText);
-            int subjAvail = (card.right - 12) - (card.left + 12) - (pw > 0 ? pw + 10 : 0);
+            int subjAvail = (card.right - 12) - (card.left + 12) - (rw.cx > 0 ? rw.cx + 10 : 0);
             if (subjAvail < 40) subjAvail = 40;
-            RECT sjr{ card.left + 12, card.top + 6, card.left + 12 + subjAvail, card.top + 28 };
+            RECT sjr{ card.left + 12, card.top + 4, card.left + 12 + subjAvail, card.top + 20 };
             DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sjr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            int px = card.right - 12 - pw;
-            for (const RefPill& p : pills)
-                px += DrawPill(dc, px, card.top + 17, p.text, p.kind, c->ui) + 4;
-
-            DrawAvatar(dc, card.left + 22, card.top + 41, r.author, c->ui);
+            if (!rt.empty()) {
+                SelectObject(dc, c->ui);
+                SetTextColor(dc, kLogRefs);
+                RECT rr{ card.right - 12 - rw.cx, card.top + 4, card.right - 12, card.top + 20 };
+                DrawTextW(dc, rt.c_str(), (int)rt.size(), &rr,
+                          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
             std::wstring aname = r.author;
             size_t lt = aname.find(L" <");
             if (lt != std::wstring::npos) aname = aname.substr(0, lt);
-            SelectObject(dc, c->uiSemi);
-            SetTextColor(dc, kLogGray);
-            RECT ar{ card.left + 36, card.top + 32, card.left + 256, card.top + 50 };
+            SelectObject(dc, c->ui);
+            SetTextColor(dc, kLogText);
+            RECT ar{ card.left + 12, card.top + 24, card.left + 232, card.top + 40 };
             DrawTextW(dc, aname.c_str(), (int)aname.size(), &ar,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             SIZE nw{};
             GetTextExtentPoint32W(dc, aname.c_str(), (int)aname.size(), &nw);
-            int dx = card.left + 36 + (nw.cx < 220 ? nw.cx : 220) + 10;
-            SelectObject(dc, c->ui);
-            RECT dtr{ dx, card.top + 32, dx + 120, card.top + 50 };
+            int dx = card.left + 12 + (nw.cx < 220 ? nw.cx : 220) + 10;
+            RECT dtr{ dx, card.top + 24, dx + 120, card.top + 40 };
             DrawTextW(dc, r.date.c_str(), (int)r.date.size(), &dtr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SelectObject(dc, c->mono);
-            RECT hr{ card.right - 100, card.top + 32, card.right - 12, card.top + 50 };
+            RECT hr{ card.right - 100, card.top + 24, card.right - 12, card.top + 40 };
             DrawTextW(dc, r.hash.c_str(), (int)r.hash.size(), &hr,
                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SelectObject(dc, c->ui);
@@ -2347,8 +2356,8 @@ void LogPaint(LogCtx* c) {
             COLORREF bgc = kLogPatchBg;
             COLORREF sign = kLogGray;
             switch (d.kind) {
-            case DiffLine::Add:      bgc = kLogAddBg;  sign = kLogAddTx; break;
-            case DiffLine::Del:      bgc = kLogDelBg;  sign = kLogDelTx; break;
+            case DiffLine::Add:      bgc = kLogAddBg;  fg = sign = kLogAddTx; break;
+            case DiffLine::Del:      bgc = kLogDelBg;  fg = sign = kLogDelTx; break;
             case DiffLine::Hunk:     bgc = kLogHunkBg; fg = kLogHunkTx;  break;
             case DiffLine::FileHead: bgc = kLogHeadBg; break;
             case DiffLine::Meta:
@@ -2411,7 +2420,7 @@ void LogPaint(LogCtx* c) {
                         x2 += sz.cx;
                         if (x1 >= limit) break;
                         if (x2 > limit) x2 = limit;
-                        RoundRect(dc, x1, y + 3, x2, y + kDiffRowH - 3, 6, 6);
+                        Rectangle(dc, x1, y + 2, x2, y + kDiffRowH - 2);
                     }
                     SelectObject(dc, ob);
                     SelectObject(dc, np);
@@ -2456,10 +2465,13 @@ void LogPaint(LogCtx* c) {
         }
     }
 
+    SetWindowOrgEx(dc, 0, 0, nullptr);
     HPEN frame = CreatePen(PS_SOLID, 1, kLogBorder);
     HPEN ofr = (HPEN)SelectObject(dc, frame);
     HBRUSH obb = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Rectangle(dc, 0, 0, rc.right - 1, rc.bottom - 1);
+    RECT full{};
+    GetClientRect(c->hwnd, &full);
+    Rectangle(dc, 0, 0, full.right - 1, full.bottom - 1);
     SelectObject(dc, obb);
     SelectObject(dc, ofr);
     DeleteObject(frame);
@@ -2503,7 +2515,7 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
         if (mmi) {
             mmi->ptMinTrackSize.x = 640;
-            mmi->ptMinTrackSize.y = 460;
+            mmi->ptMinTrackSize.y = 460 + kCapH;
         }
         return 0;
     }
@@ -2516,7 +2528,7 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (c) {
             RECT rc{};
             GetClientRect(h, &rc);
-            SetRect(&c->rcClose, rc.right - 28, 2, rc.right - 2, 24);
+            SetRect(&c->rcClose, rc.right - 26, 3, rc.right - 4, 21);
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
@@ -2524,8 +2536,10 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!c) break;
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         ScreenToClient(h, &pt);
+        pt.y -= kCapH;
         RECT rc{};
         GetClientRect(h, &rc);
+        rc.bottom -= kCapH;
         int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 3;
         if (pt.y > LogPatchTop(rc)) {
             // cursor over the patch pane — scroll the diff
@@ -2547,8 +2561,10 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         bool hv = PtInRect(&c->rcClose, pt) != 0;
         if (hv != c->hoverClose) { c->hoverClose = hv; InvalidateRect(h, nullptr, FALSE); }
+        pt.y -= kCapH;
         RECT rc{};
         GetClientRect(h, &rc);
+        rc.bottom -= kCapH;
         if (c->drag) {
             if (c->drag == 1) {
                 int trackH = LogListBottom(rc) - kLogListTop;
@@ -2606,8 +2622,10 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!c) break;
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         if (PtInRect(&c->rcClose, pt)) { DestroyWindow(h); return 0; }
+        pt.y -= kCapH;
         RECT rc{};
         GetClientRect(h, &rc);
+        rc.bottom -= kCapH;
         if (PtInRect(&c->rcListSb, pt)) {
             int th = 0, ty = 0;
             SbGeom(kLogListTop, LogListBottom(rc), (int)c->rows.size(), c->visible,
@@ -2653,6 +2671,8 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
+    case WM_NCHITTEST:
+        return CapHitTest(h, wp, lp);
     case WM_KEYDOWN:
         if (!c) break;
         if (wp == VK_ESCAPE || wp == VK_RETURN) { DestroyWindow(h); return 0; }
@@ -2705,23 +2725,24 @@ void ShowGitLog(HWND owner) {
         return;
     }
     c->mono = LogFont(9, L"Consolas", FW_NORMAL, FIXED_PITCH | FF_MODERN);
-    c->ui = LogFont(9, L"Segoe UI", FW_NORMAL, DEFAULT_PITCH | FF_SWISS);
-    c->uiSemi = LogFont(9, L"Segoe UI", FW_SEMIBOLD, DEFAULT_PITCH | FF_SWISS);
-    c->title = LogFont(11, L"Segoe UI", FW_SEMIBOLD, DEFAULT_PITCH | FF_SWISS);
-    c->bold = LogFont(9, L"Segoe UI", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
+    c->ui = LogFont(8, L"Tahoma", FW_NORMAL, DEFAULT_PITCH | FF_SWISS);
+    c->uiSemi = LogFont(8, L"Tahoma", FW_SEMIBOLD, DEFAULT_PITCH | FF_SWISS);
+    c->title = LogFont(8, L"Tahoma", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
+    c->bold = LogFont(8, L"Tahoma", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
 
     HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitLog",
                              L"История Git — v8inject",
-                             WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX |
-                             WS_OVERLAPPED | WS_VISIBLE,
-                             CW_USEDEFAULT, CW_USEDEFAULT, 960, 700, owner, nullptr,
+                             WS_POPUP | WS_THICKFRAME | WS_VISIBLE,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 960, 700 + kCapH, owner, nullptr,
                              GetModuleHandleW(nullptr), nullptr);
     if (!h) { delete c; return; }
+    CenterOnOwner(h, owner);
     SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)c);
     c->hwnd = h;
     RECT rc{};
     GetClientRect(h, &rc);
-    SetRect(&c->rcClose, rc.right - 28, 2, rc.right - 2, 24);
+    SetRect(&c->rcClose, rc.right - 26, 3, rc.right - 4, 21);
+    rc.bottom -= kCapH;
     c->visible = (LogListBottom(rc) - kLogListTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
     SetForegroundWindow(h);
@@ -2789,6 +2810,8 @@ struct ListDlg {
     std::vector<std::wstring> items;
     int btnIds[5] = {};
     int btnCount = 0;
+    bool hoverX = false;
+    bool trackedLeave = false;
 };
 
 static void ListDlgLayout(ListDlg* d) {
@@ -2797,9 +2820,9 @@ static void ListDlgLayout(ListDlg* d) {
     GetClientRect(d->h, &rc);
     const int pad = 8, bh = 26;
     int by = rc.bottom - pad - bh;
-    SetRect(&d->listFrame, pad, pad, rc.right - pad, by - pad);
-    MoveWindow(d->list, pad + 1, pad + 1, rc.right - 2 * pad - 2,
-               by - 2 * pad - 2, TRUE);
+    SetRect(&d->listFrame, pad, kCapH + pad, rc.right - pad, by - pad);
+    MoveWindow(d->list, pad + 1, kCapH + pad + 1, rc.right - 2 * pad - 2,
+               by - 2 * pad - 2 - kCapH, TRUE);
     int bx = pad;
     for (int i = 0; i < d->btnCount; ++i) {
         MoveWindow(GetDlgItem(d->h, d->btnIds[i]), bx, by, 110, bh, TRUE);
@@ -2912,7 +2935,7 @@ static void ListDlgDrawItem(const DRAWITEMSTRUCT* dis, HFONT font) {
     row.left += 4;
     HGDIOBJ oldFont = SelectObject(dis->hDC, font);
     int oldMode = SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, sel && focus ? RGB(255, 255, 255) : kDlgText);
+    SetTextColor(dis->hDC, kDlgText);
     DrawTextW(dis->hDC, text, -1, &row,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     SetBkMode(dis->hDC, oldMode);
@@ -2948,9 +2971,40 @@ static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!d) break;
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
+        DrawCaption(dc, h, d->font, d->hoverX);
         UiFrame(dc, d->listFrame, kDlgBorder);
         EndPaint(h, &ps);
         return 0;
+    }
+    case WM_NCHITTEST:
+        return CapHitTest(h, wp, lp);
+    case WM_MOUSEMOVE: {
+        if (!d) break;
+        if (!d->trackedLeave) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            d->trackedLeave = true;
+        }
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        RECT rc;
+        GetClientRect(h, &rc);
+        bool hv = PtInRect(&CapCloseRect(rc), pt) != 0;
+        if (hv != d->hoverX) { d->hoverX = hv; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (d) {
+            d->trackedLeave = false;
+            if (d->hoverX) { d->hoverX = false; InvalidateRect(h, nullptr, FALSE); }
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        if (!d) break;
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        RECT rc;
+        GetClientRect(h, &rc);
+        if (PtInRect(&CapCloseRect(rc), pt)) { DestroyWindow(h); return 0; }
+        break;
     }
     case WM_DRAWITEM: {
         if (!d) break;
@@ -2966,12 +3020,13 @@ static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mm = (MINMAXINFO*)lp;
         mm->ptMinTrackSize.x = 740;
-        mm->ptMinTrackSize.y = 220;
+        mm->ptMinTrackSize.y = 220 + kCapH;
         return 0;
     }
     case WM_SIZE: {
         if (!d) break;
         ListDlgLayout(d);
+        InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
     case WM_CLOSE:
@@ -3013,10 +3068,11 @@ void ShowList(int kind) {
     d->kind = kind;
     d->font = CreateDlgFont();
     HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitList", title,
-                             WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
-                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
+                             WS_POPUP | WS_THICKFRAME | WS_VISIBLE,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 480 + kCapH,
                              g_bar.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!h) { DeleteObject(d->font); delete d; return; }
+    CenterOnOwner(h, g_bar.hwnd);
     d->h = h;
     SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)d);
     d->list = CreateWindowExW(0, L"LISTBOX", L"",
