@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <uiautomation.h>
 #include <algorithm>
 #include <string>
 #include <utility>
@@ -566,10 +567,12 @@ void Paint(HWND hwnd) {
 // Docks the bar at the right end of the toolbar row unless the user dragged
 // it; keeps it raised above the frame's own toolbar children, which 1C
 // re-creates and would otherwise paint over us.
+void MenuReposition(HWND frame);   // main-menu overlay, defined below
+
 void Reposition(bool forceDock) {
     HWND frame = GetParent(g_bar.hwnd);
     if (!frame) { frame = FindFrame(); if (frame) SetParent(g_bar.hwnd, frame); }
-    if (!frame) return;
+    if (!frame) { MenuReposition(nullptr); return; }
 
     RECT cr{};
     GetClientRect(frame, &cr);
@@ -617,11 +620,12 @@ void Reposition(bool forceDock) {
         if (tl.x > maxX) tl.x = maxX;
         if (tl.y > maxY) tl.y = maxY;
     }
-    if (hiddenMinimized) return;
+    if (hiddenMinimized) { MenuReposition(frame); return; }
     // The size is always passed along: a mode switch while the frame was
     // minimized must still resize the (hidden) window.
     SetWindowPos(g_bar.hwnd, HWND_TOP, tl.x, tl.y, barW, kBarH,
                  SWP_NOACTIVATE | (g_topLevelDwm ? 0 : SWP_SHOWWINDOW));
+    MenuReposition(frame);
 }
 
 // The per-button tools are TTF_SUBCLASS and must stay silent unless hovered, so
@@ -3205,6 +3209,349 @@ void DoAction(int id) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main-menu overlay: a «GitBar» item painted into the designer's menu row right
+// after «Сервис». The row is custom-painted (no HMENU), but UI Automation
+// exposes it as a ToolBar with Button children carrying exact screen rects. We
+// cover the tail of the row with a top-level owned popup, paint «GitBar» plus
+// shifted copies of the buttons that followed «Сервис» (Окна, Справка), and
+// route clicks: GitBar opens the action list, a replica forwards a real click
+// to the original 1C button underneath (the menu buttons expose no UIA
+// patterns, so they cannot be invoked programmatically). If UIA finds no menu
+// toolbar the feature stays absent.
+// ---------------------------------------------------------------------------
+
+const COLORREF kMenuBg         = RGB(245, 242, 221);  // F5F2DD menu-row face
+const COLORREF kMenuText       = RGB(65, 48, 3);      // 413003 dark-brown item
+const COLORREF kMenuHoverFill  = RGB(214, 233, 255);  // D6E9FF pale-blue box
+const COLORREF kMenuHoverBorder = RGB(158, 182, 233); // 9EB6E9
+const COLORREF kMenuHoverText  = RGB(61, 78, 143);    // 3D4E8F
+
+struct MenuButton {
+    std::wstring text;
+    RECT rect{};                 // original screen rect
+};
+
+struct GitMenu {
+    HWND hwnd = nullptr;
+    HFONT font = nullptr;
+    IUIAutomation* uia = nullptr;
+    IUIAutomationElement* toolbar = nullptr;
+    IUIAutomationCondition* toolbarCond = nullptr;   // ControlType == ToolBar
+    IUIAutomationCondition* buttonCond = nullptr;    // ControlType == Button
+    std::vector<MenuButton> tail;   // buttons after «Сервис», repainted shifted
+    int anchorRight = 0;         // screen x where «GitBar» starts (Сервис.right)
+    int rowTop = 0, rowH = 21;   // menu-row screen top / height
+    int ourW = 0, width = 0;     // GitBar item width / whole overlay width
+    int hover = -1;              // 0 = GitBar, 1.. = tail index, -1 = none
+    bool trackedLeave = false;
+    bool valid = false;
+    RECT lastFrame{};
+    int tick = 0;
+};
+
+GitMenu g_menu;
+
+void MenuReleaseTail() {
+    g_menu.tail.clear();
+}
+
+bool MenuEnsureUia() {
+    if (!g_menu.uia) {
+        HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                      CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_menu.uia));
+        if (FAILED(hr) || !g_menu.uia) { g_menu.uia = nullptr; return false; }
+    }
+    if (!g_menu.toolbarCond) {
+        VARIANT v; VariantInit(&v);
+        v.vt = VT_I4; v.lVal = UIA_ToolBarControlTypeId;
+        g_menu.uia->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &g_menu.toolbarCond);
+    }
+    if (!g_menu.buttonCond) {
+        VARIANT v; VariantInit(&v);
+        v.vt = VT_I4; v.lVal = UIA_ButtonControlTypeId;
+        g_menu.uia->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &g_menu.buttonCond);
+    }
+    return g_menu.toolbarCond && g_menu.buttonCond;
+}
+
+// The menu toolbar is the one whose children include «Файл»; matching by content
+// rather than by the localized «Главное меню» name survives other languages.
+bool MenuFindToolbar(HWND frame) {
+    IUIAutomationElement* root = nullptr;
+    if (FAILED(g_menu.uia->ElementFromHandle(frame, &root)) || !root) return false;
+    IUIAutomationElementArray* bars = nullptr;
+    HRESULT hr = root->FindAll(TreeScope_Descendants, g_menu.toolbarCond, &bars);
+    root->Release();
+    if (FAILED(hr) || !bars) return false;
+    int n = 0; bars->get_Length(&n);
+    bool found = false;
+    for (int i = 0; i < n && !found; ++i) {
+        IUIAutomationElement* bar = nullptr;
+        bars->GetElement(i, &bar);
+        if (!bar) continue;
+        IUIAutomationElementArray* kids = nullptr;
+        if (SUCCEEDED(bar->FindAll(TreeScope_Children, g_menu.buttonCond, &kids)) && kids) {
+            int kn = 0; kids->get_Length(&kn);
+            for (int j = 0; j < kn; ++j) {
+                IUIAutomationElement* k = nullptr;
+                kids->GetElement(j, &k);
+                if (!k) continue;
+                BSTR name = nullptr; k->get_CurrentName(&name);
+                bool isFile = name && wcscmp(name, L"Файл") == 0;
+                if (name) SysFreeString(name);
+                k->Release();
+                if (isFile) { g_menu.toolbar = bar; bar = nullptr; found = true; break; }
+            }
+            kids->Release();
+        }
+        if (bar) bar->Release();
+    }
+    bars->Release();
+    return found;
+}
+
+bool MenuQueryLayout(HWND frame) {
+    if (!MenuEnsureUia()) return false;
+    if (!g_menu.toolbar && !MenuFindToolbar(frame)) return false;
+
+    IUIAutomationElementArray* arr = nullptr;
+    HRESULT hr = g_menu.toolbar->FindAll(TreeScope_Children, g_menu.buttonCond, &arr);
+    if (FAILED(hr) || !arr) {
+        // The cached toolbar went stale (1C rebuilt its menu): resolve again.
+        g_menu.toolbar->Release(); g_menu.toolbar = nullptr;
+        if (!MenuFindToolbar(frame)) return false;
+        hr = g_menu.toolbar->FindAll(TreeScope_Children, g_menu.buttonCond, &arr);
+        if (FAILED(hr) || !arr) return false;
+    }
+
+    struct B { std::wstring text; RECT r; IUIAutomationElement* el; };
+    std::vector<B> buttons;
+    int n = 0; arr->get_Length(&n);
+    for (int i = 0; i < n; ++i) {
+        IUIAutomationElement* el = nullptr;
+        arr->GetElement(i, &el);
+        if (!el) continue;
+        BSTR name = nullptr; el->get_CurrentName(&name);
+        B b; b.text = name ? name : L"";
+        if (name) SysFreeString(name);
+        el->get_CurrentBoundingRectangle(&b.r);
+        b.el = el;
+        buttons.push_back(b);
+    }
+    arr->Release();
+    if (buttons.empty()) return false;
+
+    int svc = -1;
+    for (int i = 0; i < (int)buttons.size(); ++i)
+        if (buttons[i].text == L"Сервис") { svc = i; break; }
+
+    MenuReleaseTail();
+    if (svc >= 0) {
+        g_menu.anchorRight = buttons[svc].r.right;
+        for (int i = svc + 1; i < (int)buttons.size(); ++i) {
+            MenuButton mb;
+            mb.text = buttons[i].text;
+            mb.rect = buttons[i].r;
+            g_menu.tail.push_back(mb);
+        }
+    } else {
+        // No «Сервис» (other locale/layout): append after the last button.
+        g_menu.anchorRight = buttons.back().r.right;
+    }
+    for (B& b : buttons) b.el->Release();
+
+    RECT tr{}; g_menu.toolbar->get_CurrentBoundingRectangle(&tr);
+    g_menu.rowTop = tr.top;
+    g_menu.rowH = (tr.bottom > tr.top) ? (tr.bottom - tr.top) : 21;
+
+    if (!g_menu.font) g_menu.font = CreateDlgFont();
+    HDC dc = GetDC(nullptr);
+    HFONT old = (HFONT)SelectObject(dc, g_menu.font);
+    SIZE sz{}; GetTextExtentPoint32W(dc, L"GitBar", 6, &sz);
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+    g_menu.ourW = sz.cx + 16;
+    int tailW = g_menu.tail.empty() ? 0 : (g_menu.tail.back().rect.right - g_menu.anchorRight);
+    g_menu.width = g_menu.ourW + tailW;
+    return true;
+}
+
+void MenuDrawItem(HDC dc, int x, int w, const wchar_t* text, bool hover) {
+    RECT item{ x, 1, x + w, g_menu.rowH - 1 };
+    if (hover) {
+        HBRUSH fb = CreateSolidBrush(kMenuHoverFill);
+        HPEN pen = CreatePen(PS_SOLID, 1, kMenuHoverBorder);
+        HGDIOBJ ob = SelectObject(dc, fb);
+        HGDIOBJ op = SelectObject(dc, pen);
+        RoundRect(dc, item.left, item.top, item.right, item.bottom, 7, 7);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(fb);
+        DeleteObject(pen);
+    }
+    COLORREF tc = hover ? kMenuHoverText : kMenuText;
+    SetTextColor(dc, tc);
+    DrawTextW(dc, text, -1, &item, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    // The platform underlines the mnemonic (the first character here).
+    int len = (int)wcslen(text);
+    if (len > 0) {
+        SIZE full{}, first{};
+        GetTextExtentPoint32W(dc, text, len, &full);
+        GetTextExtentPoint32W(dc, text, 1, &first);
+        int tx = x + (w - full.cx) / 2;
+        int ty = item.top + ((item.bottom - item.top) - full.cy) / 2 + full.cy - 1;
+        HPEN up = CreatePen(PS_SOLID, 1, tc);
+        HGDIOBJ op = SelectObject(dc, up);
+        MoveToEx(dc, tx, ty, nullptr);
+        LineTo(dc, tx + first.cx, ty);
+        SelectObject(dc, op);
+        DeleteObject(up);
+    }
+}
+
+void MenuPaint(HWND h) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT rc{}; GetClientRect(h, &rc);
+    HBRUSH bg = CreateSolidBrush(kMenuBg);
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    HFONT old = (HFONT)SelectObject(dc, g_menu.font);
+    SetBkMode(dc, TRANSPARENT);
+    MenuDrawItem(dc, 0, g_menu.ourW, L"GitBar", g_menu.hover == 0);
+    for (int i = 0; i < (int)g_menu.tail.size(); ++i) {
+        int bx = g_menu.ourW + (g_menu.tail[i].rect.left - g_menu.anchorRight);
+        int bw = g_menu.tail[i].rect.right - g_menu.tail[i].rect.left;
+        MenuDrawItem(dc, bx, bw, g_menu.tail[i].text.c_str(), g_menu.hover == i + 1);
+    }
+    SelectObject(dc, old);
+    EndPaint(h, &ps);
+}
+
+int MenuHitTest(POINT pt) {
+    if (pt.y < 0 || pt.y >= g_menu.rowH) return -1;
+    if (pt.x >= 0 && pt.x < g_menu.ourW) return 0;
+    for (int i = 0; i < (int)g_menu.tail.size(); ++i) {
+        int bx = g_menu.ourW + (g_menu.tail[i].rect.left - g_menu.anchorRight);
+        int bw = g_menu.tail[i].rect.right - g_menu.tail[i].rect.left;
+        if (pt.x >= bx && pt.x < bx + bw) return i + 1;
+    }
+    return -1;
+}
+
+// 1C's menu buttons expose no UIA patterns, so a replica cannot be invoked
+// through UIA. Instead make the overlay click-through for a moment and send a
+// real click at the ORIGINAL button position underneath; timer 3 restores
+// hit-testing once the injected click has been dispatched.
+void MenuForwardClick(const RECT& orig) {
+    if (!g_menu.hwnd) return;
+    POINT save{}; GetCursorPos(&save);
+    LONG_PTR ex = GetWindowLongPtrW(g_menu.hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(g_menu.hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+    SetWindowPos(g_menu.hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    POINT c{ (orig.left + orig.right) / 2, (orig.top + orig.bottom) / 2 };
+    SetCursorPos(c.x, c.y);
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+    // Keep the cursor on the replica the user clicked, not on the original
+    // button underneath (which maps to a different replica).
+    SetCursorPos(save.x, save.y);
+    SetTimer(g_menu.hwnd, 3, 120, nullptr);
+}
+
+LRESULT CALLBACK MenuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT:
+        MenuPaint(h);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEMOVE: {
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        int hit = MenuHitTest(pt);
+        if (hit != g_menu.hover) { g_menu.hover = hit; InvalidateRect(h, nullptr, FALSE); }
+        if (!g_menu.trackedLeave) {
+            TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            g_menu.trackedLeave = true;
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_menu.trackedLeave = false;
+        if (g_menu.hover != -1) { g_menu.hover = -1; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+        int hit = MenuHitTest(pt);
+        if (hit == 0) {
+            ShowActionMenu(h);
+        } else if (hit > 0 && hit <= (int)g_menu.tail.size()) {
+            MenuForwardClick(g_menu.tail[hit - 1].rect);
+        }
+        return 0;
+    }
+    case WM_TIMER:
+        if (wp == 3) {
+            KillTimer(h, 3);
+            LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+            SetWindowLongPtrW(h, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+            SetWindowPos(h, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// Called from the bar's 500ms reposition tick. Re-queries UIA only when the
+// frame moved/resized or every few seconds; otherwise just keeps the overlay
+// raised above the frame's own painting.
+void MenuReposition(HWND frame) {
+    if (!frame || !IsWindowVisible(frame)) {
+        if (g_menu.hwnd) ShowWindow(g_menu.hwnd, SW_HIDE);
+        return;
+    }
+    RECT fr{}; GetWindowRect(frame, &fr);
+    bool frameChanged = (fr.left != g_menu.lastFrame.left || fr.top != g_menu.lastFrame.top ||
+                         fr.right != g_menu.lastFrame.right || fr.bottom != g_menu.lastFrame.bottom);
+    g_menu.lastFrame = fr;
+    ++g_menu.tick;
+    if (!g_menu.valid || frameChanged || (g_menu.tick % 8) == 0) {
+        if (!MenuQueryLayout(frame)) {
+            g_menu.valid = false;
+            if (g_menu.hwnd) ShowWindow(g_menu.hwnd, SW_HIDE);
+            return;
+        }
+        g_menu.valid = true;
+        if (!g_menu.hwnd) {
+            g_menu.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                                          L"V8iGitMenu", L"GitBarMenu",
+                                          WS_POPUP, 0, 0, g_menu.width, g_menu.rowH,
+                                          frame, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (g_menu.hwnd) SetLayeredWindowAttributes(g_menu.hwnd, 0, 255, LWA_ALPHA);
+        }
+    }
+    if (!g_menu.hwnd) return;
+    SetWindowPos(g_menu.hwnd, HWND_TOP, g_menu.anchorRight, g_menu.rowTop,
+                 g_menu.width, g_menu.rowH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void MenuShutdown() {
+    if (g_menu.hwnd) { DestroyWindow(g_menu.hwnd); g_menu.hwnd = nullptr; }
+    MenuReleaseTail();
+    if (g_menu.toolbar) { g_menu.toolbar->Release(); g_menu.toolbar = nullptr; }
+    if (g_menu.toolbarCond) { g_menu.toolbarCond->Release(); g_menu.toolbarCond = nullptr; }
+    if (g_menu.buttonCond) { g_menu.buttonCond->Release(); g_menu.buttonCond = nullptr; }
+    if (g_menu.uia) { g_menu.uia->Release(); g_menu.uia = nullptr; }
+    if (g_menu.font) { DeleteObject(g_menu.font); g_menu.font = nullptr; }
+    g_menu.valid = false;
+    g_menu.hover = -1;
+    g_menu.tick = 0;
+}
+
 LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_PAINT:
@@ -3313,6 +3660,10 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 DWORD WINAPI BarThread(LPVOID) {
     HINSTANCE hInst = GetModuleHandleW(nullptr);
 
+    // UI Automation (main-menu overlay) and the shell dialogs need COM on this
+    // thread; STA matches the UIA client model.
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
@@ -3322,6 +3673,14 @@ DWORD WINAPI BarThread(LPVOID) {
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"V8iGitBar";
     RegisterClassW(&wc);
+
+    WNDCLASSW mc{};
+    mc.lpfnWndProc = MenuWndProc;
+    mc.hInstance = hInst;
+    mc.hbrBackground = nullptr;
+    mc.lpszClassName = L"V8iGitMenu";
+    mc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&mc);
 
     HWND frame = FindFrame();
     if (!frame) return 0;
@@ -3396,6 +3755,8 @@ DWORD WINAPI BarThread(LPVOID) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    MenuShutdown();
+    CoUninitialize();
     g_bar.hwnd = nullptr;
     g_bar.tooltip = nullptr;
     g_bar.statusTip = nullptr;
