@@ -435,11 +435,12 @@ const COLORREF kMenuHoverBorder = RGB(158, 182, 233); // 9EB6E9
 const COLORREF kMenuHoverText  = RGB(61, 78, 143);    // 3D4E8F
 const COLORREF kSubShortcut    = RGB(179, 128, 0);    // B38000 shortcut column
 const COLORREF kSubSep         = RGB(217, 213, 194);  // D9D5C2 separator line
-const COLORREF kSubGutterBg    = RGB(240, 238, 224);  // F0EEE0 icon column strip
+const COLORREF kSubGutterBg    = RGB(233, 229, 206);  // E9E5CE icon column strip
+const COLORREF kSubGutterEdge  = RGB(58, 56, 48);     // 3A3830 strip's right edge
 const int kSubItemH = 22;
 const int kSubSepH = 7;
 const int kSubGutter = 28;   // icon column, as in 1C submenus
-const int kSubTextX = kSubGutter + 6;   // labels start 6 px past the gutter strip
+const int kSubTextX = kSubGutter + 7;   // labels start 6 px past the strip's edge
 
 RECT CapCloseRect(const RECT& rc) {
     RECT r{ rc.right - 26, 3, rc.right - 4, 21 };
@@ -699,10 +700,16 @@ HBRUSH UiMenuBrush() {
     return b;
 }
 
-// The icon gutter strip on the left of the menu: a slightly darker cream
-// running the full height of the popup, as on a live 1C submenu.
+// The icon gutter strip on the left of the menu: a beige strip with a dark
+// 1px edge on its right, running the full height of the popup, as sampled
+// from a live 1C submenu.
 HBRUSH UiGutterBrush() {
     static HBRUSH b = CreateSolidBrush(kSubGutterBg);
+    return b;
+}
+
+HBRUSH UiGutterEdgeBrush() {
+    static HBRUSH b = CreateSolidBrush(kSubGutterEdge);
     return b;
 }
 
@@ -3368,13 +3375,16 @@ void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, UiMenuBrush());
-    // The darker icon-gutter strip on the left; painted for separators too, so
-    // the band runs unbroken from the top of the popup to its bottom.
+    // The darker icon-gutter strip with its dark right edge; painted for
+    // separators too, so the band runs unbroken from the top of the popup to
+    // its bottom.
     RECT gut{ rc.left, rc.top, rc.left + kSubGutter, rc.bottom };
     FillRect(dc, &gut, UiGutterBrush());
+    RECT edge{ rc.left + kSubGutter, rc.top, rc.left + kSubGutter + 1, rc.bottom };
+    FillRect(dc, &edge, UiGutterEdgeBrush());
     if (!d->itemData) {
-        // The line starts at the gutter strip, not on it.
-        RECT line{ rc.left + kSubGutter, (rc.top + rc.bottom) / 2, rc.right - 8,
+        // The line starts past the gutter strip and its edge.
+        RECT line{ rc.left + kSubGutter + 1, (rc.top + rc.bottom) / 2, rc.right - 8,
                    (rc.top + rc.bottom) / 2 + 1 };
         HBRUSH sb = CreateSolidBrush(kSubSep);
         FillRect(dc, &line, sb);
