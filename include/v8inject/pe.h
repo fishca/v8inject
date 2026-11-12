@@ -39,7 +39,7 @@ struct PeImage {
     uintptr_t base = 0;
     uint32_t  sizeOfImage = 0;
     uint32_t  entryPointRva = 0;
-    uint32_t  imageBaseRva = 0;   // PreferredImageBase (as recorded in headers)
+    uint64_t  imageBaseRva = 0;   // PreferredImageBase (as recorded in headers)
     uint16_t  machine = 0;
     uint16_t  characteristics = 0;
     bool      valid = false;

@@ -97,60 +97,85 @@ PeImage ParsePe(uintptr_t base) {
         img.error = "NT headers not readable";
         return img;
     }
-    auto* nt = (const IMAGE_NT_HEADERS32*)ntAddr;
-    if (nt->Signature != IMAGE_NT_SIGNATURE) { img.error = "no PE signature"; return img; }
 
-    img.machine         = nt->FileHeader.Machine;
-    img.characteristics = nt->FileHeader.Characteristics;
-    img.sizeOfImage     = nt->OptionalHeader.SizeOfImage;
-    img.entryPointRva   = nt->OptionalHeader.AddressOfEntryPoint;
-    img.imageBaseRva    = (uint32_t)nt->OptionalHeader.ImageBase;
+    // PE32 and PE32+ have different optional-header layouts, and the data
+    // directories sit at different offsets (96 in PE32, 112 in PE32+). Reading
+    // a 64-bit image with the 32-bit structure therefore looks for the import
+    // and export tables in the wrong place and finds nothing at all.
+    auto* nt32 = (const IMAGE_NT_HEADERS32*)ntAddr;
+    const bool pe32plus = nt32->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+
+    const IMAGE_DATA_DIRECTORY* dirs = nullptr;
+    DWORD numDirs = 0;
+    const IMAGE_SECTION_HEADER* sections = nullptr;
+
+    if (pe32plus) {
+        auto* nt64 = (const IMAGE_NT_HEADERS64*)ntAddr;
+        if (nt64->Signature != IMAGE_NT_SIGNATURE) { img.error = "no PE signature"; return img; }
+        img.sizeOfImage   = nt64->OptionalHeader.SizeOfImage;
+        img.entryPointRva = nt64->OptionalHeader.AddressOfEntryPoint;
+        img.imageBaseRva  = nt64->OptionalHeader.ImageBase;
+        numDirs           = nt64->OptionalHeader.NumberOfRvaAndSizes;
+        dirs              = nt64->OptionalHeader.DataDirectory;
+        sections          = IMAGE_FIRST_SECTION(nt64);
+    } else {
+        if (nt32->Signature != IMAGE_NT_SIGNATURE) { img.error = "no PE signature"; return img; }
+        img.sizeOfImage   = nt32->OptionalHeader.SizeOfImage;
+        img.entryPointRva = nt32->OptionalHeader.AddressOfEntryPoint;
+        img.imageBaseRva  = nt32->OptionalHeader.ImageBase;
+        numDirs           = nt32->OptionalHeader.NumberOfRvaAndSizes;
+        dirs              = nt32->OptionalHeader.DataDirectory;
+        sections          = IMAGE_FIRST_SECTION(nt32);
+    }
+
+    img.machine         = nt32->FileHeader.Machine;
+    img.characteristics = nt32->FileHeader.Characteristics;
     img.valid           = true;
 
     const uint32_t sizeOfImage = img.sizeOfImage;
 
-    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        if (!IsReadable(sec + i, sizeof(IMAGE_SECTION_HEADER))) break;
+    for (WORD i = 0; i < nt32->FileHeader.NumberOfSections; ++i) {
+        if (!IsReadable(sections + i, sizeof(IMAGE_SECTION_HEADER))) break;
         PeSection s;
-        s.name             = SectionName(sec[i]);
-        s.va               = sec[i].VirtualAddress;
-        s.virtualSize      = sec[i].Misc.VirtualSize;
-        s.rawSize          = sec[i].SizeOfRawData;
-        s.rawPtr           = sec[i].PointerToRawData;
-        s.characteristics  = sec[i].Characteristics;
+        s.name             = SectionName(sections[i]);
+        s.va               = sections[i].VirtualAddress;
+        s.virtualSize      = sections[i].Misc.VirtualSize;
+        s.rawSize          = sections[i].SizeOfRawData;
+        s.rawPtr           = sections[i].PointerToRawData;
+        s.characteristics  = sections[i].Characteristics;
         img.sections.push_back(s);
     }
 
     // ---- exports ----
-    const IMAGE_DATA_DIRECTORY& dir =
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (dir.VirtualAddress && dir.Size && dir.VirtualAddress < sizeOfImage) {
-        const uint32_t expRva = dir.VirtualAddress;
-        if (IsReadable((const void*)(base + expRva), sizeof(IMAGE_EXPORT_DIRECTORY))) {
-            auto* exp = (const IMAGE_EXPORT_DIRECTORY*)(base + expRva);
+    if (numDirs > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        const IMAGE_DATA_DIRECTORY& dir = dirs[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (dir.VirtualAddress && dir.Size && dir.VirtualAddress < sizeOfImage) {
+            const uint32_t expRva = dir.VirtualAddress;
+            if (IsReadable((const void*)(base + expRva), sizeof(IMAGE_EXPORT_DIRECTORY))) {
+                auto* exp = (const IMAGE_EXPORT_DIRECTORY*)(base + expRva);
 
-            const uint32_t namesRva = exp->AddressOfNames;
-            const uint32_t funcsRva = exp->AddressOfFunctions;
-            const uint32_t ordsRva  = exp->AddressOfNameOrdinals;
+                const uint32_t namesRva = exp->AddressOfNames;
+                const uint32_t funcsRva = exp->AddressOfFunctions;
+                const uint32_t ordsRva  = exp->AddressOfNameOrdinals;
 
-            for (DWORD i = 0; i < exp->NumberOfNames && i < 8192; ++i) {
-                uint32_t namePtrRva = SafeU32(base, sizeOfImage, namesRva + i * 4);
-                if (!namePtrRva) continue;
+                for (DWORD i = 0; i < exp->NumberOfNames && i < 8192; ++i) {
+                    uint32_t namePtrRva = SafeU32(base, sizeOfImage, namesRva + i * 4);
+                    if (!namePtrRva) continue;
 
-                PeExport e;
-                e.name = SafeAscii(base, sizeOfImage, namePtrRva, 512);
-                if (e.name.empty()) continue;
+                    PeExport e;
+                    e.name = SafeAscii(base, sizeOfImage, namePtrRva, 512);
+                    if (e.name.empty()) continue;
 
-                uint16_t idx = SafeU16(base, sizeOfImage, ordsRva + (uint32_t)i * 2);
-                e.rva = SafeU32(base, sizeOfImage, funcsRva + (uint32_t)idx * 4);
-                e.ordinal = (uint32_t)(exp->Base + idx);
-                // An export pointing inside the export directory is a forwarder.
-                if (e.rva >= expRva && e.rva < expRva + dir.Size) {
-                    e.forwarded = true;
-                    e.forwarder = SafeAscii(base, sizeOfImage, e.rva, 256);
+                    uint16_t idx = SafeU16(base, sizeOfImage, ordsRva + (uint32_t)i * 2);
+                    e.rva = SafeU32(base, sizeOfImage, funcsRva + (uint32_t)idx * 4);
+                    e.ordinal = (uint32_t)(exp->Base + idx);
+                    // An export pointing inside the export directory is a forwarder.
+                    if (e.rva >= expRva && e.rva < expRva + dir.Size) {
+                        e.forwarded = true;
+                        e.forwarder = SafeAscii(base, sizeOfImage, e.rva, 256);
+                    }
+                    img.exports.push_back(std::move(e));
                 }
-                img.exports.push_back(std::move(e));
             }
         }
     }
@@ -158,47 +183,48 @@ PeImage ParsePe(uintptr_t base) {
     // ---- imports ----
     // Every access is bounded by SizeOfImage and by the directory size declared
     // in the header. Walking this table unguarded previously crashed 1C.
-    const IMAGE_DATA_DIRECTORY& imp =
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (imp.VirtualAddress && imp.Size && imp.VirtualAddress < sizeOfImage) {
-        const uint32_t dirEnd = imp.VirtualAddress + imp.Size;
-        for (int d = 0; d < 1024; ++d) {
-            uint32_t descRva = imp.VirtualAddress + (uint32_t)(d * sizeof(IMAGE_IMPORT_DESCRIPTOR));
-            if (descRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > sizeOfImage) break;
-            if (descRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > dirEnd) break;
-            if (!IsReadable((const void*)(base + descRva), sizeof(IMAGE_IMPORT_DESCRIPTOR))) break;
+    if (numDirs > IMAGE_DIRECTORY_ENTRY_IMPORT) {
+        const IMAGE_DATA_DIRECTORY& imp = dirs[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (imp.VirtualAddress && imp.Size && imp.VirtualAddress < sizeOfImage) {
+            const uint32_t dirEnd = imp.VirtualAddress + imp.Size;
+            for (int d = 0; d < 1024; ++d) {
+                uint32_t descRva = imp.VirtualAddress + (uint32_t)(d * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+                if (descRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > sizeOfImage) break;
+                if (descRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > dirEnd) break;
+                if (!IsReadable((const void*)(base + descRva), sizeof(IMAGE_IMPORT_DESCRIPTOR))) break;
 
-            auto* desc = (const IMAGE_IMPORT_DESCRIPTOR*)(base + descRva);
-            if (!desc->Name && !desc->FirstThunk) break;   // terminator
+                auto* desc = (const IMAGE_IMPORT_DESCRIPTOR*)(base + descRva);
+                if (!desc->Name && !desc->FirstThunk) break;   // terminator
 
-            std::string dllName = SafeAscii(base, sizeOfImage, desc->Name, 256);
-            if (dllName.empty()) continue;
+                std::string dllName = SafeAscii(base, sizeOfImage, desc->Name, 256);
+                if (dllName.empty()) continue;
 
-            uint32_t thunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
-                                                        : desc->FirstThunk;
-            if (thunkRva >= sizeOfImage || desc->FirstThunk >= sizeOfImage) continue;
+                uint32_t thunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                            : desc->FirstThunk;
+                if (thunkRva >= sizeOfImage || desc->FirstThunk >= sizeOfImage) continue;
 
-            const size_t thunkSize = sizeof(IMAGE_THUNK_DATA32);
-            for (int i = 0; i < 8192; ++i) {
-                uint32_t curThunkRva = thunkRva + (uint32_t)(i * thunkSize);
-                if (curThunkRva + thunkSize > sizeOfImage) break;
-                if (!IsReadable((const void*)(base + curThunkRva), thunkSize)) break;
+                const size_t thunkSize = sizeof(IMAGE_THUNK_DATA32);
+                for (int i = 0; i < 8192; ++i) {
+                    uint32_t curThunkRva = thunkRva + (uint32_t)(i * thunkSize);
+                    if (curThunkRva + thunkSize > sizeOfImage) break;
+                    if (!IsReadable((const void*)(base + curThunkRva), thunkSize)) break;
 
-                uint32_t value = *(const uint32_t*)(base + curThunkRva);
-                if (!value) break;
+                    uint32_t value = *(const uint32_t*)(base + curThunkRva);
+                    if (!value) break;
 
-                PeImport pi;
-                pi.dll = dllName;
-                pi.iatRva = desc->FirstThunk + (uint32_t)(i * thunkSize);
+                    PeImport pi;
+                    pi.dll = dllName;
+                    pi.iatRva = desc->FirstThunk + (uint32_t)(i * thunkSize);
 
-                if (value & 0x80000000u) {
-                    pi.ordinal = (uint16_t)(value & 0xFFFF);
-                } else {
-                    if (value + 2 >= sizeOfImage) continue;
-                    pi.ordinal = SafeU16(base, sizeOfImage, value);
-                    pi.name = SafeAscii(base, sizeOfImage, value + 2, 256);
+                    if (value & 0x80000000u) {
+                        pi.ordinal = (uint16_t)(value & 0xFFFF);
+                    } else {
+                        if (value + 2 >= sizeOfImage) continue;
+                        pi.ordinal = SafeU16(base, sizeOfImage, value);
+                        pi.name = SafeAscii(base, sizeOfImage, value + 2, 256);
+                    }
+                    img.imports.push_back(std::move(pi));
                 }
-                img.imports.push_back(std::move(pi));
             }
         }
     }

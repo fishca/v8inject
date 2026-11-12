@@ -150,9 +150,24 @@ v8i_set_output(v8inject-agent)
 add_executable(v8i_hook_target tests/hook_target.cpp)
 v8i_set_output(v8i_hook_target)
 
+# ---- unit tests: a small runner of our own, no external framework ----
+# The project builds offline and hermetically, so the tests do not pull in a
+# framework: a runner of about a hundred lines and plain test functions.
+add_executable(v8i_tests
+    tests/test_main.cpp
+    tests/test_runner.cpp
+    tests/unit_pe.cpp
+    tests/unit_pe_utils.cpp
+    tests/unit_report.cpp
+    tests/unit_typeinfo.cpp
+)
+target_link_libraries(v8i_tests PRIVATE v8i_common)
+v8i_set_output(v8i_tests)
+
 # ---- smoke test ----
 enable_testing()
 add_test(NAME cli_help COMMAND v8inject --help)
+add_test(NAME unit COMMAND v8i_tests)
 
 # End-to-end hook test: injects the payload into v8i_hook_target.exe, hooks a
 # function with known arguments, and checks that the call was recorded and that
