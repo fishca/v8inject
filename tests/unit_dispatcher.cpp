@@ -133,8 +133,13 @@ V8I_TEST(Dispatcher_EveryAnswerIsValidJson) {
         const int timeout = (wcscmp(cmd, L"find") == 0) ? 60000 : 10000;
         const bool answered = d.Ask(cmd, reply, timeout);
         const DWORD spent = GetTickCount() - started;
-        std::printf("      %-10s %s in %u ms\n", cmd, answered ? "answered" : "no answer",
-                    spent);
+        // The name of the command is wide, the format is narrow: it goes
+        // through the same conversion the rest of the project uses.
+        std::wstring cmdWide(cmd);
+        std::string cmdNarrow;
+        for (wchar_t c : cmdWide) cmdNarrow += (char)(c < 128 ? c : '?');
+        std::printf("      %-10s %s in %u ms\n", cmdNarrow.c_str(),
+                    answered ? "answered" : "no answer", spent);
         if (!answered) {
             CHECK(reply.size() > 0);           // no answer at all
             continue;
