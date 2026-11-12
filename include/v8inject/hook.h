@@ -21,6 +21,16 @@ namespace v8i {
 // Returns a hook id (> 0), or 0 with `error` filled in.
 uint32_t HookInstall(uintptr_t target, const char* name, std::string& error);
 
+// Observer of one hook: called with the captured integer arguments right
+// before the trampoline runs. It is the reason some hooks exist at all (the
+// 8.5 early subscription watches for the designer's first window), so it runs
+// on the hooked function's own thread.
+using HookObserver = void (*)(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3);
+
+// Same as HookInstall, but the hook also calls `obs` for every hooked call.
+uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver obs,
+                             std::string& error);
+
 // Restores the original bytes of one hook, or of every hook when id == 0.
 size_t HookRemoveAll();
 bool   HookRemove(uint32_t id);

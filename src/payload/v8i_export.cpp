@@ -2008,9 +2008,12 @@ extern "C" __declspec(dllexport) void V8iArmEarly() {
 static bool V8iInstallCreateWindowHook();
 
 void V8iStartStartupWatch() {
-    // NOTE: the inline hook on CreateWindowExW is disabled — the current
-    // trampoline crashes 1C when the window is created. Re-enable after the
-    // trampoline is fixed (see V8iInstallCreateWindowHook).
+    // NOTE: the inline hook on CreateWindowExW is still off. Its old
+    // hand-written trampoline shifted the stack by eight bytes and crashed
+    // 1C; the trampoline is now the shared detour engine, which keeps the
+    // original frame (see V8iInstallCreateWindowHook). The hook stays disabled
+    // until that path is verified on a live Configurator -- the watcher
+    // thread below is the working way to reach the first window.
     // V8iInstallCreateWindowHook();
     CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
 }
@@ -2581,28 +2584,29 @@ static void V8iSubscribeNow() {
     }
 }
 
-static void* g_cwTrampoline = nullptr;
-static BYTE g_cwOrig[24] = {};
 static volatile int g_cwHookOk = 0;
 static volatile long g_cwHits = 0;
 
-static HWND WINAPI V8iDetourCreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name,
-                                            DWORD style, int x, int y, int w, int h,
-                                            HWND parent, HMENU menu, HINSTANCE inst,
-                                            LPVOID param) {
-    ++g_cwHits;
-    if (cls && !g85_subscribed &&
-        (wcsncmp(cls, L"V8Window0", 9) == 0 || wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)) {
+// Observer of the CreateWindowExW hook: the class name of the window being
+// created arrives as the second argument (rdx on x64).
+static void V8iObserveCreateWindow(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    InterlockedIncrement(&g_cwHits);
+    const wchar_t* cls = (const wchar_t*)a1;
+    if (!cls || g85_subscribed) return;
+    if (wcsncmp(cls, L"V8Window0", 9) == 0 || wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)
         V8iSubscribeNow();
-    }
-    typedef HWND(WINAPI* Fn)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int,
-                             HWND, HMENU, HINSTANCE, LPVOID);
-    return ((Fn)g_cwTrampoline)(exStyle, cls, name, style, x, y, w, h, parent, menu, inst, param);
 }
 
-// Installs the inline hook (mov rax, detour; jmp rax = 12 bytes + NOPs).
+// Installs the hook on user32!CreateWindowExW through the shared detour
+// engine. The earlier hand-written version called the original through a
+// C++ detour, and that call shifted the stack by eight bytes: the copied
+// prologue captured "mov r11, rsp" from a frame that was not the original
+// one, and user32 addresses its shadow space through that register -- the
+// return value landed eight bytes off and the caller's frame was touched.
+// The engine's thunk restores the stack before it enters the trampoline, so
+// the copied prologue sees exactly the frame the original function would.
 static bool V8iInstallCreateWindowHook() {
-    if (g_cwTrampoline) return true;
+    if (g_cwHookOk) return true;
     HMODULE u32 = GetModuleHandleW(L"user32.dll");
     if (!u32) u32 = LoadLibraryW(L"user32.dll");
     if (!u32) return false;
@@ -2613,28 +2617,18 @@ static bool V8iInstallCreateWindowHook() {
     //   48 81 EC 88 00 00 00  sub  rsp, 0x88
     //   33 C0                 xor  eax, eax
     //   66 89 44 24 78        mov  [rsp+78h], ax
+    // The check is x64-specific, so on x86 the hook is not installed.
     const BYTE expect[8] = {0x4C, 0x8B, 0xDC, 0x48, 0x81, 0xEC, 0x88, 0x00};
     if (memcmp(target, expect, sizeof(expect)) != 0) return false;
-    const int len = 17;  // whole instructions: 3 + 7 + 2 + 5
-    memcpy(g_cwOrig, target, len);
-    BYTE* tr = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!tr) return false;
-    memcpy(tr, target, len);
-    tr[len] = 0x48; tr[len + 1] = 0xB8;
-    *(uintptr_t*)(tr + len + 2) = (uintptr_t)target + len;
-    tr[len + 10] = 0xFF; tr[len + 11] = 0xE0;
-    g_cwTrampoline = tr;
-    DWORD oldProt = 0;
-    if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
-    BYTE patch[20];
-    memset(patch, 0x90, sizeof(patch));
-    patch[0] = 0x48; patch[1] = 0xB8;
-    *(uintptr_t*)(patch + 2) = (uintptr_t)&V8iDetourCreateWindowExW;
-    patch[10] = 0xFF; patch[11] = 0xE0;
-    memcpy(target, patch, len);
-    VirtualProtect(target, len, oldProt, &oldProt);
-    FlushInstructionCache(GetCurrentProcess(), target, len);
+    std::string err;
+    uint32_t id = HookInstallObserved((uintptr_t)target, "CreateWindowExW",
+                                      &V8iObserveCreateWindow, err);
+    if (!id) {
+        LogLine("CreateWindowExW: hook failed: %s", err.c_str());
+        return false;
+    }
     g_cwHookOk = 1;
+    LogLine("CreateWindowExW: hooked (id=%u)", id);
     return true;
 }
 

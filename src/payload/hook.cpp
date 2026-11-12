@@ -93,6 +93,7 @@ struct HookCtx {
     uint32_t  id = 0;
     volatile LONG logged = 0;   // disk-logged hits (capped to avoid flooding)
     bool      active = false;
+    HookObserver obs = nullptr;   // optional per-hook observer
     uint8_t   original[kMaxStolen + 8] = {};
     char      name[64] = {};
     volatile LONG calls = 0;
@@ -320,6 +321,11 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
     HookCtx* c = (HookCtx*)ctx;
     if (!c) return;
 
+    // The observer runs first: it is the reason some hooks exist at all (the
+    // 8.5 early subscription watches for the designer's first window), and it
+    // has to see the call before the function does anything with it.
+    if (c->obs) c->obs(a0, a1, a2, a3);
+
     InterlockedIncrement(&c->calls);
 
     LONG idx = InterlockedIncrement(&g_head) - 1;
@@ -413,6 +419,11 @@ void HookInstallFaultLogger() {
 // ---------------------------------------------------------------------------
 
 uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
+    return HookInstallObserved(target, name, nullptr, error);
+}
+
+uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver obs,
+                             std::string& error) {
     if (!target) { error = "null target"; return 0; }
     if (g_hookCount >= kMaxHooks) { error = "hook limit reached"; return 0; }
 
@@ -497,6 +508,7 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
     if (!ctx) { error = "out of memory"; return 0; }
     ctx->target = target;
     ctx->stolen = stolen;
+    ctx->obs = obs;
     memcpy(ctx->original, original, stolen);
     _snprintf_s(ctx->name, sizeof(ctx->name), _TRUNCATE, "%s", name ? name : "");
 
