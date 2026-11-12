@@ -551,6 +551,10 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
             if (p.ci.immSize == 1) {
                 // A rel8 cannot reach a trampoline up to a gigabyte away, so the
                 // instruction is re-emitted in its rel32 form.
+                if (disp < INT32_MIN || disp > INT32_MAX) {
+                    return fail("a widened branch is out of reach of a 32-bit displacement (" +
+                                p.ci.text + ")");
+                }
                 if (p.ci.text.compare(0, 3, "jmp") == 0) {
                     dst[0] = 0xE9;
                     int32_t d = (int32_t)disp;
@@ -573,10 +577,24 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
         } else {
             memcpy(dst, src, p.origSize);
             if (p.ci.ripRelative) {
-                int32_t d = 0;
-                memcpy(&d, src + p.ci.dispOffset, 4);
-                d += ripDelta;
-                memcpy(dst + p.ci.dispOffset, &d, 4);
+                // A RIP-relative operand is relative to the end of the
+                // instruction, so it moves by the distance between the two
+                // instruction ends. The instruction may also have shifted
+                // inside the trampoline: a branch ahead of it, widened from
+                // rel8 to rel32, takes more bytes and pushes everything after
+                // it forward. Without that shift the operand would point a few
+                // bytes off the intended address -- in the target process, on
+                // data that has nothing to do with the hook.
+                int32_t disp = 0;
+                memcpy(&disp, src + p.ci.dispOffset, 4);
+                int64_t d = (int64_t)disp + (int64_t)ripDelta -
+                            (int64_t)(p.newOffset - p.origOffset);
+                if (d < INT32_MIN || d > INT32_MAX) {
+                    return fail("a rip-relative operand is out of reach of a 32-bit displacement (" +
+                                p.ci.text + ")");
+                }
+                int32_t d32 = (int32_t)d;
+                memcpy(dst + p.ci.dispOffset, &d32, 4);
             }
         }
     }
