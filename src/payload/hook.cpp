@@ -780,6 +780,32 @@ std::string HexStr(uintptr_t v) {
     return b;
 }
 
+// Escapes a string for a JSON value. A hook name or an error message goes
+// into the answer verbatim, and a quote or a backslash in it would break the
+// whole response for the host.
+std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if ((unsigned char)c < 0x20) {
+                char b[8];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "\\u%04x", (unsigned)(unsigned char)c);
+                out += b;
+            } else {
+                out += c;
+            }
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 std::string HookCommandToJson(const std::wstring& args) {
@@ -800,17 +826,18 @@ std::string HookCommandToJson(const std::wstring& args) {
     uintptr_t addr = 0;
     std::string err;
     if (!ResolveHookTarget(target, addr, err)) {
-        return "{\"status\":\"error\",\"message\":\"" + err + "\"}";
+        return "{\"status\":\"error\",\"message\":\"" + JsonEscape(err) + "\"}";
     }
 
     std::string label = name.empty() ? Narrow(target) : Narrow(name);
     uint32_t id = HookInstall(addr, label.c_str(), err);
-    if (!id) return "{\"status\":\"error\",\"message\":\"" + err + "\"}";
+    if (!id) return "{\"status\":\"error\",\"message\":\"" + JsonEscape(err) + "\"}";
 
     // Report what the hook actually did, so a caller can see the stolen bytes
     // without a second command.
     std::string j = "{\"status\":\"ok\",\"id\":" + std::to_string(id) +
-                    ",\"target\":\"" + HexStr(addr) + "\",\"name\":\"" + label + "\"";
+                    ",\"target\":\"" + HexStr(addr) + "\",\"name\":\"" +
+                    JsonEscape(label) + "\"";
     {
         LockGuard guard;
         for (int i = 0; i < g_hookCount; ++i) {
@@ -859,7 +886,7 @@ std::string HooksCommandToJson(const std::wstring&) {
         if (!first) j += ",";
         first = false;
         j += "{\"id\":" + std::to_string(c->id);
-        j += ",\"name\":\"" + std::string(c->name) + "\"";
+        j += ",\"name\":\"" + JsonEscape(std::string(c->name)) + "\"";
         j += ",\"target\":\"" + HexStr(c->target) + "\"";
         j += ",\"stolen\":" + std::to_string(c->stolen);
         j += ",\"calls\":" + std::to_string((long)c->calls);
