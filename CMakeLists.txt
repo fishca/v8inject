@@ -59,6 +59,7 @@ add_library(v8i_common STATIC
     src/common/diag.cpp
     src/common/pe.cpp
     src/common/pe_utils.cpp
+    src/common/text.cpp
     src/common/typeinfo_utils.cpp
     src/common/report.cpp
 )
@@ -159,6 +160,7 @@ add_executable(v8i_tests
     tests/unit_pe.cpp
     tests/unit_pe_utils.cpp
     tests/unit_report.cpp
+    tests/unit_text.cpp
     tests/unit_typeinfo.cpp
 )
 target_link_libraries(v8i_tests PRIVATE v8i_common)

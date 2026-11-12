@@ -10,6 +10,7 @@
 #include <shellscalingapi.h>
 
 #include "v8inject/client.h"
+#include "v8inject/text.h"
 #include "v8inject/diag.h"
 #include "v8inject/injector.h"
 #include "v8inject/procs.h"
@@ -327,16 +328,9 @@ std::wstring DefaultPayloadFor(bool targetIs64) {
     return dir + (targetIs64 ? L"\\x64\\v8i_payload.dll" : L"\\x86\\v8i_payload.dll");
 }
 
-// Payload replies are UTF-8; the window is wide. Converting byte-by-byte
-// (wstring(begin, end)) produces mojibake for every non-ASCII name.
-std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring out((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
-    return out;
-}
+// Payload replies are UTF-8; the window is wide. The conversion lives in
+// v8i_common (see v8inject/text.h).
+using v8i::Utf8ToWide;
 
 void Log(const std::wstring& line) {
     std::wstring text = line + L"\r\n";

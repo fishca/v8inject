@@ -14,6 +14,7 @@
 // controls are fine here (unlike the payload in a foreign process).
 
 #include "v8inject/client.h"
+#include "v8inject/text.h"
 #include "v8inject/procs.h"
 
 #include <windows.h>
@@ -69,14 +70,8 @@ std::wstring ExeDir() {
     return buf;
 }
 
-std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring out((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
-    return out;
-}
+// The conversion lives in v8i_common (see v8inject/text.h).
+using v8i::Utf8ToWide;
 
 void Log(const std::wstring& line) {
     // Append a line to %APPDATA%\v8inject\agent.log next to the ini.

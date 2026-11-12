@@ -4,6 +4,7 @@
 #include "v8inject/disasm.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
+#include "v8inject/text.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -782,29 +783,8 @@ std::string HexStr(uintptr_t v) {
 
 // Escapes a string for a JSON value. A hook name or an error message goes
 // into the answer verbatim, and a quote or a backslash in it would break the
-// whole response for the host.
-std::string JsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if ((unsigned char)c < 0x20) {
-                char b[8];
-                _snprintf_s(b, sizeof(b), _TRUNCATE, "\\u%04x", (unsigned)(unsigned char)c);
-                out += b;
-            } else {
-                out += c;
-            }
-        }
-    }
-    return out;
-}
+// whole response for the host. The escaping itself lives in v8i_common
+// (see v8inject/text.h).
 
 }  // namespace
 

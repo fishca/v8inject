@@ -3,6 +3,7 @@
 #include "v8inject/injector.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/protocol.h"
+#include "v8inject/text.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -11,6 +12,12 @@
 #include <vector>
 
 namespace {
+
+// The text helpers live in v8i_common (with the tests): one implementation
+// instead of a private copy per module.
+using v8i::NormalizePath;
+using v8i::UnescapeStrValue;
+using v8i::Utf8ToWide;
 
 void PrintUsage() {
     wprintf(L"v8inject - interact with a running process\n\n");
@@ -87,15 +94,6 @@ void InitHostLog() {
                  GetCurrentProcessId(), sizeof(void*) == 8 ? "x64" : "x86");
 }
 
-bool ParseHex(const wchar_t* s, uint64_t& out) {
-    if (!s) return false;
-    wchar_t* end = nullptr;
-    unsigned long long v = wcstoull(s, &end, 0);
-    if (end == s) return false;
-    out = v;
-    return true;
-}
-
 // Shared option parsing for inject/probe/scan.
 struct Options {
     std::wstring dll;
@@ -121,71 +119,11 @@ void PrintOpenFailure(v8i::Client& client, const Options& o);
 
 // Console output must be wide: the payload speaks UTF-8, and %hs would try to
 // interpret that as the active ANSI code page (866/1251), producing mojibake.
-std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring out((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
-    return out;
-}
+// The conversion itself lives in v8i_common (see v8inject/text.h).
 
 // Unpack the "value" field of a `str` reply: UTF-8 text with \" \\ \n \r \t
 // and \uXXXX escapes. Returns the wide string.
-std::wstring UnescapeStrValue(const std::string& v) {
-    std::string raw;
-    raw.reserve(v.size());
-    for (size_t i = 0; i < v.size(); ++i) {
-        char c = v[i];
-        if (c != '\\' || i + 1 >= v.size()) { raw += c; continue; }
-        char n = v[i + 1];
-        switch (n) {
-        case '"': raw += '"'; ++i; break;
-        case '\\': raw += '\\'; ++i; break;
-        case 'n': raw += '\n'; ++i; break;
-        case 'r': raw += '\r'; ++i; break;
-        case 't': raw += '\t'; ++i; break;
-        case 'u': {
-            if (i + 5 < v.size()) {
-                unsigned cp = 0;
-                for (int k = 1; k <= 4; ++k) {
-                    char h = v[i + 1 + k];
-                    cp <<= 4;
-                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
-                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
-                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
-                    else { cp = 0; break; }
-                }
-                if (cp) {
-                    char b3[3];
-                    b3[0] = (char)(0xE0 | (cp >> 12));
-                    b3[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                    b3[2] = (char)(0x80 | (cp & 0x3F));
-                    raw += b3[0]; raw += b3[1]; raw += b3[2];
-                }
-                i += 5;
-            }
-            break;
-        }
-        default: raw += c; break;
-        }
-    }
-    return Utf8ToWide(raw);
-}
-
-// Normalize a path for prefix comparison: absolute, forward slashes, lowercase.
-std::wstring NormalizePath(const std::wstring& p) {
-    wchar_t full[MAX_PATH] = {};
-    GetFullPathNameW(p.c_str(), MAX_PATH, full, nullptr);
-    std::wstring out = full;
-    for (wchar_t& c : out) {
-        if (c == L'\\') c = L'/';
-        c = towlower(c);
-    }
-    while (!out.empty() && out.back() == L'/') out.pop_back();
-    return out;
-}
-
+//
 // watch <exe> --dump-dir <path> --run <cmd> [--debounce-sec N] [--timeout-sec N]
 //       [--once] [--dry-run]
 //
@@ -538,8 +476,8 @@ int wmain(int argc, wchar_t** argv) {
 
         if (cmd == L"peek") {
             if (argc < 4) { PrintUsage(); return 1; }
-            uint64_t addr = 0;
-            if (!ParseHex(argv[3], addr)) { wprintf(L"bad address: %ls\n", argv[3]); return 1; }
+            uintptr_t addr = 0;
+            if (!v8i::ParseNumber(argv[3], &addr)) { wprintf(L"bad address: %ls\n", argv[3]); return 1; }
             int len = 64;
             if (argc > 4 && argv[4][0] != L'-') { len = _wtoi(argv[4]); next = 5; }
             wchar_t buf[128] = {};
@@ -780,8 +718,8 @@ int wmain(int argc, wchar_t** argv) {
         DWORD pid = ResolvePid(argc, argv, argv[2]);
         if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
 
-        uint64_t addr = 0;
-        if (!ParseHex(argv[3], addr)) {
+        uintptr_t addr = 0;
+        if (!v8i::ParseNumber(argv[3], &addr)) {
             wprintf(L"bad address: %s\n", argv[3]);
             return 1;
         }

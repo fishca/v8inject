@@ -11,6 +11,7 @@
 #include "v8inject/protocol.h"
 #include "v8inject/typeinfo_utils.h"
 #include "v8inject/report.h"
+#include "v8inject/text.h"
 
 #include <windows.h>
 #include <cstdarg>
@@ -45,35 +46,7 @@ void InitPayloadLog(const wchar_t* dirFromBlock) {
 
 // JSON-escape into UTF-8; window titles are often Cyrillic.
 std::string EscapeW(const std::wstring& w) {
-    std::string out;
-    out.reserve(w.size());
-    for (wchar_t ch : w) {
-        unsigned c = (unsigned)ch;
-        switch (ch) {
-        case L'"':  out += "\\\""; break;
-        case L'\\': out += "\\\\"; break;
-        case L'\n': out += "\\n"; break;
-        case L'\r': out += "\\r"; break;
-        case L'\t': out += "\\t"; break;
-        default:
-            if (c < 0x20) { char b[8]; _snprintf_s(b, sizeof(b), _TRUNCATE, "\\u%04x", c); out += b; }
-            else if (c < 0x80) out += (char)c;
-            else if (c < 0x800) { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
-            else { out += (char)(0xE0 | (c >> 12)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
-        }
-    }
-    return out;
-}
-
-// Narrows a wide string to ASCII. Module names, export names and class names
-// are ASCII, so a non-ASCII character becomes '?': building a narrow string
-// from the whole wide range would cut every such character in half instead.
-std::string NarrowAscii(const std::wstring& w) {
-    std::string out;
-    out.reserve(w.size());
-    for (wchar_t c : w)
-        out.push_back(c < 128 ? (char)c : '?');
-    return out;
+    return JsonEscapeWide(w);
 }
 
 // A diagnostic dump next to the payload log. These files used to point at a

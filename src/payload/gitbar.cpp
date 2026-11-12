@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "v8inject/diag.h"
+#include "v8inject/text.h"
 #include "icons.h"
 
 #include <cstdlib>
@@ -97,14 +98,6 @@ std::wstring GitExe() {
     return p;
 }
 
-std::wstring Utf8ToWideOf(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring out((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
-    return out;
-}
 
 // Trim + squeeze for tooltips: git output is multi-line and CRLF-terminated.
 std::wstring TrimForTip(const std::wstring& s, size_t maxLen = 160) {
@@ -132,14 +125,6 @@ std::wstring TrimWs(const std::wstring& s) {
 // LogLine takes a narrow printf format and vfprintf converts %ls with the "C"
 // locale: any Cyrillic character in the text makes the conversion fail and the
 // whole argument prints empty. Convert to UTF-8 and pass it as %s instead.
-std::string WideToUtf8(const std::wstring& s) {
-    if (s.empty()) return std::string();
-    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return std::string();
-    std::string out((size_t)n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n, nullptr, nullptr);
-    return out;
-}
 
 void LogGit(const wchar_t* what, const std::wstring& text) {
     std::string u = WideToUtf8(text);
@@ -218,7 +203,7 @@ std::wstring RunGit(const std::vector<std::wstring>& args, DWORD timeoutMs = 120
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(outRd);
-    return Utf8ToWideOf(out);
+    return Utf8ToWide(out);
 }
 
 std::wstring NowStamp() {

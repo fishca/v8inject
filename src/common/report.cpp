@@ -1,5 +1,6 @@
 #include "v8inject/report.h"
 #include "v8inject/typeinfo_utils.h"
+#include "v8inject/text.h"
 #include <sstream>
 
 namespace v8i {
@@ -7,38 +8,13 @@ namespace v8i {
 namespace {
 
 std::string U8(const std::wstring& w) {
-    if (w.empty()) return {};
-    int n = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
-                                  nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return {};
-    std::string s((size_t)n, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n,
-                          nullptr, nullptr);
-    return s;
+    return WideToUtf8(w);
 }
 
+// JSON-escapes a wide string: it is converted to UTF-8 first, then the
+// narrow escaper handles the special characters.
 std::string JStr(const std::wstring& w) {
-    std::string s = U8(w);
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        default:
-            if ((unsigned char)c < 0x20) {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                out += buf;
-            } else {
-                out += c;
-            }
-        }
-    }
-    return out;
+    return JsonEscape(U8(w));
 }
 
 }  // namespace
