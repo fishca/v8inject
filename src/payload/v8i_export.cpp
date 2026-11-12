@@ -1877,18 +1877,28 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
             // Remember what actually arrives, so the filter can be fixed from
             // real data instead of guesses.
             g_cbtLastCode = nCode;
-            if (cls && cls > (const wchar_t*)0x10000 && IsReadable(cls, 96)) {
+            // IsReadable() covers bytes, the loop below reads wchar_t: 96
+            // bytes are 48 characters, and the last one would be a half-word
+            // past the checked range.
+            constexpr size_t kClassBytes = 96;
+            const size_t maxChars = kClassBytes / sizeof(wchar_t) - 1;
+            if (cls && cls > (const wchar_t*)0x10000 && IsReadable(cls, kClassBytes)) {
                 size_t k = 0;
-                for (; k < sizeof(g_cbtLastClass) - 1 && cls[k]; ++k)
+                for (; k < maxChars && k < sizeof(g_cbtLastClass) - 1 && cls[k]; ++k)
                     g_cbtLastClass[k] = (char)((cls[k] < 128) ? cls[k] : '?');
                 g_cbtLastClass[k] = 0;
                 if (InterlockedIncrement(&g_cbtStrCreates) == 1 && k)
                     memcpy(g_cbtFirstClass, g_cbtLastClass, sizeof(g_cbtFirstClass));
                 // Dump every string class that reaches the hook, so we can see
                 // whether the main window "V8Window0.xxx" passes through here
-                // at all.
+                // at all. The file goes next to the payload log: a hardcoded
+                // path would point into a directory that does not exist on
+                // another machine.
+                wchar_t dumpPath[MAX_PATH] = {};
+                _snwprintf_s(dumpPath, _countof(dumpPath), _TRUNCATE, L"%s.cbt.txt",
+                             GetLogPath());
                 FILE* cf = nullptr;
-                if (_wfopen_s(&cf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cbt_classes.txt", L"a") == 0 && cf) {
+                if (_wfopen_s(&cf, dumpPath, L"a") == 0 && cf) {
                     fprintf(cf, "%s\n", g_cbtLastClass);
                     fclose(cf);
                 }
