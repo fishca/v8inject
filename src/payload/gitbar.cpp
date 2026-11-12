@@ -434,6 +434,7 @@ const COLORREF kMenuHoverBorder = RGB(158, 182, 233); // 9EB6E9
 const COLORREF kMenuHoverText  = RGB(61, 78, 143);    // 3D4E8F
 const COLORREF kSubShortcut    = RGB(179, 128, 0);    // B38000 shortcut column
 const COLORREF kSubSep         = RGB(217, 213, 194);  // D9D5C2 separator line
+const COLORREF kSubGutterBg    = RGB(237, 233, 207);  // EDE9CF icon column strip
 const int kSubItemH = 22;
 const int kSubSepH = 7;
 const int kSubGutter = 28;   // icon column, as in 1C submenus
@@ -693,6 +694,13 @@ HBRUSH UiBgBrush() {
 // the platform's own menus.
 HBRUSH UiMenuBrush() {
     static HBRUSH b = CreateSolidBrush(kMenuBg);
+    return b;
+}
+
+// The icon gutter strip on the left of the menu: a slightly darker cream
+// running the full height of the popup, as on a live 1C submenu.
+HBRUSH UiGutterBrush() {
+    static HBRUSH b = CreateSolidBrush(kSubGutterBg);
     return b;
 }
 
@@ -3358,6 +3366,10 @@ void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, UiMenuBrush());
+    // The darker icon-gutter strip on the left; painted for separators too, so
+    // the band runs unbroken from the top of the popup to its bottom.
+    RECT gut{ rc.left, rc.top, rc.left + kSubGutter, rc.bottom };
+    FillRect(dc, &gut, UiGutterBrush());
     if (!d->itemData) {
         RECT line{ rc.left + 8, (rc.top + rc.bottom) / 2, rc.right - 8,
                    (rc.top + rc.bottom) / 2 + 1 };
