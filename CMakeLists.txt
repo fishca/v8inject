@@ -10,12 +10,28 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # reason to treat the resulting bytes as UTF-8.
 if(MSVC)
     add_compile_options(/utf-8)
+    # The project used to compile with the default /W3 and never saw its own
+    # warnings -- a mismatched int/LONG in std::max reached a release build
+    # that way. /W4 and the strict conformance switches make the compiler show
+    # what it knows; /WX comes once the code is clean (see the CI job).
+    # C++ only: ml.exe knows neither /W4 nor /permissive-, and the MASM thunks
+    # would silently produce no object file.
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>
+                        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+                        $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
     # MASM builds the register-capturing detour thunks: x64 has no inline
     # assembly, and hand-emitting the thunk bytes would be far harder to review.
     enable_language(ASM_MASM)
 endif()
 
 include(cmake/capstone.cmake)
+
+# Warnings as errors. The code is clean under /W4, so CI can insist on it;
+# local builds stay forgiving by default.
+option(V8I_WERROR "Treat compiler warnings as errors" OFF)
+if(MSVC AND V8I_WERROR)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/WX>)
+endif()
 
 if(NOT WIN32)
     message(FATAL_ERROR "v8inject: Windows-only project")
@@ -73,6 +89,13 @@ else()
     target_sources(v8i_payload PRIVATE src/payload/hook_thunk_x64.asm)
 endif()
 target_compile_definitions(v8i_payload PRIVATE V8I_PAYLOAD_EXPORTS)
+# The payload runs inside the Configurator, so the hardening options that
+# abort the process are off limits there: a fortified check turns a detected
+# overflow into abort(), and that would kill 1C along with the panel. The
+# detour targets are allocated with VirtualAlloc and are not registered
+# Control Flow Guard targets, so CFG would refuse the jump into them. (The
+# linker only knows /guard:cf, the "off" form is a compiler switch.)
+target_compile_options(v8i_payload PRIVATE /sdl- /guard:cf-)
 # msimg32: the GitBar draws 1C's own toolbar pictures, which are RGBA -
 # GDI needs AlphaBlend for that.
 target_link_libraries(v8i_payload PRIVATE v8i_common capstone comctl32 msimg32 shell32)

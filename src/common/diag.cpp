@@ -83,8 +83,8 @@ void LogLine(const char* fmt, ...) {
     if (h == INVALID_HANDLE_VALUE) {
         // Fallback chain: temp dir, then next to the module.
         wchar_t tmp[MAX_PATH] = {};
-        DWORD n = GetTempPathW(MAX_PATH, tmp);
-        if (n > 0 && n < MAX_PATH) {
+        DWORD tmpLen = GetTempPathW(MAX_PATH, tmp);
+        if (tmpLen > 0 && tmpLen < MAX_PATH) {
             lstrcatW(tmp, L"v8inject_payload.log");
             h = CreateFileW(tmp, FILE_APPEND_DATA,
                             FILE_SHARE_READ | FILE_SHARE_WRITE,

@@ -214,6 +214,7 @@ void Poll() {
 }
 
 INT_PTR CALLBACK SettingsDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    (void)lp;   // the dialog carries its state in globals
     switch (msg) {
     case WM_INITDIALOG:
         SetDlgItemTextW(h, 101, g_names.c_str());

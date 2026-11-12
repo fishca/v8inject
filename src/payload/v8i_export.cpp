@@ -1,4 +1,4 @@
-﻿#include "v8inject/diag.h"
+#include "v8inject/diag.h"
 #include "v8inject/v8i_export.h"
 #include "v8inject/hook.h"
 #include "v8inject/menu.h"
@@ -62,6 +62,17 @@ std::string EscapeW(const std::wstring& w) {
             else { out += (char)(0xE0 | (c >> 12)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
         }
     }
+    return out;
+}
+
+// Narrows a wide string to ASCII. Module names, export names and class names
+// are ASCII, so a non-ASCII character becomes '?': building a narrow string
+// from the whole wide range would cut every such character in half instead.
+std::string NarrowAscii(const std::wstring& w) {
+    std::string out;
+    out.reserve(w.size());
+    for (wchar_t c : w)
+        out.push_back(c < 128 ? (char)c : '?');
     return out;
 }
 
@@ -205,7 +216,7 @@ std::string PeToJson(const std::wstring& args) {
     PeImage img = ParsePe(m.base);
     if (!img.valid) return "{\"status\":\"error\",\"message\":\"" + img.error + "\"}";
 
-    const wchar_t* fname = wcsrchr(m.path.c_str(), L'\\\\');
+    const wchar_t* fname = wcsrchr(m.path.c_str(), L'\\');
     char buf[256];
 
     std::string j = "{\"status\":\"ok\",\"module\":\"" + EscapeW(fname ? fname + 1 : m.path) + "\"";
@@ -490,7 +501,14 @@ std::string ImportsToJson(const std::wstring& args) {
         for (auto& c : hayA) c = (char)tolower((unsigned char)c);
         std::string dllA = im.dll;
         for (auto& c : dllA) c = (char)tolower((unsigned char)c);
-        std::string wantA(want.begin(), want.end());
+        // The filter is matched case-insensitively against ASCII names, so it
+        // is lowered and narrowed one character at a time: building a narrow
+        // string from the whole wide range would cut every non-ASCII
+        // character in half.
+        std::string wantA;
+        wantA.reserve(want.size());
+        for (wchar_t c : want)
+            wantA.push_back(c < 128 ? (char)tolower((unsigned char)c) : '?');
         if (dllA.find(wantA) != std::string::npos || hayA.find(wantA) != std::string::npos)
             ++matched;
     }
@@ -511,9 +529,16 @@ std::string ImportsToJson(const std::wstring& args) {
             for (auto& c : hayA) c = (char)tolower((unsigned char)c);
             std::string dllA = im.dll;
             for (auto& c : dllA) c = (char)tolower((unsigned char)c);
-            std::wstring wantA(want.begin(), want.end());   // already lowercased
-            bool byDll = dllA.find(std::string(wantA.begin(), wantA.end())) != std::string::npos;
-            if (!byDll && hayA.find(std::string(wantA.begin(), wantA.end())) == std::string::npos)
+            // The filter is matched case-insensitively against ASCII names,
+            // so it is lowered and narrowed one character at a time: building
+            // a narrow string from the whole wide range would cut every
+            // non-ASCII character in half.
+            std::string wantA;
+            wantA.reserve(want.size());
+            for (wchar_t c : want)
+                wantA.push_back(c < 128 ? (char)tolower((unsigned char)c) : '?');
+            bool byDll = dllA.find(wantA) != std::string::npos;
+            if (!byDll && hayA.find(wantA) == std::string::npos)
                 continue;
         }
         if (shown >= a.count) break;
@@ -552,7 +577,7 @@ std::string ExportsToJson(const std::wstring& args) {
         for (const PeExport& ex : img.exports) {
             std::string hay = ex.name;
             for (auto& c : hay) c = (char)tolower((unsigned char)c);
-            if (hay.find(std::string(want.begin(), want.end())) == std::string::npos) continue;
+            if (hay.find(NarrowAscii(want)) == std::string::npos) continue;
             ++matched;
         }
     } else {
@@ -573,7 +598,7 @@ std::string ExportsToJson(const std::wstring& args) {
         if (!want.empty()) {
             std::string hay = ex.name;
             for (auto& c : hay) c = (char)tolower((unsigned char)c);
-            if (hay.find(std::string(want.begin(), want.end())) == std::string::npos) continue;
+            if (hay.find(NarrowAscii(want)) == std::string::npos) continue;
         }
         if (shown >= a.count) break;
         if (!first) j += ",";
@@ -678,7 +703,7 @@ std::string XrefToJson(const std::wstring& args) {
     std::string targetKind = "absolute";
     if (!a.haveAddr && !a.pattern.empty()) {
         // Allow "xref CreateWindowExW" — look the name up in the IAT.
-        std::string want(a.pattern.begin(), a.pattern.end());
+        std::string want = NarrowAscii(a.pattern);
         for (const PeImport& im : img.imports) {
             if (_stricmp(im.name.c_str(), want.c_str()) == 0) {
                 target = img.base + im.iatRva;
@@ -1114,6 +1139,12 @@ struct __declspec(align(8)) V8Cmd {
     unsigned int cmdNum;
     int param;
     void* object;
+#if !defined(_WIN64)
+    // On x86 the platform's Command is 28 bytes, but align(8) rounds the
+    // struct up to 32. The padding is spelled out so the layout is the same
+    // on both architectures and the compiler does not warn about it.
+    unsigned int pad;
+#endif
 };
 static const unsigned char kConfigGroup[16] = {
     0x81, 0xBB, 0x0C, 0xF1, 0x79, 0xF6, 0xD4, 0x11,
@@ -1158,6 +1189,7 @@ LONG_PTR g_cmdOldWndProc = 0;
 typedef LRESULT(CALLBACK* V8iSubclassProc)(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                 UINT_PTR id, DWORD_PTR data) {
+    (void)id;   // the subclass id is not used: one window, one pending slot
     if (m == kV8iCmdMsg) {
         V8iPending* p = (V8iPending*)data;
         if (p->mode == 2) {
@@ -1404,18 +1436,6 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
 }
 #endif
 
-// A heap page can be freed between VirtualQuery and the read (1C allocates
-// constantly), and a vtable near the end of .rdata can overrun into a page the
-// loader did not commit. Both faults used to take down the payload io thread.
-static bool ReadU32Safe(uintptr_t addr, uint32_t* out) {
-    __try {
-        *out = *(uint32_t*)addr;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 static bool ReadPtrSafe(uintptr_t addr, uintptr_t* out) {
     __try {
         *out = *(uintptr_t*)addr;
@@ -1429,6 +1449,18 @@ static bool ReadPtrSafe(uintptr_t addr, uintptr_t* out) {
 // x86 runtime calibration: find the ITopLevelFrame vtable without hardcoded
 // constants. Returns 0 when not found. POD-only reads; no calls into 1C.
 static uintptr_t g_x86RecvOffset = 0x20;
+
+// A heap page can be freed between VirtualQuery and the read (1C allocates
+// constantly), and a vtable near the end of .rdata can overrun into a page the
+// loader did not commit. Both faults used to take down the payload io thread.
+static bool ReadU32Safe(uintptr_t addr, uint32_t* out) {
+    __try {
+        *out = *(uint32_t*)addr;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 static uintptr_t DiscoverFrameVtblX86(const ModuleRange& cfg) {
     PeImage cfgImg = ParsePe(cfg.base);
@@ -1543,16 +1575,6 @@ static int V8iQIProbe(void* obj, const GUID* iid, void** out) {
         rc = -2;
     }
     return rc;
-}
-
-static void* V8iCallNoArg(uintptr_t fn) {
-    void* r = nullptr;
-    __try {
-        r = ((void*(__cdecl*)())fn)();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        r = nullptr;
-    }
-    return r;
 }
 
 // --- 8.5 UI-thread bridge ---
@@ -2024,10 +2046,6 @@ void V8iStartStartupWatch() {
 static unsigned char g85_frameDump[64] = {};
 static char g85_frameMod[40] = {};
 static uint32_t g85_frameRva = 0;
-static HRESULT __stdcall V8iRecipQI(void* self, const GUID*, void** out) {
-    if (out) *out = self;
-    return 0;
-}
 static ULONG __stdcall V8iRecipAddRef(void*) { return 1; }
 static ULONG __stdcall V8iRecipRelease(void*) { return 1; }
 // ---------------------------------------------------------------------------
@@ -2590,6 +2608,7 @@ static volatile long g_cwHits = 0;
 // Observer of the CreateWindowExW hook: the class name of the window being
 // created arrives as the second argument (rdx on x64).
 static void V8iObserveCreateWindow(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    (void)a0; (void)a2; (void)a3;   // only the class name (a1) matters here
     InterlockedIncrement(&g_cwHits);
     const wchar_t* cls = (const wchar_t*)a1;
     if (!cls || g85_subscribed) return;
@@ -2605,7 +2624,7 @@ static void V8iObserveCreateWindow(uintptr_t a0, uintptr_t a1, uintptr_t a2, uin
 // return value landed eight bytes off and the caller's frame was touched.
 // The engine's thunk restores the stack before it enters the trampoline, so
 // the copied prologue sees exactly the frame the original function would.
-static bool V8iInstallCreateWindowHook() {
+[[maybe_unused]] static bool V8iInstallCreateWindowHook() {
     if (g_cwHookOk) return true;
     HMODULE u32 = GetModuleHandleW(L"user32.dll");
     if (!u32) u32 = LoadLibraryW(L"user32.dll");
@@ -2678,7 +2697,7 @@ static std::string CmdInfoToJsonA() {
             if (a >= m.base && a < m.base + m.size) {
                 size_t s = m.path.find_last_of(L"\\/");
                 std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
-                mod.assign(n.begin(), n.end());
+                mod = NarrowAscii(n);
                 return (unsigned long long)(a - m.base);
             }
         }
@@ -2705,7 +2724,7 @@ static std::string CmdInfoToJsonA() {
         _snprintf_s(b, sizeof(b), _TRUNCATE,
                     "{\"hwnd\":\"0x%llX\",\"cls\":\"%s\",\"obj\":\"0x%llX\",\"vt\":\"%s+0x%llX\"",
                     (unsigned long long)(uintptr_t)w.h,
-                    std::string(w.cls.begin(), w.cls.end()).c_str(),
+                    NarrowAscii(w.cls).c_str(),
                     (unsigned long long)obj, mod.c_str(), rva);
         j += b;
         if (!isFrameMod(mod)) {
@@ -2751,7 +2770,7 @@ static std::string CmdInfoToJsonA() {
         for (const ModuleRange& m : mods) {
             size_t s = m.path.find_last_of(L"\\/");
             std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
-            std::string leaf(n.begin(), n.end());
+            std::string leaf = NarrowAscii(n);
             if (leaf == "frame.dll" || leaf == "mngcore.dll" || leaf == "mngui.dll" ||
                 leaf == "frmcore.dll" || leaf == "config.dll")
                 fam.push_back({ m.base, m.size, leaf });
@@ -2839,7 +2858,7 @@ static std::string CmdInfoToJsonA() {
         for (const ModuleRange& m : mods) {
             size_t s = m.path.find_last_of(L"\\/");
             std::wstring n = (s == std::wstring::npos) ? m.path : m.path.substr(s + 1);
-            std::string leaf(n.begin(), n.end());
+            std::string leaf = NarrowAscii(n);
             if (leaf != "frame.dll" && leaf != "config.dll" && leaf != "mngcore.dll")
                 continue;
             PeImage im = ParsePe(m.base);
@@ -3306,10 +3325,6 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     if (!FindModule(L"config.dll", cfg))
         return "{\"status\":\"error\",\"message\":\"config.dll not loaded\"}";
 
-    // True when this call reused the cached x86 frame instead of discovering
-    // it; only then is a second pass (cache invalidation) worth trying.
-    bool usedCachedFrame = false;
-
 #if defined(_WIN64)
     // Re-validate the runtime-discovered frame on every use: 1C destroys
     // transient frames, and a stale object poisons all later calls (its freed
@@ -3335,8 +3350,10 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     const uintptr_t vtblPtr = g_x64FrameObj ? *(uintptr_t*)g_x64FrameObj
                                             : cfg.base + kFrameVtblRva;
     uintptr_t kRecvBackOffset = g_x64FrameObj ? g_x64RecvOffset : 0x20;
-    if (kFrameVtblRva == 0)
-        return "{\"status\":\"error\",\"message\":\"frame vtable not calibrated for this build\"}";
+    // The RVA above is calibrated for one 8.3 build; on another build the
+    // runtime discovery has to find the frame, and only then is this path
+    // taken. (A zero RVA used to be checked here, but the constant made that
+    // branch dead code.)
 #else
     // x86: calibrate at runtime — no hardcoded RVA. A heap object whose first
     // dword points into config.dll .rdata, whose vtable slots 3..40 all point
@@ -3346,7 +3363,9 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     // repeating it per command was both slow and racy (freed pages).
     static const uintptr_t kCoreOffset = sizeof(void*);
     static const int kTransmitSlot = 3;
-    usedCachedFrame = g_x86FrameObj != 0;
+    // True when this call reused the cached x86 frame instead of discovering
+    // it; only then is a second pass (cache invalidation) worth trying.
+    bool usedCachedFrame = g_x86FrameObj != 0;
     if (!g_x86FrameObj) g_x86FrameObj = DiscoverFrameVtblX86(cfg);
     if (!g_x86FrameObj)
         return "{\"status\":\"error\",\"message\":\"no frame vtable found on x86\"}";
@@ -3436,7 +3455,7 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     const wchar_t* atP = wcschr(args.c_str(), L'@');
     const wchar_t* hashP = wcschr(args.c_str(), L'#');
     if (atP && hashP) {
-        uintptr_t fRecv = wcstoull(atP + 1, nullptr, 16);
+        uintptr_t fRecv = (uintptr_t)wcstoull(atP + 1, nullptr, 16);
         int fSlot = (int)wcstoul(hashP + 1, nullptr, 10);
         if (fRecv && fSlot >= 0 && fSlot < 64 && IsReadable((void*)fRecv, sizeof(void*))) {
             uintptr_t fVt = *(uintptr_t*)fRecv;

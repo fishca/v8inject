@@ -859,7 +859,8 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT rc;
         GetClientRect(h, &rc);
-        bool hv = PtInRect(&CapCloseRect(rc), pt) != 0;
+        RECT capRect = CapCloseRect(rc);
+        bool hv = PtInRect(&capRect, pt) != 0;
         if (hv != c->hoverX) { c->hoverX = hv; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     }
@@ -874,7 +875,8 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT rc;
         GetClientRect(h, &rc);
-        if (PtInRect(&CapCloseRect(rc), pt)) { DestroyWindow(h); return 0; }
+        RECT capRect = CapCloseRect(rc);
+        if (PtInRect(&capRect, pt)) { DestroyWindow(h); return 0; }
         break;
     }
     case WM_DRAWITEM:
@@ -1534,7 +1536,8 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
         RECT rc;
         GetClientRect(h, &rc);
-        if (PtInRect(&CapCloseRect(rc), pt)) { DestroyWindow(h); return 0; }
+        RECT capRect = CapCloseRect(rc);
+        if (PtInRect(&capRect, pt)) { DestroyWindow(h); return 0; }
         for (int i = 0; i < 4; ++i) {
             if (PtInRect(&c->fieldRects[i], pt)) {
                 if (c->active != i) {
@@ -1584,7 +1587,8 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (b != c->hoverBtn) { c->hoverBtn = b; InvalidateRect(h, nullptr, FALSE); }
         RECT rc;
         GetClientRect(h, &rc);
-        bool hv = PtInRect(&CapCloseRect(rc), pt) != 0;
+        RECT capRect = CapCloseRect(rc);
+        bool hv = PtInRect(&capRect, pt) != 0;
         if (hv != c->hoverX) { c->hoverX = hv; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     }
@@ -3186,7 +3190,8 @@ static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT rc;
         GetClientRect(h, &rc);
-        bool hv = PtInRect(&CapCloseRect(rc), pt) != 0;
+        RECT capRect = CapCloseRect(rc);
+        bool hv = PtInRect(&capRect, pt) != 0;
         if (hv != d->hoverX) { d->hoverX = hv; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     }
@@ -3201,7 +3206,8 @@ static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         RECT rc;
         GetClientRect(h, &rc);
-        if (PtInRect(&CapCloseRect(rc), pt)) { DestroyWindow(h); return 0; }
+        RECT capRect = CapCloseRect(rc);
+        if (PtInRect(&capRect, pt)) { DestroyWindow(h); return 0; }
         break;
     }
     case WM_DRAWITEM: {

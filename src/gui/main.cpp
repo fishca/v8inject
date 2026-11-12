@@ -824,7 +824,7 @@ void CreateControls(HWND hwnd) {
 
     g_filter = CreateWindowExW(0, L"EDIT", L"",
                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                               97, 10, 218, 22, hwnd, (HMENU)kIdFilter, hInst, nullptr);
+                               97, 10, 218, 22, hwnd, (HMENU)(UINT_PTR)kIdFilter, hInst, nullptr);
     SendMessageW(g_filter, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_filter, EM_SETCUEBANNER, TRUE, (LPARAM)L"фильтр по имени");
     TrackField(g_filter, 96, 9, 220, 24);
@@ -834,7 +834,7 @@ void CreateControls(HWND hwnd) {
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
                                  LVS_SHOWSELALWAYS,
-                             13, 45, 758, 238, hwnd, (HMENU)kIdList, hInst, nullptr);
+                             13, 45, 758, 238, hwnd, (HMENU)(UINT_PTR)kIdList, hInst, nullptr);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     SendMessageW(g_list, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     ListView_SetBkColor(g_list, kUiFieldBg);
@@ -862,7 +862,7 @@ void CreateControls(HWND hwnd) {
     Lbl(294, 80, L"Payload DLL:");
     g_dllEdit = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                97, 292, 558, 22, hwnd, (HMENU)kIdDllEdit, hInst, nullptr);
+                                97, 292, 558, 22, hwnd, (HMENU)(UINT_PTR)kIdDllEdit, hInst, nullptr);
     SendMessageW(g_dllEdit, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     TrackField(g_dllEdit, 96, 291, 560, 24);
 
@@ -879,7 +879,7 @@ void CreateControls(HWND hwnd) {
 
     g_cmdEdit = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                13, 365, 558, 24, hwnd, (HMENU)kIdCommand, hInst, nullptr);
+                                13, 365, 558, 24, hwnd, (HMENU)(UINT_PTR)kIdCommand, hInst, nullptr);
     SendMessageW(g_cmdEdit, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_cmdEdit, EM_SETCUEBANNER, TRUE,
                  (LPARAM)L"objects | pe | peek <addr> [len] | scan <addr>");
@@ -891,14 +891,14 @@ void CreateControls(HWND hwnd) {
     g_log = CreateWindowExW(0, L"EDIT", L"",
                             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
                                 ES_READONLY | WS_VSCROLL,
-                            13, 399, 758, 218, hwnd, (HMENU)kIdLog, hInst, nullptr);
+                            13, 399, 758, 218, hwnd, (HMENU)(UINT_PTR)kIdLog, hInst, nullptr);
     SendMessageW(g_log, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_log, EM_SETLIMITTEXT, 0, 0);
     TrackField(g_log, 12, 398, 760, 220);
 
     g_status = CreateWindowExW(0, L"STATIC", L"Не подключено",
                                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                               12, 626, 500, 20, hwnd, (HMENU)kIdStatus, hInst, nullptr);
+                               12, 626, 500, 20, hwnd, (HMENU)(UINT_PTR)kIdStatus, hInst, nullptr);
     SendMessageW(g_status, WM_SETFONT, (WPARAM)UiFont(), TRUE);
 
     // The GUI runs in UTF-8; the payload replies in UTF-8 too.

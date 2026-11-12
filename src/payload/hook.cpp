@@ -821,8 +821,8 @@ std::string HookCommandToJson(const std::wstring& args) {
             j += ",\"trampoline\":\"" + HexStr((uintptr_t)c->trampoline) + "\"";
             char b[8];
             j += ",\"original\":\"";
-            for (size_t i = 0; i < c->stolen; ++i) {
-                _snprintf_s(b, sizeof(b), _TRUNCATE, "%02X", c->original[i]);
+            for (size_t k = 0; k < c->stolen; ++k) {
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "%02X", c->original[k]);
                 j += b;
             }
             j += "\"";
