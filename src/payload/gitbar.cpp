@@ -568,9 +568,14 @@ void Paint(HWND hwnd) {
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
     HPEN border = CreatePen(PS_SOLID, 1, kDlgBorder);
-    SelectObject(dc, border);
-    SelectObject(dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ oldPen = SelectObject(dc, border);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
     Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    // The pen and the brush have to be put back before they are deleted:
+    // a deleted object that is still selected in the DC is a dangling handle
+    // for every later draw with that DC.
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
     DeleteObject(border);
 
     if (g_bar.compact) {
@@ -589,9 +594,11 @@ void Paint(HWND hwnd) {
             FillRect(dc, &cell, hl);
             DeleteObject(hl);
             HPEN pen = CreatePen(PS_SOLID, 1, kDlgBorder);
-            SelectObject(dc, pen);
-            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            HGDIOBJ cellPen = SelectObject(dc, pen);
+            HGDIOBJ cellBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
             Rectangle(dc, cell.left, cell.top, cell.right, cell.bottom);
+            SelectObject(dc, cellBrush);
+            SelectObject(dc, cellPen);
             DeleteObject(pen);
         }
         DrawIcon(dc, IconFor(id), x + (kCell - icons::kSize) / 2,
@@ -950,6 +957,11 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
     // IsDialogMessageW gives Tab / Enter (default button) / Esc for free; it
     // posts nothing into this loop, it drives the dialog proc above directly.
     MSG msg;
+    // The menu overlay of the designer hides itself while a modal dialog of
+    // the panel is up: the overlay is a separate top-level window and would
+    // otherwise float above the dialog.
+    ++g_modalDepth;
+    MenuReposition(nullptr);
     for (;;) {
         if (!IsWindow(dlg)) break;
         if (!GetMessageW(&msg, nullptr, 0, 0)) break;   // WM_QUIT: the bar is going away
@@ -957,6 +969,7 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    --g_modalDepth;
     if (IsWindow(dlg)) DestroyWindow(dlg);
     if (ctx.font) DeleteObject(ctx.font);
     Reposition(true);
