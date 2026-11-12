@@ -1,5 +1,6 @@
 #include "test_runner.h"
 
+#include <cstdarg>
 #include <cstdio>
 #include <vector>
 
@@ -20,8 +21,17 @@ std::vector<Entry>& Registry() {
 
 int g_failedChecks = 0;
 int g_totalChecks = 0;
+FILE* g_log = nullptr;
+
+// Writes a line to the console and to the transcript file.
+void Out(const std::string& line) {
+    std::printf("%s", line.c_str());
+    if (g_log) { std::fputs(line.c_str(), g_log); std::fflush(g_log); }
+}
 
 }  // namespace
+
+void SetLogFile(FILE* log) { g_log = log; }
 
 int Register(const char* name, TestFn fn) {
     Registry().push_back(Entry{ name, fn });
@@ -30,7 +40,9 @@ int Register(const char* name, TestFn fn) {
 
 void Fail(const char* file, int line, const std::string& what) {
     ++g_failedChecks;
-    std::printf("    FAIL %s:%d: %s\n", file, line, what.c_str());
+    char b[1024];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, "    FAIL %s:%d: %s\n", file, line, what.c_str());
+    Out(b);
 }
 
 bool CheckTrue(bool ok, const char* file, int line, const std::string& what) {
@@ -80,22 +92,29 @@ std::string Text(const std::wstring& v) {
 int RunAll() {
     int failedTests = 0;
     const std::vector<Entry>& registry = Registry();
-    std::printf("running %zu tests\n", registry.size());
+
+    char b[128];
+    _snprintf_s(b, sizeof(b), _TRUNCATE, "running %zu tests\n", registry.size());
+    Out(b);
 
     for (const Entry& e : registry) {
         const int before = g_failedChecks;
-        std::printf("[ RUN  ] %s\n", e.name);
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "[ RUN  ] %s\n", e.name);
+        Out(b);
         e.fn();
         if (g_failedChecks != before) {
             ++failedTests;
-            std::printf("[ FAIL ] %s\n", e.name);
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[ FAIL ] %s\n", e.name);
         } else {
-            std::printf("[  OK  ] %s\n", e.name);
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[  OK  ] %s\n", e.name);
         }
+        Out(b);
     }
 
-    std::printf("\n%zu tests, %d checks, %d failed check(s), %d failed test(s)\n",
-                registry.size(), g_totalChecks, g_failedChecks, failedTests);
+    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                 "\n%zu tests, %d checks, %d failed check(s), %d failed test(s)\n",
+                 registry.size(), g_totalChecks, g_failedChecks, failedTests);
+    Out(b);
     return failedTests;
 }
 

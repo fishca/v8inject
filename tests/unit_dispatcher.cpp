@@ -126,7 +126,16 @@ V8I_TEST(Dispatcher_EveryAnswerIsValidJson) {
 
     for (const wchar_t* cmd : commands) {
         std::string reply;
-        if (!d.Ask(cmd, reply)) {
+        const DWORD started = GetTickCount();
+        // The heavy commands (a scan of the whole address space) need more
+        // than the default: on a slow CI runner they do not fit into a few
+        // seconds.
+        const int timeout = (wcscmp(cmd, L"find") == 0) ? 60000 : 10000;
+        const bool answered = d.Ask(cmd, reply, timeout);
+        const DWORD spent = GetTickCount() - started;
+        std::printf("      %-10s %s in %u ms\n", cmd, answered ? "answered" : "no answer",
+                    spent);
+        if (!answered) {
             CHECK(reply.size() > 0);           // no answer at all
             continue;
         }

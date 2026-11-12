@@ -122,7 +122,10 @@ jobs:
         with:
           name: v8inject-${{ matrix.arch }}
           path: build/${{ matrix.arch }}/bin/${{ matrix.arch }}/*
-          if-no-files-found: error
+          if-no-files-found: warn
+        # Always: the artifact of a failed build carries the transcript of the
+        # tests, and that is what says which test failed.
+        if: always()
 
   # Tag push (v*): build runs for the tag commit, then this job packages the
   # two artifacts into release zips and publishes a GitHub release.

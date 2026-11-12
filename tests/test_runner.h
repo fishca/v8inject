@@ -14,6 +14,7 @@
 // registration order. The process exit code is the number of failed tests,
 // so CTest sees a failure without parsing the output.
 
+#include <cstdio>
 #include <string>
 
 namespace v8i {
@@ -24,6 +25,11 @@ using TestFn = void (*)();
 // Registers a test. Called from a static initializer, so it must not throw
 // and must not depend on the order of the translation units.
 int Register(const char* name, TestFn fn);
+
+// Sends the transcript to a file as well as to the console. The CI keeps the
+// artifact of the build: when a test fails on a runner, the log says which
+// test failed and why, while the console output only shows an exit code.
+void SetLogFile(FILE* log);
 
 // Records a failed check.
 void Fail(const char* file, int line, const std::string& what);
