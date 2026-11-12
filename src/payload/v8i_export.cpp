@@ -1842,18 +1842,32 @@ static HHOOK g_cbtThreadHook;
 static volatile long g_cbtThreadTid;
 static void V8iResolveCore85Proc(uintptr_t* outBase, uint32_t* outRva);
 
+// Runs the subscribe attempt on the UI thread of the given window: the
+// subclass is installed for the duration of one message, so the platform
+// code runs on its own thread. The early path (the CBT hook, the inline
+// CreateWindowExW hook) and the polling watcher can both reach this point,
+// hence the lock: an overlapping attempt would capture the subclass proc as
+// the "original" one and leave the window subclassed for good.
+static volatile LONG g_subclassBusy = 0;
+static void V8iSubscribeOnUiThread(HWND h) {
+    if (!h) return;
+    if (InterlockedCompareExchange(&g_subclassBusy, 1, 0) != 0) return;
+    WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)V8iSubclass85);
+    if (old) {
+        g85_origWndProc = old;
+        SendMessageW(h, WM_APP + 0x602, 0, 0);
+        SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
+    }
+    InterlockedExchange(&g_subclassBusy, 0);
+}
+
 static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     for (int i = 0; i < 4000 && !g85_subscribed; ++i) {
         HWND h = nullptr;
         EnumWindows(V8iFindMainWindow, (LPARAM)&h);
         if (h) {
             g85_uiWin = (uintptr_t)h;
-            g85_origWndProc = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC,
-                                                         (LONG_PTR)V8iSubclass85);
-            if (g85_origWndProc) {
-                SendMessageW(h, WM_APP + 0x602, 0, 0);
-                SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)g85_origWndProc);
-            }
+            V8iSubscribeOnUiThread(h);
             // The global CBT hook never fires in 8.5 (cbtCalls stays 0 even for
             // newly opened windows), so try a thread-scoped one on the UI thread.
             if (!g_cbtThreadHook) {
@@ -1980,6 +1994,24 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(g_cbtHook, nCode, wParam, lParam);
 }
 
+// Installs the inline hook from a worker thread: the detour engine suspends
+// the threads of the process while it patches the entry, and that must not
+// happen under the loader lock (DllMain arms the early path).
+static bool V8iInstallCreateWindowHook();
+static DWORD WINAPI V8iInstallCreateWindowThread(LPVOID) {
+    // Only the Configurator: the payload can be loaded into any process, and
+    // the hook would otherwise sit on every window creation of that process.
+    if (!V8iIsTargetProcess()) return 0;
+    // The hook exists to catch the designer's main window before it exists.
+    // If the window is already there, the polling watcher handles it and the
+    // hook would only add overhead to every window creation in 1C.
+    HWND h = nullptr;
+    EnumWindows(V8iFindMainWindow, (LPARAM)&h);
+    if (h) return 0;
+    V8iInstallCreateWindowHook();
+    return 0;
+}
+
 // Installs the hook; called from v8i_probe before the session starts, so the
 // splash screen is still ahead.
 static bool V8iArmEarlySubscribe() {
@@ -1990,6 +2022,10 @@ static bool V8iArmEarlySubscribe() {
                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCWSTR)&V8iCbtProc, &self)) return false;
     g_cbtHook = SetWindowsHookExW(WH_CBT, (HOOKPROC)&V8iCbtProc, self, 0);
+    // The global CBT hook never fires in 8.5 (cbtCalls stays zero), so the
+    // designer's main window is watched through an inline hook on
+    // CreateWindowExW instead: that one sees every window creation.
+    CreateThread(nullptr, 0, V8iInstallCreateWindowThread, nullptr, 0, nullptr);
     return g_cbtHook != nullptr;
 }
 
@@ -2040,12 +2076,7 @@ Sleep(0);
         if (!IsWindow(h)) break;
         DWORD tid = GetWindowThreadProcessId(h, nullptr);
         if (tid && tid != GetCurrentThreadId()) {
-            WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)V8iSubclass85);
-            if (old) {
-                g85_origWndProc = old;
-                SendMessageW(h, WM_APP + 0x602, 0, 0);
-                SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
-            }
+            V8iSubscribeOnUiThread(h);
         }
         if (g85_subscribed) break;
     }
@@ -2060,16 +2091,12 @@ extern "C" __declspec(dllexport) void V8iArmEarly() {
     V8iArmEarlySubscribe();
 }
 
-static bool V8iInstallCreateWindowHook();
-
 void V8iStartStartupWatch() {
-    // NOTE: the inline hook on CreateWindowExW is still off. Its old
-    // hand-written trampoline shifted the stack by eight bytes and crashed
-    // 1C; the trampoline is now the shared detour engine, which keeps the
-    // original frame (see V8iInstallCreateWindowHook). The hook stays disabled
-    // until that path is verified on a live Configurator -- the watcher
-    // thread below is the working way to reach the first window.
-    // V8iInstallCreateWindowHook();
+    // The inline hook on CreateWindowExW is armed by the early path (see
+    // V8iArmEarlySubscribe) and only while the designer's main window does
+    // not exist yet. This watcher is the working way to reach that window
+    // once it is there: it polls, subclasses it and retries the subscribe
+    // chain on the UI thread.
     CreateThread(nullptr, 0, V8iStartupWatchThread, nullptr, 0, nullptr);
 }
 
@@ -2605,59 +2632,45 @@ static void V8iResolveCore85Proc(uintptr_t* outBase, uint32_t* outRva) {
     }
 }
 
-static void V8iSubscribeNow() {
-    if (g85_subscribed) return;
-    uintptr_t base = 0;
-    uint32_t rva = 0;
-    V8iResolveCore85Proc(&base, &rva);
-    if (!base || !rva) return;
-    uintptr_t fn = base + rva;
-    void* proc = nullptr;
-    __try {
-        proc = ((V8iCurProcFn)fn)();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        proc = nullptr;
-    }
-    if (!proc) return;
-    uintptr_t vt = 0;
-    __try { vt = *(uintptr_t*)proc; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { vt = 0; }
-    if (!vt) return;
-    static const GUID kIID_EventService = {0xEBF766AA, 0xF32C, 0x11D3,
-                                           {0x98, 0x51, 0x00, 0x80, 0x48, 0xDA, 0x12, 0x52}};
-    static const GUID kEvCreateFrame = {0x3573FFE0, 0x2FFF, 0x11D5,
-                                        {0xBF, 0x5E, 0x00, 0x50, 0xBA, 0xE2, 0xBC, 0x79}};
-    void* svc = nullptr;
-    __try {
-        svc = ((V8iGetSvcFn)((uintptr_t*)vt)[14])(proc, &kIID_EventService);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        svc = nullptr;
-    }
-    if (!svc) return;
-    uintptr_t svt = 0;
-    __try { svt = *(uintptr_t*)svc; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { svt = 0; }
-    if (!svt) return;
-    typedef void(__cdecl* SubFn)(void*, const GUID*, void*, const char*, int);
-    __try {
-        ((SubFn)((uintptr_t*)svt)[4])(svc, &kEvCreateFrame, (void*)&g85_recip, "v8inject", 0);
-        g85_subscribed = 1;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-
 static volatile int g_cwHookOk = 0;
 static volatile long g_cwHits = 0;
+static volatile LONG g_cwTriggered = 0;
+
+// The window is created *inside* CreateWindowExW, so the hook runs before the
+// window exists: the worker waits for it and hands it to the early subscribe
+// routine, the same one the CBT path uses.
+static DWORD WINAPI V8iCwEarlyWorker(LPVOID) {
+    for (int i = 0; i < 400 && !g85_subscribed; ++i) {
+        HWND h = nullptr;
+        EnumWindows(V8iFindMainWindow, (LPARAM)&h);
+        if (h) {
+            V8iEarlySubscribeThread(h);
+            return 0;
+        }
+        Sleep(5);
+    }
+    LogLine("createwindow hook: the main frame never appeared");
+    return 0;
+}
 
 // Observer of the CreateWindowExW hook: the class name of the window being
 // created arrives as the second argument (rdx on x64).
 static void V8iObserveCreateWindow(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
     (void)a0; (void)a2; (void)a3;   // only the class name (a1) matters here
     InterlockedIncrement(&g_cwHits);
+    if (g85_subscribed) return;
+    // The class of the designer's main frame. On 8.5 it is "V8TopLevelFrame"
+    // (the CBT dump of a live Configurator shows it), and such a window is
+    // created on the UI thread - the only thread allowed to call core85.
     const wchar_t* cls = (const wchar_t*)a1;
-    if (!cls || g85_subscribed) return;
-    if (wcsncmp(cls, L"V8Window0", 9) == 0 || wcsncmp(cls, L"V8TopLevelFrame", 15) == 0)
-        V8iSubscribeNow();
+    if (!cls) return;
+    if (wcsncmp(cls, L"V8TopLevelFrame", 15) != 0 &&
+        wcsncmp(cls, L"V8Window0", 9) != 0) return;
+    if (InterlockedExchange(&g_cwTriggered, 1) != 0) return;
+    // The core is not ready at the moment the window is created, and
+    // subscribing right here crashes 1C. The worker waits for the window and
+    // retries the subscribe chain on its UI thread until the core answers.
+    CreateThread(nullptr, 0, V8iCwEarlyWorker, nullptr, 0, nullptr);
 }
 
 // Installs the hook on user32!CreateWindowExW through the shared detour
@@ -2668,7 +2681,7 @@ static void V8iObserveCreateWindow(uintptr_t a0, uintptr_t a1, uintptr_t a2, uin
 // return value landed eight bytes off and the caller's frame was touched.
 // The engine's thunk restores the stack before it enters the trampoline, so
 // the copied prologue sees exactly the frame the original function would.
-[[maybe_unused]] static bool V8iInstallCreateWindowHook() {
+static bool V8iInstallCreateWindowHook() {
     if (g_cwHookOk) return true;
     HMODULE u32 = GetModuleHandleW(L"user32.dll");
     if (!u32) u32 = LoadLibraryW(L"user32.dll");
