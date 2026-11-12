@@ -41,6 +41,17 @@ void PrintUsage() {
     wprintf(L"  v8inject hooks   <exe>\n");
     wprintf(L"  v8inject unhook  <exe> <id|all>\n");
     wprintf(L"  v8inject trace   <exe> [--count N] [--since N] [--clear]\n");
+    wprintf(L"  v8inject gitbar  <exe> [hide] [--dll <path>]   # show the git panel in the designer\n");
+    wprintf(L"  v8inject cmd     <exe> <num> [sub]   # run a designer command (8.3, e.g. 45)\n");
+    wprintf(L"  v8inject cmd85   <exe> <num> [sub]   # run a designer command (8.5)\n");
+    wprintf(L"  v8inject cmdinfo <exe>               # how the command receiver is located here\n");
+    wprintf(L"  v8inject frames  <exe>               # what eventCreateFrame delivered (8.5)\n");
+    wprintf(L"  v8inject exports85 <exe>             # 8.5 export table\n");
+    wprintf(L"  v8inject menu    <exe> [filter]       # menu items of the target process\n");
+    wprintf(L"  v8inject menucmd <exe> <hwnd> <id>    # invoke a menu command by id\n");
+    wprintf(L"  v8inject str     <exe> <text>         # payload-side string helper\n");
+    wprintf(L"  v8inject launch  <exe-path> <args>   # start 1C and inject the payload right away\n");
+    wprintf(L"  v8inject hookcbt [seconds]           # early subscription via a global WH_CBT hook\n");
     wprintf(L"  v8inject watch   <exe> --dump-dir <path> --run <cmd> [--debounce-sec N]\n");
     wprintf(L"                             [--timeout-sec N] [--once] [--dry-run]\n");
     wprintf(L"                             # fires --run when a burst of CreateFileW on\n");
@@ -502,14 +513,16 @@ int wmain(int argc, wchar_t** argv) {
         cmd == L"memmap" || cmd == L"heapobjects" || cmd == L"findvalue" || cmd == L"byhwnd" ||
         cmd == L"around" || cmd == L"xref" ||
         cmd == L"gitbar" || cmd == L"cmdinfo" || cmd == L"exports85" || cmd == L"frames" ||
-        cmd == L"cmd85" ||
+        cmd == L"cmd85" || cmd == L"cmd" || cmd == L"menu" || cmd == L"menucmd" ||
+        cmd == L"str" ||
         cmd == L"hook" || cmd == L"hooks" || cmd == L"unhook" || cmd == L"trace") {
         if (argc < 3) { PrintUsage(); return 1; }
         if (cmd == L"imports" && argc < 4) { PrintUsage(); return 1; }
         // cmd 45 opens a modal dump dialog: the 1C UI thread (and with it the
         // payload's marshal SendMessageTimeout, 30 s) stays busy, so the reply
         // legitimately takes longer than the default 15 s.
-        int timeout = (cmd == L"xref" || cmd == L"cmd85") ? 120000 : 15000;
+        int timeout = (cmd == L"xref" || cmd == L"cmd85" || cmd == L"cmd")
+                          ? 120000 : 15000;
         Options o = ParseOptions(argc, argv, 3);
         return RunPayloadCommand(cmd.c_str(), argv[2], argc, argv, 3, timeout);
     }
