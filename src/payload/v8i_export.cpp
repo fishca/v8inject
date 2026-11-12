@@ -76,6 +76,35 @@ std::string NarrowAscii(const std::wstring& w) {
     return out;
 }
 
+// A diagnostic dump next to the payload log. These files used to point at a
+// path hardcoded to the author's machine: on anyone else's computer the
+// directory did not exist, so the dumps were silently never written.
+//
+// Plain buffers instead of std::wstring: the callers sit inside __try
+// blocks, where a function that needs unwinding is not allowed.
+bool LogSideFile(const wchar_t* name, wchar_t* out, size_t cch) {
+    const wchar_t* log = GetLogPath();
+    if (log && log[0] && wcscmp(log, L"(unset)") != 0) {
+        _snwprintf_s(out, cch, _TRUNCATE, L"%s.%s", log, name);
+        return true;
+    }
+    wchar_t tmp[MAX_PATH] = {};
+    DWORD n = GetTempPathW(MAX_PATH, tmp);
+    if (n == 0 || n >= MAX_PATH) return false;
+    _snwprintf_s(out, cch, _TRUNCATE, L"%s%s", tmp, name);
+    return true;
+}
+
+// A file in the real temp directory: the file-driven command channel is the
+// only way to reach a payload that was loaded without a Client session.
+bool TempFile(const wchar_t* name, wchar_t* out, size_t cch) {
+    wchar_t tmp[MAX_PATH] = {};
+    DWORD n = GetTempPathW(MAX_PATH, tmp);
+    if (n == 0 || n >= MAX_PATH) return false;
+    _snwprintf_s(out, cch, _TRUNCATE, L"%s%s", tmp, name);
+    return true;
+}
+
 // Reads a NUL-terminated UTF-16 string at an address inside this process,
 // bounded. Used to decode paths/names captured in trace args.
 std::string StrToJson(const std::wstring& args) {
@@ -665,8 +694,8 @@ std::string ModsToJson(const std::wstring& args) {
         ++shown;
         first = false;
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"base\":\"0x%X\",\"size\":\"0x%X\",\"name\":\"",
-                    (unsigned)(m.base & 0xFFFFFFFFul), (unsigned)m.size);
+                    "{\"base\":\"0x%llX\",\"size\":\"0x%llX\",\"name\":\"",
+                    (unsigned long long)m.base, (unsigned long long)m.size);
         j += buf;
         const wchar_t* leaf = wcsrchr(m.path.c_str(), L'\\');
         j += EscapeW(leaf ? leaf + 1 : m.path);
@@ -1775,7 +1804,9 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
             // diagnosis (hookcbt loads the payload without a cmdinfo run).
             {
                 FILE* tf = nullptr;
-                if (_wfopen_s(&tf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_subscribe.txt", L"a") == 0 && tf) {
+                wchar_t subPath[MAX_PATH] = {};
+                if (LogSideFile(L"subscribe.txt", subPath, _countof(subPath)) &&
+                    _wfopen_s(&tf, subPath, L"a") == 0 && tf) {
                     fprintf(tf, "dt=%lu fn=%llx proc=%llx procVt=%llx svc=%llx svcVt=%llx "
                                 "subscribed=%d evCount=%ld exitEv=%ld evFrame=%llx\n",
                             GetTickCount() - g85_attachTick, (unsigned long long)g85_fn,
@@ -1917,12 +1948,12 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 // path would point into a directory that does not exist on
                 // another machine.
                 wchar_t dumpPath[MAX_PATH] = {};
-                _snwprintf_s(dumpPath, _countof(dumpPath), _TRUNCATE, L"%s.cbt.txt",
-                             GetLogPath());
-                FILE* cf = nullptr;
-                if (_wfopen_s(&cf, dumpPath, L"a") == 0 && cf) {
-                    fprintf(cf, "%s\n", g_cbtLastClass);
-                    fclose(cf);
+                if (LogSideFile(L"cbt.txt", dumpPath, _countof(dumpPath))) {
+                    FILE* cf = nullptr;
+                    if (_wfopen_s(&cf, dumpPath, L"a") == 0 && cf) {
+                        fprintf(cf, "%s\n", g_cbtLastClass);
+                        fclose(cf);
+                    }
                 }
             } else {
                 g_cbtLastClass[0] = 0;
@@ -1975,7 +2006,9 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK V8iCbtProcExport(
         const wchar_t* leaf = wcsrchr(p, L'\\');
         leaf = leaf ? leaf + 1 : p;
         FILE* f = nullptr;
-        if (_wfopen_s(&f, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cbt_hit.txt", L"a") == 0 && f) {
+        wchar_t hitPath[MAX_PATH] = {};
+        if (LogSideFile(L"cbt_hit.txt", hitPath, _countof(hitPath)) &&
+            _wfopen_s(&f, hitPath, L"a") == 0 && f) {
             fprintf(f, "%lu %ls nCode=%d cbtCalls=%ld fired=%d\n",
                     GetCurrentProcessId(), p, nCode, g_cbtCalls, g_cbtFired);
             fclose(f);
@@ -2206,8 +2239,15 @@ static std::string Cmd85SendJson(unsigned int num, int sub, bool has) {
 // %TEMP%\v8i_cmd85_req.txt ("<num> [sub]"), sends each request once (file is
 // consumed), appends the result to %TEMP%\v8i_cmd85_res.txt.
 static DWORD WINAPI V8iCmd85PollThread(LPVOID) {
-    const wchar_t* reqPath = L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cmd85_req.txt";
-    const wchar_t* resPath = L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cmd85_res.txt";
+    // The real temp directory: the old path pointed at the author's machine,
+    // where the channel could not work anywhere else.
+    wchar_t reqPath[MAX_PATH] = {};
+    wchar_t resPath[MAX_PATH] = {};
+    if (!TempFile(L"v8i_cmd85_req.txt", reqPath, _countof(reqPath)) ||
+        !TempFile(L"v8i_cmd85_res.txt", resPath, _countof(resPath))) {
+        LogLine("cmd85: no temp directory for the file channel");
+        return 1;
+    }
     for (int i = 0; i < 900; ++i) {          // 900 * 200 ms = 3 min
         Sleep(200);
         FILE* f = nullptr;
@@ -2272,7 +2312,9 @@ static void V8iCaptureCmdRecv(void* obj) {
     // CBT hook (sessionless, no command readback).
     {
         FILE* cf = nullptr;
-        if (_wfopen_s(&cf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_cmdrecv.txt", L"a") == 0 && cf) {
+        wchar_t recvPath[MAX_PATH] = {};
+        if (LogSideFile(L"cmdrecv.txt", recvPath, _countof(recvPath)) &&
+            _wfopen_s(&cf, recvPath, L"a") == 0 && cf) {
             fprintf(cf, "obj=%llx vt=%llx recv31=%llx recvVt31=%llx exc=%x\n",
                     (unsigned long long)(uintptr_t)obj, (unsigned long long)fvt,
                     (unsigned long long)g85_recv, (unsigned long long)g85_recvVt, (unsigned)exc);
@@ -2319,7 +2361,9 @@ static HRESULT __stdcall V8iRecipOnEvent(void*, const GUID* ev, long, void* obj)
     // without any Client session to answer commands).
     {
         FILE* rf = nullptr;
-        if (_wfopen_s(&rf, L"C:\\Users\\fishca\\AppData\\Local\\Temp\\v8i_recip.txt", L"a") == 0 && rf) {
+        wchar_t recipPath[MAX_PATH] = {};
+        if (LogSideFile(L"recip.txt", recipPath, _countof(recipPath)) &&
+            _wfopen_s(&rf, recipPath, L"a") == 0 && rf) {
             fprintf(rf, "ev=%d create=%d exit=%d obj=%llx evid=%02x%02x%02x%02x-%02x%02x-%02x%02x"
                         "-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
                     g85_evCount, isCreateFrame ? 1 : 0, g85_exitEvCount,
@@ -3786,7 +3830,11 @@ static int RunPayload(const wchar_t* sharedName) {
 
     LogLine("waiting for commands, ready=%ld", (long)g_io->ready);
     for (;;) {
-        LONG state = g_io->ready;
+        // The state word is read through an interlocked operation: it is the
+        // acquire barrier that pairs with the host's release store of the
+        // request, so the request text is visible once the state says
+        // "request".
+        LONG state = InterlockedCompareExchange((volatile LONG*)&g_io->ready, 0, 0);
         if (state == kStateExit) break;
         if (state != kStateRequest) {
             Sleep(15);
