@@ -64,8 +64,19 @@ std::wstring IniGet(const wchar_t* key) {
     return buf;
 }
 
-void IniSet(const wchar_t* key, const wchar_t* value) {
-    WritePrivateProfileStringW(L"git", key, value, kIniPath());
+// Writes one key of the gitbar ini. Returns false when the file could not be
+// written -- on a machine that never ran v8inject the %APPDATA%\v8inject
+// folder does not exist, and WritePrivateProfileString then fails silently,
+// so the settings look saved and are not.
+bool IniSet(const wchar_t* key, const wchar_t* value) {
+    wchar_t dir[MAX_PATH] = {};
+    if (ExpandEnvironmentStringsW(L"%APPDATA%\\v8inject", dir, MAX_PATH) > 0)
+        CreateDirectoryW(dir, nullptr);          // ERROR_ALREADY_EXISTS is fine
+    if (!WritePrivateProfileStringW(L"git", key, value, kIniPath())) {
+        LogLine("gitbar: cannot write ini key %ls (win32 %lu)", key, GetLastError());
+        return false;
+    }
+    return true;
 }
 
 // Client width below which the full strip would cover the designer's own
@@ -178,7 +189,13 @@ std::wstring RunGit(const std::vector<std::wstring>& args, DWORD timeoutMs = 120
         if (!PeekNamedPipe(outRd, nullptr, 0, nullptr, &avail, nullptr)) break;  // closed
         if (avail) {
             DWORD rd = 0;
-            if (!ReadFile(outRd, buf, sizeof(buf), &rd, nullptr) || rd == 0) break;
+            // Read exactly what the pipe holds. A byte-mode pipe blocks until
+            // the whole requested count arrives, so asking for the full buffer
+            // while only a few dozen bytes are buffered would hang here until
+            // the writer closes -- and the timeout below would never be
+            // reached.
+            DWORD want = avail < sizeof(buf) ? avail : (DWORD)sizeof(buf);
+            if (!ReadFile(outRd, buf, want, &rd, nullptr) || rd == 0) break;
             out.append(buf, rd);
             continue;
         }
@@ -193,7 +210,8 @@ std::wstring RunGit(const std::vector<std::wstring>& args, DWORD timeoutMs = 120
         DWORD avail = 0;
         while (PeekNamedPipe(outRd, nullptr, 0, nullptr, &avail, nullptr) && avail) {
             DWORD rd = 0;
-            if (!ReadFile(outRd, buf, sizeof(buf), &rd, nullptr) || rd == 0) break;
+            DWORD want = avail < sizeof(buf) ? avail : (DWORD)sizeof(buf);
+            if (!ReadFile(outRd, buf, want, &rd, nullptr) || rd == 0) break;
             out.append(buf, rd);
         }
     }
@@ -1350,11 +1368,17 @@ int SettingsHitButton(SettingsCtx* c, POINT pt) {
 }
 
 void SettingsSave(HWND h, SettingsCtx* c) {
-    if (!c->fields[0].empty()) IniSet(L"gitpath", c->fields[0].c_str());
-    if (!c->fields[1].empty()) IniSet(L"dumpdir", c->fields[1].c_str());
-    IniSet(L"commitmsg", c->fields[2].c_str());   // empty = auto "chore: 1c dump <stamp>"
-    IniSet(L"remote", c->fields[3].c_str());
+    bool ok = true;
+    if (!c->fields[0].empty()) ok = IniSet(L"gitpath", c->fields[0].c_str()) && ok;
+    if (!c->fields[1].empty()) ok = IniSet(L"dumpdir", c->fields[1].c_str()) && ok;
+    ok = IniSet(L"commitmsg", c->fields[2].c_str()) && ok;   // empty = auto "chore: 1c dump <stamp>"
+    ok = IniSet(L"remote", c->fields[3].c_str()) && ok;
     LogGit(L"settings saved to", kIniPath());
+    if (!ok) {
+        MessageBoxW(h, L"Не удалось записать настройки.\nПроверьте права на папку профиля "
+                       L"(%APPDATA%\\v8inject).",
+                    L"GitBar", MB_ICONERROR);
+    }
     DestroyWindow(h);
 }
 
@@ -2994,7 +3018,11 @@ static void SplitLines(const std::wstring& s, std::vector<std::wstring>& out) {
 static void ListDlgFill(ListDlg* d) {
     std::wstring out;
     switch (d->kind) {
-    case 0: out = RunGit({ L"-C", d->dir, L"status", L"--porcelain" }); break;
+    // core.quotepath=false: without it git escapes non-ASCII names as
+    // "\320\241.txt", and that escaped text is what would be handed back to
+    // "git add" -- the command would not find the file.
+    case 0: out = RunGit({ L"-C", d->dir, L"-c", L"core.quotepath=false",
+                           L"status", L"--porcelain" }); break;
     case 1: out = RunGit({ L"-C", d->dir, L"branch", L"-a" }); break;
     case 2: out = RunGit({ L"-C", d->dir, L"stash", L"list" }); break;
     default: out = RunGit({ L"-C", d->dir, L"tag", L"-n1" }); break;
@@ -3037,25 +3065,49 @@ static std::wstring ListDlgSel(ListDlg* d) {
     return sp == std::wstring::npos ? line : line.substr(0, sp);
 }
 
+// Asks before an action that cannot be undone: throwing away the edits in a
+// file, deleting a branch, a stash or a tag. A mis-click on "Отменить" in the
+// working-copy list used to discard the user's changes without a word.
+bool ConfirmDestructive(HWND h, const wchar_t* what, const std::wstring& sel) {
+    std::wstring msg = std::wstring(what) + L"\n\n" + sel +
+                        L"\n\nДействие необратимо. Продолжить?";
+    return MessageBoxW(h, msg.c_str(), L"Git",
+                        MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
+}
+
 static void ListDlgAct(ListDlg* d, int btn) {
     std::wstring sel = ListDlgSel(d);
     std::wstring out;
+    if (sel.empty()) return;
     switch (d->kind) {
     case 0:  // working copy
         if (btn == 0) out = RunGit({ L"-C", d->dir, L"add", L"--", sel });
         else if (btn == 1) out = RunGit({ L"-C", d->dir, L"reset", L"HEAD", L"--", sel });
-        else if (btn == 2) out = RunGit({ L"-C", d->dir, L"checkout", L"--", sel });
+        else if (btn == 2) {
+            if (!ConfirmDestructive(d->h, L"Отменить изменения в файле (правки будут потеряны):", sel))
+                return;
+            out = RunGit({ L"-C", d->dir, L"checkout", L"--", sel });
+        }
         break;
     case 1:  // branches
         if (btn == 0) out = RunGit({ L"-C", d->dir, L"checkout", sel });
-        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"branch", L"-d", sel });
+        else if (btn == 1) {
+            if (!ConfirmDestructive(d->h, L"Удалить ветку:", sel)) return;
+            out = RunGit({ L"-C", d->dir, L"branch", L"-d", sel });
+        }
         break;
     case 2:  // stashes
         if (btn == 0) out = RunGit({ L"-C", d->dir, L"stash", L"pop", sel });
-        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"stash", L"drop", sel });
+        else if (btn == 1) {
+            if (!ConfirmDestructive(d->h, L"Удалить отложенные изменения:", sel)) return;
+            out = RunGit({ L"-C", d->dir, L"stash", L"drop", sel });
+        }
         break;
     default:  // tags
-        if (btn == 0) out = RunGit({ L"-C", d->dir, L"tag", L"-d", sel });
+        if (btn == 0) {
+            if (!ConfirmDestructive(d->h, L"Удалить тег:", sel)) return;
+            out = RunGit({ L"-C", d->dir, L"tag", L"-d", sel });
+        }
         else if (btn == 1) out = RunGit({ L"-C", d->dir, L"push", L"origin", sel });
         break;
     }
