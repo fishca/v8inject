@@ -1613,9 +1613,9 @@ void ShowSettings(HWND owner) {
 }
 
 // ---------------------------------------------------------------------------
-// Git history viewer in the configurator, styled after v8GitView: dark
-// IntelliJ-like palette, parent-based lane graph with dots and halos,
-// branch/tag badges, monospace hashes and a dark diff pane.
+// Git history viewer in the configurator: the lane graph, ref badges and diff
+// pane borrowed from v8GitView, dressed in the classic 1C skin — cream chrome,
+// white rows, rust captions, light-blue selection and a light diff pane.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1663,9 +1663,8 @@ struct LogCtx {
     int diffLines = 0;     // total diff lines (for the scroll hint)
     HFONT mono = nullptr;
     HFONT ui = nullptr;
-    HFONT uiSemi = nullptr;    // semibold for subjects / headers
+    HFONT uiSemi = nullptr;    // bold for subjects / file headers
     HFONT title = nullptr;
-    HFONT bold = nullptr;
     HFONT badge = nullptr;
     RECT rcClose{};
     bool hoverClose = false;
@@ -1677,35 +1676,35 @@ struct LogCtx {
     RECT rcPatchSb{};
 };
 
-const int kLogRowH = 28;      // v8GitView row height
+const int kLogRowH = 28;      // commit row height
 const int kDiffRowH = 16;     // patch rows stay compact
 const int kLogListTop = 42;   // first commit row, below title + column headers
 const int kLaneStep = 16;
 const int kGraphPadL = 10;
 const int kGraphPadR = 8;
 const int kSbW = 10;          // thin overlay scrollbar width
-// Dark palette ported from v8GitView (IntelliJ-like).
-const COLORREF kLogBg = RGB(30, 31, 34);        // window chrome #1E1F22
-const COLORREF kLogPanel = RGB(30, 31, 34);
-const COLORREF kLogBase = RGB(43, 45, 48);      // list rows #2B2D30
-const COLORREF kLogAlt = RGB(47, 49, 54);       // alternate rows #2F3136
-const COLORREF kLogSel = RGB(53, 116, 240);     // selection #3574F0
-const COLORREF kLogBorder = RGB(58, 61, 65);    // #3A3D41
-const COLORREF kLogText = RGB(223, 225, 229);   // #DFE1E5
-const COLORREF kLogGray = RGB(122, 126, 133);   // #7A7E85
-const COLORREF kLogDim = RGB(111, 115, 122);    // #6F737A
-const COLORREF kLogAddBg = RGB(41, 58, 46);
-const COLORREF kLogAddTx = RGB(106, 171, 115);  // #6AAB73
-const COLORREF kLogAddHl = RGB(62, 90, 64);
-const COLORREF kLogDelBg = RGB(64, 41, 44);
-const COLORREF kLogDelTx = RGB(224, 123, 123);
-const COLORREF kLogDelHl = RGB(90, 58, 60);
-const COLORREF kLogHunkBg = RGB(38, 40, 43);
-const COLORREF kLogHunkTx = RGB(122, 126, 133);
-const COLORREF kLogHeadBg = RGB(58, 61, 65);    // "diff --git" band
-const COLORREF kLogPatchBg = RGB(43, 45, 48);   // code pane
-const COLORREF kLogLineNo = RGB(111, 115, 122);
-const COLORREF kLogGutter = RGB(38, 40, 43);
+// Light palette in the shared 1C skin (kDlg* above): cream chrome, white rows,
+// rust column captions, light-blue selection and a white diff field.
+const COLORREF kLogBg = kDlgBg;                     // FCFAEB window chrome
+const COLORREF kLogPanel = RGB(245, 243, 229);      // F5F3E5 header band
+const COLORREF kLogBase = kDlgFieldBg;              // white list rows
+const COLORREF kLogAlt = RGB(248, 246, 236);        // subtle cream alternation
+const COLORREF kLogSel = kDlgSel;                   // 9ED8EB light-blue selection
+const COLORREF kLogBorder = kDlgBorder;             // B3AC86 frames
+const COLORREF kLogText = kDlgText;                 // 333333
+const COLORREF kLogGray = RGB(128, 121, 98);        // warm dim text
+const COLORREF kLogAddBg = RGB(232, 244, 232);
+const COLORREF kLogAddTx = RGB(45, 110, 58);
+const COLORREF kLogAddHl = RGB(172, 222, 180);
+const COLORREF kLogDelBg = RGB(250, 235, 236);
+const COLORREF kLogDelTx = RGB(155, 48, 56);
+const COLORREF kLogDelHl = RGB(238, 180, 184);
+const COLORREF kLogHunkBg = RGB(240, 238, 226);
+const COLORREF kLogHunkTx = kLogGray;
+const COLORREF kLogHeadBg = kDlgBtnFace;            // D7D3BD "diff --git" band
+const COLORREF kLogPatchBg = kDlgFieldBg;           // white code pane
+const COLORREF kLogLineNo = RGB(158, 152, 126);
+const COLORREF kLogGutter = RGB(244, 242, 230);
 
 COLORREF Blend(COLORREF fg, COLORREF bg, int alpha) {
     int r = (GetRValue(fg) * alpha + GetRValue(bg) * (255 - alpha)) / 255;
@@ -1714,22 +1713,21 @@ COLORREF Blend(COLORREF fg, COLORREF bg, int alpha) {
     return RGB(r, g, b);
 }
 
-// Qt-style lighter(): scale the HSV value, keep the hue.
-COLORREF Lighter(COLORREF c, int pct) {
-    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
-    int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-    if (mx == 0) return c;
-    int nv = mx * pct / 100;
-    if (nv > 255) nv = 255;
-    return RGB(r * nv / mx, g * nv / mx, b * nv / mx);
+// Scale the HSV value down, keep the hue: badge labels and other accents that
+// would glow on a dark face become darker inks on cream / white rows.
+COLORREF Darker(COLORREF c, int pct) {
+    int r = GetRValue(c) * pct / 100, g = GetGValue(c) * pct / 100,
+        b = GetBValue(c) * pct / 100;
+    return RGB(r, g, b);
 }
 
-// v8GitView lane palette.
+// Lane palette tuned for the light face: saturated mid-tones stay readable on
+// white rows, the cream chrome and the light-blue selection.
 const COLORREF kLaneColors[] = {
-    RGB(0x4E, 0x9C, 0xF5), RGB(0xF2, 0x8E, 0x2B), RGB(0x59, 0xA1, 0x4F), RGB(0xE1, 0x57, 0x59),
-    RGB(0xB0, 0x7A, 0xA1), RGB(0x76, 0xB7, 0xB2), RGB(0xED, 0xC9, 0x48), RGB(0xFF, 0x9D, 0xA7),
-    RGB(0x9C, 0x75, 0x5F), RGB(0xBA, 0xB0, 0xAC), RGB(0x5B, 0x8F, 0xF9), RGB(0x61, 0xDD, 0xAA),
-    RGB(0x65, 0x78, 0x9B), RGB(0xF6, 0xBD, 0x16), RGB(0x72, 0x62, 0xFD), RGB(0x78, 0xD3, 0xF8),
+    RGB(0x2E, 0x6F, 0xD2), RGB(0xD3, 0x74, 0x0F), RGB(0x39, 0x8B, 0x3B), RGB(0xC6, 0x39, 0x40),
+    RGB(0x92, 0x4F, 0x8C), RGB(0x1F, 0x84, 0x8C), RGB(0xB0, 0x7D, 0x0B), RGB(0xC2, 0x53, 0x6F),
+    RGB(0x7D, 0x54, 0x33), RGB(0x60, 0x60, 0x60), RGB(0x2B, 0x5F, 0x9E), RGB(0x1F, 0x87, 0x55),
+    RGB(0x4E, 0x5A, 0x72), RGB(0x9C, 0x78, 0x00), RGB(0x59, 0x3E, 0x9B), RGB(0x0F, 0x7E, 0xA5),
 };
 const int kLaneCount = (int)(sizeof(kLaneColors) / sizeof(kLaneColors[0]));
 COLORREF LaneColor(int lane) { return kLaneColors[((lane % kLaneCount) + kLaneCount) % kLaneCount]; }
@@ -2074,7 +2072,7 @@ void ParseDiff(const std::wstring& patch, std::vector<DiffLine>& out) {
     }
 }
 
-// Commit node: a filled dot with a soft halo, as in v8GitView.
+// Commit node: a filled dot with a soft halo on the row face.
 static void DrawNode(HDC dc, int cx, int cy, COLORREF color, COLORREF bg) {
     HPEN np = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
     HBRUSH hb = CreateSolidBrush(Blend(color, bg, 70));
@@ -2090,7 +2088,7 @@ static void DrawNode(HDC dc, int cx, int cy, COLORREF color, COLORREF bg) {
     DeleteObject(db);
 }
 
-// Rounded branch/tag pills: tinted fill, stronger border, light bold label.
+// Rounded branch/tag pills: tinted fill, stronger border, darker bold label.
 // Advances x past the drawn badges; overflow collapses into a "+N" pill.
 static void DrawBadges(HDC dc, HFONT font, const std::vector<RefBadge>& badges,
                        int& x, int y, int rowH, int rightLimit, COLORREF bg) {
@@ -2114,7 +2112,7 @@ static void DrawBadges(HDC dc, HFONT font, const std::vector<RefBadge>& badges,
         SelectObject(dc, op);
         DeleteObject(fb);
         DeleteObject(bp);
-        SetTextColor(dc, Lighter(b.color, 145));
+        SetTextColor(dc, Darker(b.color, 76));
         RECT br{ x, top, x + w, top + 18 };
         DrawTextW(dc, b.label.c_str(), (int)b.label.size(), &br,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -2128,7 +2126,7 @@ static void DrawBadges(HDC dc, HFONT font, const std::vector<RefBadge>& badges,
         GetTextExtentPoint32W(dc, lab, (int)wcslen(lab), &sz);
         int w = sz.cx + 12;
         if (x + w <= rightLimit) {
-            HBRUSH fb = CreateSolidBrush(kLogAlt);
+            HBRUSH fb = CreateSolidBrush(kDlgBtnFace);
             HPEN bp = CreatePen(PS_SOLID, 1, kLogBorder);
             HBRUSH ob = (HBRUSH)SelectObject(dc, fb);
             HPEN op = (HPEN)SelectObject(dc, bp);
@@ -2145,45 +2143,6 @@ static void DrawBadges(HDC dc, HFONT font, const std::vector<RefBadge>& badges,
         }
     }
     SelectObject(dc, of);
-}
-
-// Dark variant of the shared caption band for the history window.
-static void DrawLogCaption(HDC dc, HWND h, HFONT font, bool hoverX) {
-    RECT rc{};
-    GetClientRect(h, &rc);
-    RECT band{ 0, 0, rc.right, kCapH };
-    HBRUSH cb = CreateSolidBrush(kLogBg);
-    FillRect(dc, &band, cb);
-    DeleteObject(cb);
-    HPEN lp = CreatePen(PS_SOLID, 1, kLogBorder);
-    HPEN olp = (HPEN)SelectObject(dc, lp);
-    MoveToEx(dc, 0, kCapH - 1, nullptr);
-    LineTo(dc, rc.right, kCapH - 1);
-    SelectObject(dc, olp);
-    DeleteObject(lp);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, kLogText);
-    HFONT of = (HFONT)SelectObject(dc, font);
-    wchar_t t[256] = {};
-    GetWindowTextW(h, t, 256);
-    RECT tr{ 8, 0, rc.right - 30, kCapH - 1 };
-    DrawTextW(dc, t, -1, &tr,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    SelectObject(dc, of);
-    RECT xr = CapCloseRect(rc);
-    if (hoverX) {
-        HBRUSH hb = CreateSolidBrush(kLogBorder);
-        FillRect(dc, &xr, hb);
-        DeleteObject(hb);
-    }
-    HPEN xp = CreatePen(PS_SOLID, 1, kLogText);
-    HPEN oxp = (HPEN)SelectObject(dc, xp);
-    MoveToEx(dc, xr.left + 6, xr.top + 5, nullptr);
-    LineTo(dc, xr.right - 6, xr.bottom - 5);
-    MoveToEx(dc, xr.right - 6, xr.top + 5, nullptr);
-    LineTo(dc, xr.left + 6, xr.bottom - 5);
-    SelectObject(dc, oxp);
-    DeleteObject(xp);
 }
 
 static int PatchRowsFit(const RECT& rc) {
@@ -2214,7 +2173,7 @@ static void DrawScrollbar(HDC dc, const RECT& track, int thumbH, int thumbY, boo
     FillRect(dc, &track, tb);
     DeleteObject(tb);
     RECT th{ track.left + 1, thumbY, track.right - 1, thumbY + thumbH };
-    HBRUSH hb = CreateSolidBrush(active ? RGB(84, 88, 92) : kLogBorder);
+    HBRUSH hb = CreateSolidBrush(active ? kDlgFieldBorder : kLogBorder);
     FillRect(dc, &th, hb);
     DeleteObject(hb);
 }
@@ -2227,7 +2186,7 @@ void LogPaint(LogCtx* c) {
     HBRUSH bg = CreateSolidBrush(kLogBg);
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
-    DrawLogCaption(dc, c->hwnd, c->title, c->hoverClose);
+    DrawCaption(dc, c->hwnd, c->title, c->hoverClose);
     // The body keeps its own coordinate space below the painted caption.
     SetWindowOrgEx(dc, 0, -kCapH, nullptr);
     rc.bottom -= kCapH;
@@ -2247,10 +2206,10 @@ void LogPaint(LogCtx* c) {
     auto RowBg = [&](int idx) -> COLORREF {
         if (idx == c->sel) return kLogSel;
         COLORREF base = (idx & 1) ? kLogAlt : kLogBase;
-        return idx == c->hover ? Lighter(base, 113) : base;
+        return idx == c->hover ? Blend(kDlgHover, base, 140) : base;
     };
 
-    // Header band: repo path on the dark face under the caption.
+    // Header band: repo path on the cream face under the caption.
     RECT hdr{ 0, 0, rc.right, 24 };
     HBRUSH hbr = CreateSolidBrush(kLogPanel);
     FillRect(dc, &hdr, hbr);
@@ -2270,13 +2229,14 @@ void LogPaint(LogCtx* c) {
     SelectObject(dc, obp);
     DeleteObject(border);
 
-    // Column headers: commit | author | date, dim labels on the chrome face.
+    // Column headers: commit | author | date, rust labels like the field
+    // captions on a live platform dialog.
     RECT hband{ 0, 24, rc.right, kLogListTop - 1 };
     HBRUSH hbb = CreateSolidBrush(kLogPanel);
     FillRect(dc, &hband, hbb);
     DeleteObject(hbb);
     SelectObject(dc, c->ui);
-    SetTextColor(dc, kLogGray);
+    SetTextColor(dc, kDlgLabel);
     RECT hG{ 8, 24, subjLeft, kLogListTop - 1 };
     DrawTextW(dc, L"Коммит", -1, &hG, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     RECT hA{ authorLeft + 4, 24, dateLeft, kLogListTop - 1 };
@@ -2289,7 +2249,8 @@ void LogPaint(LogCtx* c) {
     c->visible = (listBottom - listTop) / kLogRowH;
     if (c->visible < 1) c->visible = 1;
 
-    // The commit list: alternating dark rows, blue selection, lighter hover.
+    // The commit list: white rows with a subtle cream alternation, light-blue
+    // selection, pale-yellow hover.
     RECT listArea{ listLeft, listTop, contentRight, listBottom };
     HBRUSH lbr = CreateSolidBrush(kLogBase);
     FillRect(dc, &listArea, lbr);
@@ -2378,7 +2339,7 @@ void LogPaint(LogCtx* c) {
         DrawBadges(dc, c->badge, r.badges, x, yTop, kLogRowH, subjRight - subjMin, rbg);
 
         SelectObject(dc, c->ui);
-        SetTextColor(dc, sel ? RGB(255, 255, 255) : kLogText);
+        SetTextColor(dc, kDlgText);
         RECT sr{ x, yTop, subjRight, yBot };
         DrawTextW(dc, r.subject.c_str(), (int)r.subject.size(), &sr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -2424,14 +2385,14 @@ void LogPaint(LogCtx* c) {
         DrawTextW(dc, hint, -1, &hr, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
 
-    // Details panel: dark card with subject, badges, author, date and hash.
+    // Details panel: white field card with subject, badges, author, date, hash.
     int detTop = LogDetailTop(rc);
     {
         RECT card{ 8, detTop, rc.right - 8, detTop + 44 };
         HBRUSH cb = CreateSolidBrush(kLogBase);
         FillRect(dc, &card, cb);
         DeleteObject(cb);
-        HPEN cp = CreatePen(PS_SOLID, 1, kLogBorder);
+        HPEN cp = CreatePen(PS_SOLID, 1, kDlgFieldBorder);
         HPEN ocp = (HPEN)SelectObject(dc, cp);
         HBRUSH ob2 = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
         Rectangle(dc, card.left, card.top, card.right, card.bottom);
@@ -2480,7 +2441,7 @@ void LogPaint(LogCtx* c) {
         }
     }
 
-    // Patch pane: dark code field, dim two-column gutter, coloured sign,
+    // Patch pane: white code field, light two-column gutter, coloured sign,
     // green/red row tints and word-level chips; hunk / file headers get bands.
     int patchTop = LogPatchTop(rc);
     int patchBottom = rc.bottom - 6;
@@ -2886,11 +2847,10 @@ void ShowGitLog(HWND owner) {
         return;
     }
     c->mono = LogFont(9, L"Consolas", FW_NORMAL, FIXED_PITCH | FF_MODERN);
-    c->ui = LogFont(9, L"Segoe UI", FW_NORMAL, DEFAULT_PITCH | FF_SWISS);
-    c->uiSemi = LogFont(9, L"Segoe UI", FW_SEMIBOLD, DEFAULT_PITCH | FF_SWISS);
-    c->title = LogFont(9, L"Segoe UI", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
-    c->bold = LogFont(9, L"Segoe UI", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
-    c->badge = LogFont(8, L"Segoe UI", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
+    c->ui = LogFont(8, L"Tahoma", FW_NORMAL, DEFAULT_PITCH | FF_SWISS);
+    c->uiSemi = LogFont(8, L"Tahoma", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
+    c->title = LogFont(8, L"Tahoma", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
+    c->badge = LogFont(8, L"Tahoma", FW_BOLD, DEFAULT_PITCH | FF_SWISS);
 
     HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitLog",
                              L"История Git — v8inject",
@@ -2899,15 +2859,6 @@ void ShowGitLog(HWND owner) {
                              GetModuleHandleW(nullptr), nullptr);
     if (!h) { delete c; return; }
     CenterOnOwner(h, owner);
-    // Dark system frame to match the painted dark chrome.
-    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
-    if (dwm) {
-        auto setAttr = (HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD))
-            GetProcAddress(dwm, "DwmSetWindowAttribute");
-        BOOL on = TRUE;
-        if (setAttr) setAttr(h, 20, &on, sizeof(on));
-        FreeLibrary(dwm);
-    }
     SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)c);
     c->hwnd = h;
     RECT rc{};
@@ -2937,7 +2888,6 @@ void ShowGitLog(HWND owner) {
     if (c->ui) DeleteObject(c->ui);
     if (c->uiSemi) DeleteObject(c->uiSemi);
     if (c->title) DeleteObject(c->title);
-    if (c->bold) DeleteObject(c->bold);
     if (c->badge) DeleteObject(c->badge);
     delete c;
     Reposition(false);
