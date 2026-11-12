@@ -427,17 +427,19 @@ const COLORREF kDlgSelIdle = RGB(212, 208, 200);
 const COLORREF kDlgCaption = RGB(204, 204, 204);   // CCCCCC classic caption band
 const int kCapH = 22;                              // caption height, as in 1C dialogs
 
-// Main-menu row and dropdown-submenu palette, sampled from the live designer.
-const COLORREF kMenuBg         = RGB(245, 242, 221);  // F5F2DD menu-row face
+// Main-menu row and dropdown-submenu palette, sampled from the live designer's
+// «Администрирование» dropdown.
+const COLORREF kMenuBg         = RGB(248, 247, 238);  // F8F7EE menu face
 const COLORREF kMenuText       = RGB(65, 48, 3);      // 413003 dark-brown item
 const COLORREF kMenuHoverBorder = RGB(158, 182, 233); // 9EB6E9
 const COLORREF kMenuHoverText  = RGB(61, 78, 143);    // 3D4E8F
 const COLORREF kSubShortcut    = RGB(179, 128, 0);    // B38000 shortcut column
 const COLORREF kSubSep         = RGB(217, 213, 194);  // D9D5C2 separator line
-const COLORREF kSubGutterBg    = RGB(237, 233, 207);  // EDE9CF icon column strip
+const COLORREF kSubGutterBg    = RGB(240, 238, 224);  // F0EEE0 icon column strip
 const int kSubItemH = 22;
 const int kSubSepH = 7;
 const int kSubGutter = 28;   // icon column, as in 1C submenus
+const int kSubTextX = kSubGutter + 6;   // labels start 6 px past the gutter strip
 
 RECT CapCloseRect(const RECT& rc) {
     RECT r{ rc.right - 26, 3, rc.right - 4, 21 };
@@ -3357,7 +3359,7 @@ void DrawSubHover(HDC dc, const RECT& rc) {
 void ActionMenuMeasure(LPMEASUREITEMSTRUCT m) {
     if (!m->itemData) { m->itemWidth = 0; m->itemHeight = kSubSepH; return; }
     // One common width for every row so the hint column lines up.
-    m->itemWidth = kSubGutter + g_actionMetrics.textW +
+    m->itemWidth = kSubTextX + g_actionMetrics.textW +
                    (g_actionMetrics.hasHint ? 24 + g_actionMetrics.hintW + 16 : 24);
     m->itemHeight = kSubItemH;
 }
@@ -3371,7 +3373,8 @@ void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
     RECT gut{ rc.left, rc.top, rc.left + kSubGutter, rc.bottom };
     FillRect(dc, &gut, UiGutterBrush());
     if (!d->itemData) {
-        RECT line{ rc.left + 8, (rc.top + rc.bottom) / 2, rc.right - 8,
+        // The line starts at the gutter strip, not on it.
+        RECT line{ rc.left + kSubGutter, (rc.top + rc.bottom) / 2, rc.right - 8,
                    (rc.top + rc.bottom) / 2 + 1 };
         HBRUSH sb = CreateSolidBrush(kSubSep);
         FillRect(dc, &line, sb);
@@ -3391,7 +3394,7 @@ void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
                        : kMenuText;
     SetTextColor(dc, tx);
     HFONT old = (HFONT)SelectObject(dc, SubFont());
-    RECT tr{ rc.left + kSubGutter, rc.top, rc.right - 8, rc.bottom };
+    RECT tr{ rc.left + kSubTextX, rc.top, rc.right - 8, rc.bottom };
     DrawTextW(dc, it->text, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     // The platform underlines the mnemonic (the first character) while its
     // submenu is open.
@@ -3403,8 +3406,8 @@ void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
         int uy = rc.top + (kSubItemH - full.cy) / 2 + full.cy - 1;
         HPEN up = CreatePen(PS_SOLID, 1, tx);
         HGDIOBJ op = SelectObject(dc, up);
-        MoveToEx(dc, rc.left + kSubGutter, uy, nullptr);
-        LineTo(dc, rc.left + kSubGutter + first.cx, uy);
+        MoveToEx(dc, rc.left + kSubTextX, uy, nullptr);
+        LineTo(dc, rc.left + kSubTextX + first.cx, uy);
         SelectObject(dc, op);
         DeleteObject(up);
     }
