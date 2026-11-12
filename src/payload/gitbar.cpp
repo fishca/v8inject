@@ -371,6 +371,9 @@ const unsigned char* IconFor(int id) {
     case kWinIdStash: return icons::kIconStash;
     case kWinIdTags: return icons::kIconTags;
     case kWinIdStatus: return icons::kIconStatus;
+    // Menu-only actions: no PNG of their own yet, so borrow the closest glyph.
+    case kWinIdClone: return icons::kIconBranches;   // the whole repo tree
+    case kWinIdDumpExt: return icons::kIconDump;     // same operation, extension
     }
     return nullptr;
 }
@@ -427,7 +430,6 @@ const int kCapH = 22;                              // caption height, as in 1C d
 // Main-menu row and dropdown-submenu palette, sampled from the live designer.
 const COLORREF kMenuBg         = RGB(245, 242, 221);  // F5F2DD menu-row face
 const COLORREF kMenuText       = RGB(65, 48, 3);      // 413003 dark-brown item
-const COLORREF kMenuHoverFill  = RGB(214, 233, 255);  // D6E9FF pale-blue box
 const COLORREF kMenuHoverBorder = RGB(158, 182, 233); // 9EB6E9
 const COLORREF kMenuHoverText  = RGB(61, 78, 143);    // 3D4E8F
 const COLORREF kSubShortcut    = RGB(179, 128, 0);    // B38000 shortcut column
@@ -683,6 +685,14 @@ HFONT CreateDlgFont() {
 
 HBRUSH UiBgBrush() {
     static HBRUSH b = CreateSolidBrush(kDlgBg);
+    return b;
+}
+
+// The menu face is a different cream than the dialog face: F5F2DD, sampled
+// from a live «Сервис» dropdown. The dialog face FCFAEB reads wrong next to
+// the platform's own menus.
+HBRUSH UiMenuBrush() {
+    static HBRUSH b = CreateSolidBrush(kMenuBg);
     return b;
 }
 
@@ -3268,27 +3278,51 @@ void DoAction(int id);
 // The popup is owner-drawn to match the designer's own submenus (cream face,
 // brown items, rust shortcuts, pale-blue rounded hover); TrackPopupMenu still
 // provides the modal dismiss / keyboard behaviour.
-struct ActionItem { int id; const wchar_t* text; bool sepBefore; };
+struct ActionItem { int id; const wchar_t* text; const wchar_t* hint; bool sepBefore; };
 const ActionItem kActionItems[] = {
-    { kWinIdDump,     L"Выгрузить исходники (команда 45)", true },
-    { kWinIdDumpExt,  L"Выгрузить расширение в файлы (команда 205)", false },
-    { kWinIdInit,     L"git init в папке выгрузки", false },
-    { kWinIdClone,    L"Клонировать репозиторий…", false },
-    { kWinIdCommit,   L"Коммит изменений…", false },
-    { kWinIdPush,     L"Пуш в удалённый репозиторий", false },
-    { kWinIdPull,     L"Забрать изменения (git pull)", true },
-    { kWinIdFetch,    L"Получить изменения (git fetch)", false },
-    { kWinIdBranches, L"Ветки…", true },
-    { kWinIdStash,    L"Отложенные изменения…", false },
-    { kWinIdTags,     L"Теги…", false },
-    { kWinIdStatus,   L"Рабочая копия…", false },
-    { kWinIdLog,      L"История коммитов", false },
-    { kWinIdSettings, L"Настройки…", true },
+    { kWinIdDump,     L"Выгрузить исходники в файлы",  L"команда 45", true },
+    { kWinIdDumpExt,  L"Выгрузить расширение в файлы", L"команда 205", false },
+    { kWinIdInit,     L"Создать репозиторий в папке выгрузки", L"git init", false },
+    { kWinIdClone,    L"Клонировать репозиторий…",     L"git clone", false },
+    { kWinIdCommit,   L"Коммит изменений…",            L"git commit", false },
+    { kWinIdPush,     L"Пуш в удалённый репозиторий",  L"git push", false },
+    { kWinIdPull,     L"Забрать изменения",            L"git pull", true },
+    { kWinIdFetch,    L"Получить изменения",           L"git fetch", false },
+    { kWinIdBranches, L"Ветки…",                       L"git branch", true },
+    { kWinIdStash,    L"Отложенные изменения…",        L"git stash", false },
+    { kWinIdTags,     L"Теги…",                        L"git tag", false },
+    { kWinIdStatus,   L"Рабочая копия…",               L"git status", false },
+    { kWinIdLog,      L"История коммитов",             L"git log", false },
+    { kWinIdSettings, L"Настройки…",                   L"", true },
 };
 
 HFONT SubFont() {
     static HFONT f = CreateDlgFont();
     return f;
+}
+
+// Shared column widths for the whole popup: the gold hint column sits on one
+// common right-aligned x, the way the shortcut column does in a live 1C
+// submenu. Computed once before TrackPopupMenu; measure and draw read it.
+struct ActionMetrics { int textW = 0; int hintW = 0; bool hasHint = false; };
+ActionMetrics g_actionMetrics;
+
+void ActionMenuComputeMetrics() {
+    g_actionMetrics = {};
+    HDC dc = GetDC(nullptr);
+    HFONT old = (HFONT)SelectObject(dc, SubFont());
+    for (const ActionItem& it : kActionItems) {
+        SIZE sz{};
+        GetTextExtentPoint32W(dc, it.text, (int)wcslen(it.text), &sz);
+        g_actionMetrics.textW = std::max(g_actionMetrics.textW, (int)sz.cx);
+        if (it.hint[0]) {
+            GetTextExtentPoint32W(dc, it.hint, (int)wcslen(it.hint), &sz);
+            g_actionMetrics.hintW = std::max(g_actionMetrics.hintW, (int)sz.cx);
+            g_actionMetrics.hasHint = true;
+        }
+    }
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
 }
 
 // Pale-blue rounded hover with a vertical gradient, as in 1C submenus.
@@ -3314,21 +3348,16 @@ void DrawSubHover(HDC dc, const RECT& rc) {
 
 void ActionMenuMeasure(LPMEASUREITEMSTRUCT m) {
     if (!m->itemData) { m->itemWidth = 0; m->itemHeight = kSubSepH; return; }
-    const ActionItem* it = (const ActionItem*)m->itemData;
-    HDC dc = GetDC(nullptr);
-    HFONT old = (HFONT)SelectObject(dc, SubFont());
-    SIZE sz{};
-    GetTextExtentPoint32W(dc, it->text, (int)wcslen(it->text), &sz);
-    SelectObject(dc, old);
-    ReleaseDC(nullptr, dc);
-    m->itemWidth = kSubGutter + sz.cx + 24;
+    // One common width for every row so the hint column lines up.
+    m->itemWidth = kSubGutter + g_actionMetrics.textW +
+                   (g_actionMetrics.hasHint ? 24 + g_actionMetrics.hintW + 16 : 24);
     m->itemHeight = kSubItemH;
 }
 
 void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
-    FillRect(dc, &rc, UiBgBrush());
+    FillRect(dc, &rc, UiMenuBrush());
     if (!d->itemData) {
         RECT line{ rc.left + 8, (rc.top + rc.bottom) / 2, rc.right - 8,
                    (rc.top + rc.bottom) / 2 + 1 };
@@ -3338,20 +3367,48 @@ void ActionMenuDraw(LPDRAWITEMSTRUCT d) {
         return;
     }
     const ActionItem* it = (const ActionItem*)d->itemData;
-    bool sel = (d->itemState & ODS_SELECTED) != 0;
+    bool en = (d->itemState & ODS_DISABLED) == 0;
+    bool sel = en && (d->itemState & ODS_SELECTED) != 0;
     if (sel) DrawSubHover(dc, rc);
     const unsigned char* px = IconFor(it->id);
     if (px) DrawIcon(dc, px, rc.left + (kSubGutter - icons::kSize) / 2,
                      rc.top + (kSubItemH - icons::kSize) / 2);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, sel ? kMenuHoverText : kMenuText);
+    COLORREF tx = !en  ? Blend(kMenuText, kMenuBg, 115)
+                : sel  ? kMenuHoverText
+                       : kMenuText;
+    SetTextColor(dc, tx);
     HFONT old = (HFONT)SelectObject(dc, SubFont());
     RECT tr{ rc.left + kSubGutter, rc.top, rc.right - 8, rc.bottom };
     DrawTextW(dc, it->text, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    // The platform underlines the mnemonic (the first character) while its
+    // submenu is open.
+    int len = (int)wcslen(it->text);
+    if (en && len > 0) {
+        SIZE full{}, first{};
+        GetTextExtentPoint32W(dc, it->text, len, &full);
+        GetTextExtentPoint32W(dc, it->text, 1, &first);
+        int uy = rc.top + (kSubItemH - full.cy) / 2 + full.cy - 1;
+        HPEN up = CreatePen(PS_SOLID, 1, tx);
+        HGDIOBJ op = SelectObject(dc, up);
+        MoveToEx(dc, rc.left + kSubGutter, uy, nullptr);
+        LineTo(dc, rc.left + kSubGutter + first.cx, uy);
+        SelectObject(dc, op);
+        DeleteObject(up);
+    }
+    // The right column: gold git command, as the shortcut column in the
+    // platform's own submenus.
+    if (it->hint[0]) {
+        SetTextColor(dc, en ? kSubShortcut : Blend(kSubShortcut, kMenuBg, 115));
+        RECT hr{ rc.right - 16 - g_actionMetrics.hintW, rc.top, rc.right - 16, rc.bottom };
+        DrawTextW(dc, it->hint, -1, &hr,
+                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    }
     SelectObject(dc, old);
 }
 
 void ShowActionMenu(HWND owner) {
+    ActionMenuComputeMetrics();
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     for (const ActionItem& it : kActionItems) {
@@ -3360,7 +3417,7 @@ void ShowActionMenu(HWND owner) {
     }
     MENUINFO mi{ sizeof(mi) };
     mi.fMask = MIM_BACKGROUND;
-    mi.hbrBack = UiBgBrush();
+    mi.hbrBack = UiMenuBrush();
     SetMenuInfo(menu, &mi);
     POINT pt{ 0, kBarH };
     ClientToScreen(owner, &pt);
@@ -3571,23 +3628,15 @@ bool MenuQueryLayout(HWND frame) {
 
 void MenuDrawItem(HDC dc, int x, int w, const wchar_t* text, bool hover) {
     RECT item{ x, 1, x + w, g_menu.rowH - 1 };
-    if (hover) {
-        HBRUSH fb = CreateSolidBrush(kMenuHoverFill);
-        HPEN pen = CreatePen(PS_SOLID, 1, kMenuHoverBorder);
-        HGDIOBJ ob = SelectObject(dc, fb);
-        HGDIOBJ op = SelectObject(dc, pen);
-        RoundRect(dc, item.left, item.top, item.right, item.bottom, 7, 7);
-        SelectObject(dc, ob);
-        SelectObject(dc, op);
-        DeleteObject(fb);
-        DeleteObject(pen);
-    }
+    // The same pale-blue gradient box the submenus use, as on the live row.
+    if (hover) DrawSubHover(dc, item);
     COLORREF tc = hover ? kMenuHoverText : kMenuText;
     SetTextColor(dc, tc);
     DrawTextW(dc, text, -1, &item, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
-    // The platform underlines the mnemonic (the first character here).
-    int len = (int)wcslen(text);
-    if (len > 0) {
+    // The platform underlines the mnemonic of the hovered item only; a plain
+    // row shows no underline.
+    if (hover && text[0]) {
+        int len = (int)wcslen(text);
         SIZE full{}, first{};
         GetTextExtentPoint32W(dc, text, len, &full);
         GetTextExtentPoint32W(dc, text, 1, &first);
