@@ -50,12 +50,41 @@ bool IsSession0(DWORD pid) {
     return session == 0;
 }
 
+// The bitness of a running process. IsWow64Process2 (Windows 10 1709+) tells
+// the native machine of the image directly; the old IsWow64Process cannot:
+// on a 32-bit host it answers FALSE for every process, which would make all
+// of them look 64-bit and send the GUI after an x64 payload for an x86 target.
 bool IsProcess64(DWORD pid) {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return false;
-    BOOL wow64 = FALSE;
-    bool is64 = true;
-    if (IsWow64Process(h, &wow64)) is64 = !wow64;
+
+    using FnIsWow64Process2 = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+    static FnIsWow64Process2 isWow64Process2 = nullptr;
+    static bool isWow64Process2Resolved = false;
+    if (!isWow64Process2Resolved) {
+        isWow64Process2Resolved = true;
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (k32) isWow64Process2 = (FnIsWow64Process2)GetProcAddress(k32, "IsWow64Process2");
+    }
+
+    bool is64 = false;
+    USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    if (isWow64Process2 && isWow64Process2(h, &processMachine, &nativeMachine)) {
+        is64 = nativeMachine == IMAGE_FILE_MACHINE_AMD64 ||
+               nativeMachine == IMAGE_FILE_MACHINE_ARM64;
+    } else {
+        BOOL wow64 = FALSE;
+        if (IsWow64Process(h, &wow64)) {
+#if defined(_M_X64) || defined(_M_ARM64)
+            // On a 64-bit host: wow64 == TRUE means a 32-bit process.
+            is64 = !wow64;
+#else
+            // On a 32-bit host nothing 64-bit can run at all.
+            is64 = false;
+#endif
+        }
+    }
     CloseHandle(h);
     return is64;
 }

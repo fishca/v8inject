@@ -36,14 +36,19 @@ bool RemoteLoadLibrary(HANDLE hProc, const std::wstring& dllPath, HMODULE* baseO
     HANDLE th = loadLib ? CreateRemoteThread(hProc, nullptr, 0, loadLib,
                                              remote, 0, nullptr) : nullptr;
     if (th) {
-        WaitForSingleObject(th, 15000);
+        DWORD wait = WaitForSingleObject(th, 15000);
         DWORD code = 0;
-        GetExitCodeThread(th, &code);
-        ok = (code != 0);
+        if (wait == WAIT_OBJECT_0) GetExitCodeThread(th, &code);
+        // A thread that is still running after the timeout has not loaded
+        // anything yet: its exit code is STILL_ACTIVE (259), and treating that
+        // as a module handle would report "injected" for a payload that never
+        // ran.
+        ok = (wait == WAIT_OBJECT_0) && code != 0 && code != STILL_ACTIVE;
+        LogLine("RemoteLoadLibrary(%ls) -> %s (wait=%lu code=%lu)",
+                dllPath.c_str(), ok ? "ok" : "FAILED", wait, code);
         CloseHandle(th);
     }
     VirtualFreeEx(hProc, remote, 0, MEM_RELEASE);
-    LogLine("RemoteLoadLibrary(%ls) -> %s", dllPath.c_str(), ok ? "ok" : "FAILED");
     if (!ok) return false;
 
     // Resolve the real module base inside the target.
