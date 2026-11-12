@@ -91,12 +91,11 @@ bool Client::WaitForState(LONG expected, int timeoutMs) {
     }
 }
 
-bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
-                  const std::wstring& logDir, int timeoutMs) {
+bool Client::OpenBlock(uint32_t pid, const std::wstring& logDir) {
     if (hMap_) return false;
 
     MakeSharedName(sharedName_, _countof(sharedName_), pid);
-    LogLine("Client::Open pid=%u name=%ls logDir=%ls", pid, sharedName_, logDir.c_str());
+    LogLine("Client::OpenBlock pid=%u name=%ls logDir=%ls", pid, sharedName_, logDir.c_str());
 
     // 2 GB block is virtual; only touched pages become resident.
     PSECURITY_DESCRIPTOR sd = nullptr;
@@ -132,6 +131,12 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     wcsncpy_s(io_->logDir, MAX_PATH, logDir.c_str(), _TRUNCATE);
     io_->request[0] = 0;
     io_->response[0] = 0;
+    return true;
+}
+
+bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
+                  const std::wstring& logDir, int timeoutMs) {
+    if (!OpenBlock(pid, logDir)) return false;
 
     // Copy the payload into the target and start v8i_probe on its own thread.
     if (!StartPayloadThread(pid, payloadDll, sharedName_,

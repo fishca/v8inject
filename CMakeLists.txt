@@ -57,6 +57,7 @@ endfunction()
 
 add_library(v8i_common STATIC
     src/common/diag.cpp
+    src/common/ini.cpp
     src/common/pe.cpp
     src/common/pe_utils.cpp
     src/common/text.cpp
@@ -158,11 +159,40 @@ add_executable(v8i_tests
     tests/test_main.cpp
     tests/test_runner.cpp
     tests/unit_pe.cpp
+    tests/unit_ini.cpp
     tests/unit_pe_utils.cpp
+    tests/unit_protocol.cpp
     tests/unit_report.cpp
     tests/unit_text.cpp
     tests/unit_typeinfo.cpp
+    tests/unit_dispatcher.cpp
+    # The host side of the protocol lives in the host: the test plays the
+    # payload, so it needs the real Client. The injector comes with it (the
+    # client calls it), but the test never injects anything.
+    src/host/client.cpp
+    src/host/injector.cpp
+    # The payload sources are compiled in as well: the dispatcher test runs
+    # the real command loop of the payload against a block of the test's own.
+    # dllmain.cpp stays out - it belongs to the DLL.
+    src/payload/disasm.cpp
+    src/payload/gitbar.cpp
+    src/payload/hook.cpp
+    src/payload/menu.cpp
+    src/payload/memscan.cpp
+    src/payload/objects.cpp
+    src/payload/v8i_export.cpp
 )
+target_link_libraries(v8i_tests PRIVATE v8i_common capstone comctl32 msimg32 shell32)
+# The payload sources are compiled in, so their exported entry points are
+# defined here rather than imported.
+target_compile_definitions(v8i_tests PRIVATE V8I_PAYLOAD_EXPORTS)
+# The detour engine needs its assembly thunk (x64 has no inline assembly).
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_sources(v8i_tests PRIVATE src/payload/hook_thunk_x86.asm)
+    target_compile_options(v8i_tests PRIVATE $<$<COMPILE_LANGUAGE:ASM_MASM>:/safeseh>)
+else()
+    target_sources(v8i_tests PRIVATE src/payload/hook_thunk_x64.asm)
+endif()
 target_link_libraries(v8i_tests PRIVATE v8i_common)
 v8i_set_output(v8i_tests)
 

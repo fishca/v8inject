@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "v8inject/diag.h"
+#include "v8inject/ini.h"
 #include "v8inject/text.h"
 #include "icons.h"
 
@@ -59,21 +60,18 @@ const wchar_t* kIniPath() {
     return path;
 }
 
-std::wstring IniGet(const wchar_t* key) {
-    wchar_t buf[1024] = {};
-    GetPrivateProfileStringW(L"git", key, L"", buf, 1024, kIniPath());
-    return buf;
+// The ini helpers live in v8i_common (see v8inject/ini.h): one place, and
+// the folder of the file is created before the first write.
+std::wstring GitIniGet(const wchar_t* key, const wchar_t* fallback = L"") {
+    return v8i::IniGet(kIniPath(), L"git", key, fallback);
 }
 
 // Writes one key of the gitbar ini. Returns false when the file could not be
 // written -- on a machine that never ran v8inject the %APPDATA%\v8inject
 // folder does not exist, and WritePrivateProfileString then fails silently,
 // so the settings look saved and are not.
-bool IniSet(const wchar_t* key, const wchar_t* value) {
-    wchar_t dir[MAX_PATH] = {};
-    if (ExpandEnvironmentStringsW(L"%APPDATA%\\v8inject", dir, MAX_PATH) > 0)
-        CreateDirectoryW(dir, nullptr);          // ERROR_ALREADY_EXISTS is fine
-    if (!WritePrivateProfileStringW(L"git", key, value, kIniPath())) {
+bool GitIniSet(const wchar_t* key, const wchar_t* value) {
+    if (!v8i::IniSet(kIniPath(), L"git", key, value)) {
         LogLine("gitbar: cannot write ini key %ls (win32 %lu)", key, GetLastError());
         return false;
     }
@@ -85,15 +83,14 @@ bool IniSet(const wchar_t* key, const wchar_t* value) {
 // 0 disables the compact mode. Read on every reposition, so a hand-edited
 // ini takes effect without restarting 1C.
 int CompactThreshold() {
-    wchar_t buf[32] = {};
-    GetPrivateProfileStringW(L"git", L"compactwidth", L"900", buf, 32, kIniPath());
-    int v = (int)wcstol(buf, nullptr, 10);
+    const std::wstring buf = GitIniGet(L"compactwidth", L"900");
+    int v = (int)wcstol(buf.c_str(), nullptr, 10);
     if (v < 0) v = 0;
     return v > 10000 ? 10000 : v;
 }
 
 std::wstring GitExe() {
-    std::wstring p = IniGet(L"gitpath");
+    std::wstring p = GitIniGet(L"gitpath");
     if (p.empty()) p = L"git.exe";  // fall back to PATH
     return p;
 }
@@ -963,7 +960,7 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
 
 // Commit message: the ini value is only a default — it is asked every time.
 bool AskCommitMessage(std::wstring* msg) {
-    std::wstring def = IniGet(L"commitmsg");
+    std::wstring def = GitIniGet(L"commitmsg");
     if (def.empty()) def = L"chore: 1c dump " + NowStamp();
     if (!PromptText(g_bar.hwnd, L"GitBar — комментарий к коммиту",
                     L"Комментарий (git commit -m):", def, msg)) {
@@ -971,7 +968,7 @@ bool AskCommitMessage(std::wstring* msg) {
         return false;
     }
     if (msg->empty()) *msg = def;
-    IniSet(L"commitmsg", msg->c_str());
+    GitIniSet(L"commitmsg", msg->c_str());
     return true;
 }
 
@@ -1087,7 +1084,7 @@ bool PickFolder(HWND owner, const wchar_t* title, const std::wstring& initial,
 // makes the folder a normal clone, so the first push is a fast-forward and the
 // unrelated-histories merge is not needed at all.
 void RunClone() {
-    std::wstring def = IniGet(L"remote");
+    std::wstring def = GitIniGet(L"remote");
     std::wstring remote;
     if (!PromptText(g_bar.hwnd, L"GitBar — клонирование репозитория",
                     L"URL репозитория (git clone):", def, &remote)) {
@@ -1103,7 +1100,7 @@ void RunClone() {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         std::wstring pick;
         bool picked = PickFolder(g_bar.hwnd, L"Куда клонировать (папка должна быть пустой)",
-                                 IniGet(L"dumpdir"), &pick);
+                                 GitIniGet(L"dumpdir"), &pick);
         if (SUCCEEDED(hr)) CoUninitialize();
         if (!picked) { ShowTip(L"клонирование отменено"); return; }
 
@@ -1134,8 +1131,8 @@ void RunClone() {
         return;
     }
 
-    IniSet(L"dumpdir", dir.c_str());
-    IniSet(L"remote", remote.c_str());
+    GitIniSet(L"dumpdir", dir.c_str());
+    GitIniSet(L"remote", remote.c_str());
     ShowTip(L"клонировано: " + dir);
 
     // The clone is only the container for the dump: offer the next step at once.
@@ -1149,7 +1146,7 @@ void RunClone() {
 }
 
 void RunInit() {
-    std::wstring dir = IniGet(L"dumpdir");
+    std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) { ShowTip(L"нет папки выгрузки (Настройки)"); return; }
     DWORD attr = GetFileAttributesW(dir.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -1163,7 +1160,7 @@ void RunInit() {
 
     // An 'origin' makes the push button usable right after init; a stale one
     // is corrected instead of failing with "remote origin already exists".
-    std::wstring remote = IniGet(L"remote");
+    std::wstring remote = GitIniGet(L"remote");
     if (!remote.empty()) {
         std::wstring add = RunGit({ L"-C", dir, L"remote", L"add", L"origin", remote });
         if (add.find(L"already exists") != std::wstring::npos) {
@@ -1178,7 +1175,7 @@ void RunInit() {
 }
 
 void RunCommit() {
-    std::wstring dir = IniGet(L"dumpdir");
+    std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) { ShowTip(L"нет папки выгрузки (Настройки)"); return; }
     std::wstring msg;
     if (!AskCommitMessage(&msg)) return;
@@ -1192,7 +1189,7 @@ void RunCommit() {
 }
 
 void RunPush() {
-    std::wstring dir = IniGet(L"dumpdir");
+    std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) { ShowTip(L"нет папки выгрузки (Настройки)"); return; }
 
     // git push takes no message of its own, so a dirty tree is where the
@@ -1369,10 +1366,10 @@ int SettingsHitButton(SettingsCtx* c, POINT pt) {
 
 void SettingsSave(HWND h, SettingsCtx* c) {
     bool ok = true;
-    if (!c->fields[0].empty()) ok = IniSet(L"gitpath", c->fields[0].c_str()) && ok;
-    if (!c->fields[1].empty()) ok = IniSet(L"dumpdir", c->fields[1].c_str()) && ok;
-    ok = IniSet(L"commitmsg", c->fields[2].c_str()) && ok;   // empty = auto "chore: 1c dump <stamp>"
-    ok = IniSet(L"remote", c->fields[3].c_str()) && ok;
+    if (!c->fields[0].empty()) ok = GitIniSet(L"gitpath", c->fields[0].c_str()) && ok;
+    if (!c->fields[1].empty()) ok = GitIniSet(L"dumpdir", c->fields[1].c_str()) && ok;
+    ok = GitIniSet(L"commitmsg", c->fields[2].c_str()) && ok;   // empty = auto "chore: 1c dump <stamp>"
+    ok = GitIniSet(L"remote", c->fields[3].c_str()) && ok;
     LogGit(L"settings saved to", kIniPath());
     if (!ok) {
         MessageBoxW(h, L"Не удалось записать настройки.\nПроверьте права на папку профиля "
@@ -1627,9 +1624,9 @@ void ShowSettings(HWND owner) {
                                          != INVALID_FILE_ATTRIBUTES) {
         ctx.fields[0] = L"C:\\Program Files\\Git\\cmd\\git.exe";
     }
-    ctx.fields[1] = IniGet(L"dumpdir");
-    ctx.fields[2] = IniGet(L"commitmsg");
-    ctx.fields[3] = IniGet(L"remote");
+    ctx.fields[1] = GitIniGet(L"dumpdir");
+    ctx.fields[2] = GitIniGet(L"commitmsg");
+    ctx.fields[3] = GitIniGet(L"remote");
 
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitBarSettings", L"GitBar — настройки",
                                WS_POPUP | WS_VISIBLE,
@@ -2863,7 +2860,7 @@ LRESULT CALLBACK LogWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }  // namespace
 
 void ShowGitLog(HWND owner) {
-    std::wstring dir = IniGet(L"dumpdir");
+    std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) {
         MessageBoxW(owner, L"Сначала укажите папку выгрузки в настройках GitBar.",
                     L"История Git", MB_ICONINFORMATION);
@@ -2940,7 +2937,7 @@ void ShowGitLog(HWND owner) {
 }
 
 void RunPull() {
-    std::wstring dir = IniGet(L"dumpdir");
+    std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) {
         MessageBoxW(g_bar.hwnd, L"Сначала укажите папку выгрузки в настройках GitBar.",
                     L"Git pull", MB_ICONINFORMATION);
@@ -2954,7 +2951,7 @@ void RunPull() {
 }
 
 void RunFetch() {
-    std::wstring dir = IniGet(L"dumpdir");
+    std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) {
         MessageBoxW(g_bar.hwnd, L"Сначала укажите папку выгрузки в настройках GitBar.",
                     L"Git fetch", MB_ICONINFORMATION);
@@ -3239,7 +3236,7 @@ static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowList(int kind) {
-    std::wstring dir = IniGet(L"dumpdir");
+    std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) {
         MessageBoxW(g_bar.hwnd, L"Сначала укажите папку выгрузки в настройках GitBar.",
                     L"Git", MB_ICONINFORMATION);

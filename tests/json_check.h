@@ -18,14 +18,16 @@ class JsonParser {
 public:
     explicit JsonParser(const std::string& text) : s_(text) {}
 
-    bool Parse(std::string* err = nullptr) {
+    bool Parse(std::string* err = nullptr, size_t* offset = nullptr) {
         SkipWs();
-        if (!Value()) { Set(err, "not a value"); return false; }
+        if (!Value()) { SetAt(err, "not a value"); break_at(offset); return false; }
         SkipWs();
-        if (pos_ != s_.size()) { Set(err, "trailing characters"); return false; }
+        if (pos_ != s_.size()) { SetAt(err, "trailing characters"); break_at(offset); return false; }
         return true;
     }
 
+    // Where the parser gave up.
+    size_t ErrorPos() const { return pos_; }
 private:
     bool Value() {
         if (pos_ >= s_.size()) return false;
@@ -138,8 +140,21 @@ private:
         }
     }
 
+    void break_at(size_t* offset) const {
+        if (offset) *offset = pos_;
+    }
+
     static void Set(std::string* err, const char* what) {
         if (err) *err = what;
+    }
+
+    // The same, but with the place where the parser gave up: a broken answer
+    // is only useful if one knows where it broke.
+    void SetAt(std::string* err, const char* what) const {
+        if (!err) return;
+        char b[128];
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "%s at offset %zu", what, pos_);
+        *err = b;
     }
 
     const std::string& s_;
@@ -147,9 +162,12 @@ private:
 };
 
 // True when the text is a well-formed JSON value.
-inline bool JsonValid(const std::string& text, std::string* err = nullptr) {
+inline bool JsonValid(const std::string& text, std::string* err = nullptr,
+                      size_t* offset = nullptr) {
     JsonParser parser(text);
-    return parser.Parse(err);
+    const bool ok = parser.Parse(err, offset);
+    if (!ok && offset) *offset = parser.ErrorPos();
+    return ok;
 }
 
 }  // namespace test

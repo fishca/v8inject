@@ -14,6 +14,7 @@
 // controls are fine here (unlike the payload in a foreign process).
 
 #include "v8inject/client.h"
+#include "v8inject/ini.h"
 #include "v8inject/text.h"
 #include "v8inject/procs.h"
 
@@ -93,17 +94,15 @@ void Log(const std::wstring& line) {
 }
 
 void LoadConfig() {
-    wchar_t buf[512] = {};
-    GetPrivateProfileStringW(L"agent", L"names", L"1cv8.exe,1cv8c.exe,1cv8s.exe",
-                             buf, 512, IniPath().c_str());
-    g_names = buf;
+    g_names = v8i::IniGet(IniPath().c_str(), L"agent", L"names",
+                          L"1cv8.exe,1cv8c.exe,1cv8s.exe");
     g_autoGitBar = GetPrivateProfileIntW(L"agent", L"autogitbar", 1, IniPath().c_str()) != 0;
 }
 
 void SaveConfig() {
-    WritePrivateProfileStringW(L"agent", L"names", g_names.c_str(), IniPath().c_str());
-    WritePrivateProfileStringW(L"agent", L"autogitbar",
-                               g_autoGitBar ? L"1" : L"0", IniPath().c_str());
+    v8i::IniSet(IniPath().c_str(), L"agent", L"names", g_names.c_str());
+    v8i::IniSet(IniPath().c_str(), L"agent", L"autogitbar",
+                g_autoGitBar ? L"1" : L"0");
 }
 
 bool AutostartEnabled() {
@@ -129,9 +128,8 @@ void SetAutostart(bool on) {
         RegDeleteValueW(key, L"v8inject-agent");
     }
     RegCloseKey(key);
-    WritePrivateProfileStringW(L"agent", L"autostart",
-                               on ? L"1" : L"0",
-                               (AppDataDir() + L"\\" + kIniPath).c_str());
+    v8i::IniSet((AppDataDir() + L"\\" + kIniPath).c_str(), L"agent", L"autostart",
+                on ? L"1" : L"0");
 }
 
 // Payloads live in <agent dir>\x64\... and \x86\... (agent may itself sit in

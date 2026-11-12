@@ -20,6 +20,12 @@ public:
     bool Open(uint32_t pid, const std::wstring& payloadDll,
               const std::wstring& logDir, int timeoutMs = 15000);
 
+    // Creates the shared block alone, without touching the target process:
+    // whoever answers the block may be anywhere. The tests use it with their
+    // own fake payload; the production path is Open() = OpenBlock() plus the
+    // injection and the handshake.
+    bool OpenBlock(uint32_t pid, const std::wstring& logDir);
+
     // Sends one command and returns the raw JSON reply.
     // Returns false on timeout or protocol error.
     bool Call(const std::wstring& command, std::string& response, int timeoutMs = 15000);

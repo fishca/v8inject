@@ -235,7 +235,7 @@ std::string PeToJson(const std::wstring& args) {
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "{\"name\":\"%s\",\"rva\":\"0x%X\",\"va\":\"0x%llX\",\"vsize\":%u,\"raw\":%u,"
                     "\"flags\":\"%s%s%s\"}",
-                    s.name.c_str(), s.va, (unsigned long long)(img.base + s.va),
+                    JsonEscape(s.name).c_str(), s.va, (unsigned long long)(img.base + s.va),
                     s.virtualSize, s.rawSize,
                     s.Readable() ? "R" : "-", s.Writable() ? "W" : "-",
                     s.Executable() ? "X" : "-");
@@ -251,9 +251,9 @@ std::string PeToJson(const std::wstring& args) {
         if (shown > 200) break;
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "{\"name\":\"%s\",\"rva\":\"0x%X\",\"va\":\"0x%llX\",\"ordinal\":%u%s%s%s}",
-                    e.name.c_str(), e.rva, (unsigned long long)(img.base + e.rva), e.ordinal,
+                    JsonEscape(e.name).c_str(), e.rva, (unsigned long long)(img.base + e.rva), e.ordinal,
                     e.forwarded ? ",\"forwarded\":true,\"to\":\"" : "",
-                    e.forwarded ? e.forwarder.c_str() : "",
+                    e.forwarded ? JsonEscape(e.forwarder).c_str() : "",
                     e.forwarded ? "\"" : "");
         j += buf;
     }
@@ -262,7 +262,7 @@ std::string PeToJson(const std::wstring& args) {
     // Only the module names: a full list with bases overflows the response
     // buffer and hides the interesting fields.
     j += ",\"moduleCount\":" + std::to_string(EnumModules().size());
-    j += "]}";
+    j += "}";
     return j;
 }
 
@@ -473,7 +473,7 @@ std::string DisasmToJson(const std::wstring& args) {
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "{\"addr\":\"0x%llX\",\"bytes\":\"%s\",\"text\":\"%s %s\"}",
                     (unsigned long long)i.address, i.bytes.c_str(),
-                    i.mnemonic.c_str(), i.opStr.c_str());
+                    JsonEscape(i.mnemonic).c_str(), JsonEscape(i.opStr).c_str());
         j += buf;
     }
     j += "]}";
@@ -549,7 +549,7 @@ std::string ImportsToJson(const std::wstring& args) {
         first = false;
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "{\"dll\":\"%s\",\"name\":\"%s\",\"ordinal\":%u,\"iat\":\"0x%llX\"}",
-                    im.dll.c_str(), im.name.c_str(), im.ordinal,
+                    JsonEscape(im.dll).c_str(), JsonEscape(im.name).c_str(), im.ordinal,
                     (unsigned long long)(img.base + im.iatRva));
         j += buf;
     }
@@ -608,7 +608,7 @@ std::string ExportsToJson(const std::wstring& args) {
         first = false;
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                     "{\"name\":\"%s\",\"rva\":\"0x%X\",\"addr\":\"0x%llX\",\"ordinal\":%u",
-                    ex.name.c_str(), ex.rva, (unsigned long long)(img.base + ex.rva),
+                    JsonEscape(ex.name).c_str(), ex.rva, (unsigned long long)(img.base + ex.rva),
                     ex.ordinal);
         j += buf;
         if (ex.forwarded) {
@@ -3814,6 +3814,17 @@ static int RunPayload(const wchar_t* sharedName) {
     // Report readiness before anything that can fail.
     PutResponse("{\"status\":\"loaded\"}");
 
+    const int rc = V8iRunCommandLoop(g_io);
+    UnmapViewOfFile(g_io);
+    g_io = nullptr;
+    CloseHandle(hMap);
+    return rc;
+}
+
+int v8i::V8iRunCommandLoop(SharedIo* io) {
+    if (!io) return -1;
+    g_io = io;
+
     LogLine("waiting for commands, ready=%ld", (long)g_io->ready);
     for (;;) {
         // The state word is read through an interlocked operation: it is the
@@ -4047,9 +4058,6 @@ static int RunPayload(const wchar_t* sharedName) {
     }
 
     InterlockedExchange((volatile LONG*)&g_io->ready, kStateExit);
-    UnmapViewOfFile(g_io);
-    CloseHandle(hMap);
-    g_io = nullptr;
     return 0;
 }
 
