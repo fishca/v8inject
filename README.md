@@ -169,8 +169,8 @@ remote=git@github.com:user/repo.git        ; origin для git init (необя�
 
 `cmd <num> [sub]` вызывает штатную команду конфигуратора (`ICommandReceiver::transmitCommand`)
 на UI-потоке — так работает кнопка выгрузки и любые другие действия меню.
-На 8.3 это команда payload `cmd` (пока только внутри сессии `attach`),
-на 8.5 — `cmd85` (доступна и отдельной командой CLI):
+На 8.3 это команда payload `cmd`, на 8.5 — `cmd85` (доступна и отдельной
+командой CLI):
 
 ```bat
 v8inject attach 1cv8.exe
