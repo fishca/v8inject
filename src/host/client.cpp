@@ -3,6 +3,7 @@
 #include "v8inject/injector.h"
 
 #include <chrono>
+#include <sddl.h>
 #include <thread>
 #include <vector>
 
@@ -20,6 +21,45 @@ std::wstring DirectoryOf(const std::wstring& path) {
 std::wstring FileNameOf(const std::wstring& path) {
     size_t pos = path.find_last_of(L'\\');
     return pos == std::wstring::npos ? path : path.substr(pos + 1);
+}
+
+// Security descriptor for the shared block: full access for the user who
+// created it and for SYSTEM, nobody else. The block's name is predictable
+// (Local\v8inject.<pid>), so without a DACL another process of the session
+// could open it, pose as the payload and answer the host.
+bool MakeBlockSecurityDescriptor(PSECURITY_DESCRIPTOR* out) {
+    *out = nullptr;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+
+    DWORD size = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    std::vector<BYTE> buf(size);
+    bool ok = false;
+    if (size && GetTokenInformation(token, TokenUser, buf.data(), size, &size)) {
+        TOKEN_USER* tu = (TOKEN_USER*)buf.data();
+        wchar_t* sidText = nullptr;
+        if (ConvertSidToStringSidW(tu->User.Sid, &sidText)) {
+            std::wstring sddl = L"D:P(A;;GA;;;" + std::wstring(sidText) + L")(A;;GA;;;SY)";
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+                *out = sd;
+                ok = true;
+            }
+            LocalFree(sidText);
+        }
+    }
+    CloseHandle(token);
+    return ok;
+}
+
+// The state word is the handshake between the two processes: reading it
+// through an interlocked operation gives the acquire barrier that pairs with
+// the release barrier of the write (the response text must be visible before
+// the state says it is there).
+LONG ReadState(volatile LONG* p) {
+    return InterlockedCompareExchange(p, 0, 0);
 }
 
 }  // namespace
@@ -45,7 +85,7 @@ void Client::ReleaseHandles() {
 bool Client::WaitForState(LONG expected, int timeoutMs) {
     auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
     for (;;) {
-        if (io_->ready == expected) return true;
+        if (ReadState(&io_->ready) == expected) return true;
         if (Clock::now() >= deadline) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
@@ -59,16 +99,32 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     LogLine("Client::Open pid=%u name=%ls logDir=%ls", pid, sharedName_, logDir.c_str());
 
     // 2 GB block is virtual; only touched pages become resident.
-    hMap_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, FALSE };
+    if (MakeBlockSecurityDescriptor(&sd)) sa.lpSecurityDescriptor = sd;
+    hMap_ = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
                                0, (DWORD)sizeof(SharedIo), sharedName_);
+    if (sd) LocalFree(sd);
     if (!hMap_) return false;
+    // A block with that name already existed: another host is already talking
+    // to this pid, or somebody else got there first and the payload would
+    // attach to a stranger's block. Both are reasons to stop.
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        _snwprintf_s(lastError_, _countof(lastError_), _TRUNCATE,
+                     L"the shared block %ls already exists (another host is "
+                     L"already connected to this process?)",
+                     sharedName_);
+        LogLine("Client::Open: %ls already exists", sharedName_);
+        ReleaseHandles();
+        return false;
+    }
 
     io_ = (SharedIo*)MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedIo));
     LogLine("Client: shared block mapped at %p (size=%llu)",
             (void*)io_, (unsigned long long)sizeof(SharedIo));
     if (!io_) { ReleaseHandles(); return false; }
 
-    io_->ready = kStateIdle;
+    InterlockedExchange((volatile LONG*)&io_->ready, kStateIdle);
     io_->requestLen = 0;
     io_->responseLen = 0;
     io_->seq = 0;
@@ -89,7 +145,7 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     }
 
     // Payload reports readiness by writing a "loaded" reply.
-    LONG st = io_->ready;
+    LONG st = ReadState(&io_->ready);
     LogLine("handshake wait: ready=%ld", (long)st);
     if (!WaitForState(kStateResponse, timeoutMs)) {
         lastDiag_ = io_->diag;
@@ -111,7 +167,7 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     // Consume the readiness reply: without this the very next Call sees a
     // kStateResponse block and refuses with "busy".
     LogLine("handshake ok, ready=%ld resuming idle", (long)io_->ready);
-    io_->ready = kStateIdle;
+    InterlockedExchange((volatile LONG*)&io_->ready, kStateIdle);
     return true;
 }
 
@@ -124,7 +180,7 @@ bool Client::Call(const std::wstring& command, std::string& response, int timeou
     io_->responseLen = 0;
     io_->response[0] = 0;
     InterlockedIncrement(&seq_);
-    io_->seq = seq_;
+    InterlockedExchange((volatile LONG*)&io_->seq, seq_);
 
     // Idle -> Request. If the payload is still busy we treat it as an error
     // rather than racing on a half-written buffer.
