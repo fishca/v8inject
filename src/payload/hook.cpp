@@ -297,11 +297,29 @@ size_t BuildStub(uint8_t* block, void* ctx) {
 // Bytes that take control from the stub back to the first untouched instruction.
 size_t BuildTrampolineTail(uint8_t* at, uintptr_t resume) {
 #if defined(_M_X64)
-    at[0] = 0x48; at[1] = 0xB8;
+    // An absolute indirect jump through an inline slot:
+    //
+    //     jmp qword ptr [rip+0]   ; FF 25 00 00 00 00
+    //     dq resume               ; the slot, 8 bytes
+    //
+    // The old tail was `mov rax, resume; jmp rax`, which clobbered rax *after*
+    // the stolen prologue had loaded it. A function whose next original
+    // instruction consumes rax then read or wrote through a bogus pointer --
+    // every core::ListInStream::get is exactly
+    //
+    //     mov rcx,[rcx]
+    //     mov rax,[rcx]
+    //     jmp [rax+0xC8]
+    //
+    // so the hook crashed the target with 0xC0000005 on the first call. This
+    // form changes no register at all and leaves the flags alone: only rip
+    // moves. It costs two bytes more, and the tail sits at the end of a
+    // 256-byte block, so the size does not matter.
+    at[0] = 0xFF; at[1] = 0x25;                       // jmp qword ptr [rip+0]
+    at[2] = at[3] = at[4] = at[5] = 0;
     uint64_t r = (uint64_t)resume;
-    memcpy(at + 2, &r, 8);
-    at[10] = 0xFF; at[11] = 0xE0;                 // jmp rax
-    return 12;
+    memcpy(at + 6, &r, 8);                            // the address slot
+    return 14;
 #else
     at[0] = 0xE9;
     int32_t rel = (int32_t)((intptr_t)resume - (intptr_t)(at + 5));
