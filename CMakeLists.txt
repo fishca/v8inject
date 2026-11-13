@@ -159,6 +159,7 @@ add_executable(v8i_tests
     tests/test_main.cpp
     tests/test_runner.cpp
     tests/unit_pe.cpp
+    tests/unit_hook.cpp
     tests/unit_ini.cpp
     tests/unit_pe_utils.cpp
     tests/unit_protocol.cpp
