@@ -3572,8 +3572,12 @@ struct GitMenu {
     // thread; for 10 s after it the tick leaves the overlay alone (no UIA, no
     // raising) -- a UIA re-query in that window froze 1C on a live 8.3.27.2342.
     DWORD forwardedAt = 0;
+    // The native rect of the button whose replica was forwarded. Only a panel
+    // anchored at THIS rect is slid right (timer 4): panels of menus opened
+    // natively elsewhere on the row must stay where 1C put them.
+    RECT forwardedRect{};
     // Menu panels of this pause that were slid right (timer 4), so each is
-    // moved once. Cleared when the pause lifts.
+    // moved once. Cleared when the pause lifts and on every new forward.
     HWND shifted[kMaxShiftedPopups] = {};
     int  shiftedCount = 0;
 };
@@ -3768,8 +3772,11 @@ void MenuForwardClick(const RECT& orig) {
     if (!g_menu.hwnd) return;
     // The click opens 1C's native menu, which tracks in a modal loop on this
     // very thread. Until it is over, the tick must not re-query UIA or raise
-    // the overlay (see MenuReposition).
+    // the overlay (see MenuReposition). The panel will anchor at THIS rect,
+    // and only a panel anchored here may be slid right (MenuShiftPopups).
     g_menu.forwardedAt = GetTickCount();
+    g_menu.forwardedRect = orig;
+    g_menu.shiftedCount = 0;   // a new forward expects a new panel
     POINT save{}; GetCursorPos(&save);
     LONG_PTR ex = GetWindowLongPtrW(g_menu.hwnd, GWL_EXSTYLE);
     SetWindowLongPtrW(g_menu.hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
@@ -3792,15 +3799,18 @@ void MenuForwardClick(const RECT& orig) {
 // the LEFT of the replica the user sees and clicks (replicas are painted
 // shifted right to make room for the GitBar item) -- so without help the
 // «Справка» panel opens under «Окна» (live 8.3.27.2342). Timer 4 polls while
-// the pause after a forwarded click is active and slides each panel right by
-// ourW, once per panel handle. Top-level windows only: if 1C's panel ever
-// turns out to be a child window, this degrades to the old misplaced opening.
+// the pause after a forwarded click is active and slides the panel right by
+// ourW. Only the panel of the forwarded button is touched: the match is the
+// panel's left edge against the forwarded button's left (±12 px) -- panels of
+// menus the user opened natively elsewhere on the row stay where 1C put them.
+// Top-level windows only: if 1C's panel ever turns out to be a child window,
+// this degrades to the old misplaced opening.
 bool MenuShiftPopups() {
     if (!g_menu.hwnd || g_menu.ourW <= 0 || g_menu.tail.empty()) return false;
+    if (g_menu.forwardedRect.left == 0 && g_menu.forwardedRect.right == 0) return false;
     HWND frame = GetWindow(g_menu.hwnd, GW_OWNER);
     if (!frame) return false;
-    const int maxLeft = g_menu.tail.back().rect.right;
-    struct Ctx { GitMenu* m; HWND frame; int maxLeft; } ctx = { &g_menu, frame, maxLeft };
+    struct Ctx { GitMenu* m; HWND frame; } ctx = { &g_menu, frame };
     EnumWindows([](HWND h, LPARAM lp) -> BOOL {
         Ctx* c = (Ctx*)lp;
         if (GetWindow(h, GW_OWNER) != c->frame) return TRUE;
@@ -3812,11 +3822,11 @@ bool MenuShiftPopups() {
             wcsncmp(cls, L"tooltips", 8) == 0) return TRUE;
         RECT r{};
         if (!GetWindowRect(h, &r)) return TRUE;
-        // The panel opens right under the menu row, within the row's button
-        // span; anything else owned by the frame in that band is not ours to
-        // move.
+        // The panel opens right under the menu row, anchored at the forwarded
+        // button's left edge (±12 px). Anything else owned by the frame --
+        // panels of natively opened menus, tooltips -- stays where 1C put it.
         if (r.top < c->m->rowTop || r.top > c->m->rowTop + c->m->rowH + 80) return TRUE;
-        if (r.left < c->m->anchorRight - 200 || r.left > c->maxLeft) return TRUE;
+        if (abs(r.left - c->m->forwardedRect.left) > 12) return TRUE;
         for (int i = 0; i < c->m->shiftedCount; ++i)
             if (c->m->shifted[i] == h) return TRUE;   // already slid
         SetWindowPos(h, nullptr, r.left + c->m->ourW, r.top, 0, 0,
@@ -3933,6 +3943,7 @@ void MenuReposition(HWND frame) {
     // The pause is over: no menu panel to slide any more.
     if (g_menu.hwnd) KillTimer(g_menu.hwnd, 4);
     g_menu.shiftedCount = 0;
+    g_menu.forwardedRect = RECT{};
     RECT fr{}; GetWindowRect(frame, &fr);
     bool frameChanged = (fr.left != g_menu.lastFrame.left || fr.top != g_menu.lastFrame.top ||
                          fr.right != g_menu.lastFrame.right || fr.bottom != g_menu.lastFrame.bottom);
