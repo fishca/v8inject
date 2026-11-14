@@ -3924,6 +3924,14 @@ void MenuReposition(HWND frame) {
         if (g_menu.hwnd) ShowWindow(g_menu.hwnd, SW_HIDE);
         return;
     }
+    // Frame position first: it is needed both by the pause (following the
+    // frame during a drag) and by the normal path (change detection).
+    RECT fr{}; GetWindowRect(frame, &fr);
+    const bool frameChanged = (fr.left != g_menu.lastFrame.left || fr.top != g_menu.lastFrame.top ||
+                               fr.right != g_menu.lastFrame.right || fr.bottom != g_menu.lastFrame.bottom);
+    const POINT frameDelta{ fr.left - g_menu.lastFrame.left, fr.top - g_menu.lastFrame.top };
+    g_menu.lastFrame = fr;
+
     // While the mouse is captured by a modal loop on this thread (1C's native
     // menu tracking after a forwarded click, our own popups, a drag), or right
     // after a forwarded click, leave the overlay strictly alone: do not re-query
@@ -3938,16 +3946,25 @@ void MenuReposition(HWND frame) {
     // until the menu closes. The pause lifts after 10 s.
     if (GetCapture() != nullptr ||
         (g_menu.forwardedAt != 0 && GetTickCount() - g_menu.forwardedAt < 10000)) {
+        // A title-bar drag also holds the capture: without a follow-up the
+        // overlay would stay at the old screen position and separate from the
+        // row while the frame moves away (live 8.3.27.2342). Slide the overlay
+        // by the frame's delta -- GetWindowRect and SetWindowPos on our own
+        // window, no UIA, so the modal-loop freeze does not apply. When the
+        // drag ends, the normal path re-queries UIA and snaps to the exact
+        // anchor.
+        if (g_menu.hwnd && (frameDelta.x != 0 || frameDelta.y != 0)) {
+            RECT mr{};
+            if (GetWindowRect(g_menu.hwnd, &mr))
+                SetWindowPos(g_menu.hwnd, nullptr, mr.left + frameDelta.x, mr.top + frameDelta.y,
+                             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         return;
     }
     // The pause is over: no menu panel to slide any more.
     if (g_menu.hwnd) KillTimer(g_menu.hwnd, 4);
     g_menu.shiftedCount = 0;
     g_menu.forwardedRect = RECT{};
-    RECT fr{}; GetWindowRect(frame, &fr);
-    bool frameChanged = (fr.left != g_menu.lastFrame.left || fr.top != g_menu.lastFrame.top ||
-                         fr.right != g_menu.lastFrame.right || fr.bottom != g_menu.lastFrame.bottom);
-    g_menu.lastFrame = fr;
     ++g_menu.tick;
     if (!g_menu.valid || frameChanged || (g_menu.tick % 8) == 0) {
         if (!MenuQueryLayout(frame)) {
