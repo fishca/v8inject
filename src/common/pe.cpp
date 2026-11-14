@@ -203,25 +203,42 @@ PeImage ParsePe(uintptr_t base) {
                                                             : desc->FirstThunk;
                 if (thunkRva >= sizeOfImage || desc->FirstThunk >= sizeOfImage) continue;
 
-                const size_t thunkSize = sizeof(IMAGE_THUNK_DATA32);
+                // Thunk size follows the image, not the build: on x64 the
+                // thunks are 8 bytes (IMAGE_THUNK_DATA64), and reading them as
+                // 4-byte entries produced one bogus entry per DLL. Found when
+                // the import order of a test binary changed under it.
+                constexpr size_t thunkSize = sizeof(void*) == 8 ? sizeof(IMAGE_THUNK_DATA64)
+                                                                : sizeof(IMAGE_THUNK_DATA32);
                 for (int i = 0; i < 8192; ++i) {
                     uint32_t curThunkRva = thunkRva + (uint32_t)(i * thunkSize);
                     if (curThunkRva + thunkSize > sizeOfImage) break;
                     if (!IsReadable((const void*)(base + curThunkRva), thunkSize)) break;
 
-                    uint32_t value = *(const uint32_t*)(base + curThunkRva);
+                    uint64_t value = 0;
+                    if constexpr (sizeof(void*) == 8) {
+                        value = *(const uint64_t*)(base + curThunkRva);
+                    } else {
+                        value = *(const uint32_t*)(base + curThunkRva);
+                    }
                     if (!value) break;
 
                     PeImport pi;
                     pi.dll = dllName;
                     pi.iatRva = desc->FirstThunk + (uint32_t)(i * thunkSize);
 
-                    if (value & 0x80000000u) {
+                    bool byOrdinal = false;
+                    if constexpr (sizeof(void*) == 8) {
+                        byOrdinal = (value & 0x8000000000000000ULL) != 0;
+                    } else {
+                        byOrdinal = (value & 0x80000000u) != 0;
+                    }
+                    if (byOrdinal) {
                         pi.ordinal = (uint16_t)(value & 0xFFFF);
                     } else {
-                        if (value + 2 >= sizeOfImage) continue;
-                        pi.ordinal = SafeU16(base, sizeOfImage, value);
-                        pi.name = SafeAscii(base, sizeOfImage, value + 2, 256);
+                        uint32_t nameRva = (uint32_t)value;
+                        if (nameRva + 2 >= sizeOfImage) continue;
+                        pi.ordinal = SafeU16(base, sizeOfImage, nameRva);
+                        pi.name = SafeAscii(base, sizeOfImage, nameRva + 2, 256);
                     }
                     img.imports.push_back(std::move(pi));
                 }

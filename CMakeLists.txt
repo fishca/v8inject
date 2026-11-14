@@ -77,6 +77,7 @@ add_library(v8i_payload SHARED
     src/payload/disasm.cpp
     src/payload/gitbar.cpp
     src/payload/hook.cpp
+    src/payload/mainmenu.cpp
     src/payload/menu.cpp
     src/payload/memscan.cpp
     src/payload/objects.cpp
@@ -178,6 +179,7 @@ add_executable(v8i_tests
     src/payload/disasm.cpp
     src/payload/gitbar.cpp
     src/payload/hook.cpp
+    src/payload/mainmenu.cpp
     src/payload/menu.cpp
     src/payload/memscan.cpp
     src/payload/objects.cpp

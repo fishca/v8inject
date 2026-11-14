@@ -3792,6 +3792,70 @@ V8I_API int V8I_CALL v8i_version() {
     return 1;
 }
 
+// The command receiver of the main frame, for the native-menu hooks
+// (src/payload/mainmenu.cpp). Runs the same discovery the cmd chain uses and
+// validates the chain with a live hasHandler(45) probe through the marshal.
+// 8.3 only: the 8.5 receiver is captured on the cmd85 path and its vtable
+// layout is not wired for the menu yet.
+bool v8i::V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
+                                int* transmitSlot, int* updateSlot, int* hasSlot) {
+    ModuleRange cfg;
+    if (!FindModule(L"config.dll", cfg)) return false;
+    if (FindModule(L"core85.dll", cfg)) return false;   // 8.5: not wired yet
+
+    uintptr_t frame = 0;
+    uintptr_t recvBack = 0;
+#if defined(_WIN64)
+    if (!g_x64FrameObj) g_x64FrameObj = DiscoverFrameVtblX64(cfg);
+    frame = g_x64FrameObj;
+    recvBack = 0x20;
+#else
+    if (!g_x86FrameObj) g_x86FrameObj = DiscoverFrameVtblX86(cfg);
+    frame = g_x86FrameObj;
+    recvBack = g_x86RecvOffset;
+#endif
+    if (!frame) return false;
+
+    uintptr_t core = 0;
+    if (!ReadPtrSafe(frame + sizeof(void*), &core) || !core) return false;
+    void* recv = (void*)(core - recvBack);
+    uintptr_t vt = 0;
+    if (!ReadPtrSafe((uintptr_t)recv, &vt) || !IsReadable((void*)vt, 8 * sizeof(void*)))
+        return false;
+    void* hasTr = ((void**)vt)[5];   // hasHandler
+    if (!IsReadable(hasTr, 1)) return false;
+
+    // Live probe: the same hasHandler(45) the cmd chain uses to tell the main
+    // frame's receiver from its siblings (8.3.27.2342 live: three config
+    // vtable objects pass the static checks, only the main frame answers).
+    HWND cmdHwnd = nullptr;
+    DWORD ensureErr = 0;
+    const char* marshalPath = "";
+    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return false;
+    g_pending.recv = recv;
+    g_pending.trFn = hasTr;
+    g_pending.mode = 1;
+    memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
+    g_pending.u.cmd.cmdNum = 45;
+    g_pending.u.cmd.param = 0;
+    g_pending.u.cmd.object = nullptr;
+    g_pending.rc = -2;
+    g_pending.exc = 0;
+    InterlockedExchange(&g_pending.done, 0);
+    DWORD_PTR probeRes = 0;
+    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes))
+        return false;
+    if (!g_pending.done || g_pending.exc != 0 || g_pending.rc < 0) return false;
+
+    *recvOut = recv;
+    *recvVtOut = (uintptr_t*)vt;
+    *transmitSlot = 3;
+    *updateSlot = 4;
+    *hasSlot = 5;
+    return true;
+}
+
 static int RunPayload(const wchar_t* sharedName) {
     if (!sharedName) return -1;
 
@@ -3810,6 +3874,10 @@ static int RunPayload(const wchar_t* sharedName) {
     LogLine("RunPayload started, pid=%lu arch=%s", GetCurrentProcessId(),
             sizeof(void*) == 8 ? "x64" : "x86");
     LogLine("MapViewOfFile -> %p", (void*)g_io);
+
+    // Native «GitBar» item in the Configurator menu (8.3.27/8.5 layout, see
+    // src/payload/mainmenu.cpp). Outside 1C (the tests) this is a no-op.
+    if (V8iIsTargetProcess()) v8i::V8iStartNativeMenu();
 
     // Report readiness before anything that can fail.
     PutResponse("{\"status\":\"loaded\"}");

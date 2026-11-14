@@ -3901,7 +3901,10 @@ LRESULT CALLBACK MenuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 // never created and the row is left to 1C. A stability switch for builds where
 // the UIA replica misbehaves (added after the «Окна»-menu hang on a live
 // 8.3.27.2342); read once, applied on the next GitBar creation.
+static volatile LONG g_nativeMenu = 0;   // the native menu item is rendered
+
 bool MenuOverlayEnabled() {
+    if (g_nativeMenu) return false;   // the platform draws the item itself
     static const bool enabled = GitIniGet(L"menuoverlay", L"1") != L"0";
     return enabled;
 }
@@ -4026,6 +4029,13 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONUP:
     case WM_CONTEXTMENU:
         ShowActionMenu(hwnd);
+        return 0;
+
+    // Deferred command from the native menu transmit trap (mainmenu.cpp):
+    // the settings dialog opens on a normal message, not inside
+    // transmitCommand where the platform is tearing its menu down.
+    case WM_APP + 0x2F14:
+        ShowSettings(hwnd);
         return 0;
 
     case WM_MOUSEMOVE: {
@@ -4261,5 +4271,35 @@ std::string GitBarCommandToJson(const std::wstring& args) {
 // is pumping messages after DoAction returned, so the cross-thread SendMessage
 // inside ShowTip is safe.
 void GitBarTipFromWorker(const wchar_t* text) { ShowTip(text ? text : L""); }
+
+// --- нативный пункт меню (src/payload/mainmenu.cpp) -------------------------
+
+// Путь к gitbar.ini — для ключа [git] nativemenu в mainmenu.cpp.
+const wchar_t* V8iGitBarIniPath() {
+    return kIniPath();
+}
+
+// Вызывается mainmenu.cpp, когда платформа реально нарисовала нативный пункт:
+// реплика в ряду меню становится лишней.
+void V8iGitBarSetNativeMenu() {
+    InterlockedExchange(&g_nativeMenu, 1);
+    if (g_menu.hwnd) ShowWindow(g_menu.hwnd, SW_HIDE);
+}
+
+// Команды нашей группы из transmit-перехвата (UI-поток). Диалог настроек
+// открывается отложенно — обычным сообщением бару, не внутри transmitCommand,
+// где платформа разбирает своё меню. «Скрыть» — WM_CLOSE напрямую (без
+// ожидания потока панели: UI-поток в transmit не должен блокироваться).
+void V8iGitBarMenuAction(unsigned num) {
+    if (num == 2) {
+        if (!g_bar.hwnd || !IsWindowVisible(g_bar.hwnd)) GitBarCommandToJson(L"");
+        if (g_bar.hwnd) PostMessageW(g_bar.hwnd, WM_APP + 0x2F14, 0, 0);
+    } else if (num == 3) {
+        if (g_bar.hwnd && IsWindowVisible(g_bar.hwnd))
+            PostMessageW(g_bar.hwnd, WM_CLOSE, 0, 0);
+        else
+            GitBarCommandToJson(L"");
+    }
+}
 
 }  // namespace v8i
