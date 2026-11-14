@@ -48,8 +48,6 @@ private:
     HANDLE        hMap_ = nullptr;
     SharedIo*     io_   = nullptr;
     HANDLE        hThread_ = nullptr;
-    void*         remoteName_ = nullptr;
-    void*         remoteArgs_ = nullptr;
     HANDLE        hProc_ = nullptr;
     LONG          seq_ = 0;
     LONG          lastDiag_ = 0;

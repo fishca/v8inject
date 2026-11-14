@@ -166,6 +166,7 @@ add_executable(v8i_tests
     tests/unit_text.cpp
     tests/unit_typeinfo.cpp
     tests/unit_dispatcher.cpp
+    tests/unit_injector.cpp
     # The host side of the protocol lives in the host: the test plays the
     # payload, so it needs the real Client. The injector comes with it (the
     # client calls it), but the test never injects anything.

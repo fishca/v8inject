@@ -21,35 +21,56 @@ void* AllocRemote(HANDLE hProc, const void* data, size_t bytes) {
     return remote;
 }
 
-// LoadLibraryW lives at the same address in every process of one bitness,
-// so its address is valid remotely. The returned HMODULE is fetched separately
-// because GetExitCodeThread only carries 32 bits and would truncate it on x64.
+// LoadLibraryW is resolved locally and rebased into the target, never used by
+// its local address. On one Windows boot the system DLLs sit at the same base
+// in every process of a bitness, so the delta is usually zero -- but that is
+// an assumption, and checking it turns a silent wrong-address call in the
+// target into a clean, explained failure.
 bool RemoteLoadLibrary(HANDLE hProc, const std::wstring& dllPath, HMODULE* baseOut) {
     void* remote = AllocRemote(hProc, dllPath.c_str(),
                                (dllPath.size() + 1) * sizeof(wchar_t));
     if (!remote) return false;
 
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    auto loadLib = (LPTHREAD_START_ROUTINE)GetProcAddress(k32, "LoadLibraryW");
-
-    bool ok = false;
-    HANDLE th = loadLib ? CreateRemoteThread(hProc, nullptr, 0, loadLib,
-                                             remote, 0, nullptr) : nullptr;
-    if (th) {
-        DWORD wait = WaitForSingleObject(th, 15000);
-        DWORD code = 0;
-        if (wait == WAIT_OBJECT_0) GetExitCodeThread(th, &code);
-        // A thread that is still running after the timeout has not loaded
-        // anything yet: its exit code is STILL_ACTIVE (259), and treating that
-        // as a module handle would report "injected" for a payload that never
-        // ran.
-        ok = (wait == WAIT_OBJECT_0) && code != 0 && code != STILL_ACTIVE;
-        LogLine("RemoteLoadLibrary(%ls) -> %s (wait=%lu code=%lu)",
-                dllPath.c_str(), ok ? "ok" : "FAILED", wait, code);
-        CloseHandle(th);
+    HMODULE localK32 = GetModuleHandleW(L"kernel32.dll");
+    FARPROC localLoadLib = localK32 ? GetProcAddress(localK32, "LoadLibraryW") : nullptr;
+    HMODULE remoteK32 = localLoadLib ? FindModuleInProcess(hProc, L"kernel32.dll") : nullptr;
+    LPTHREAD_START_ROUTINE loadLib = nullptr;
+    if (localLoadLib && remoteK32) {
+        loadLib = (LPTHREAD_START_ROUTINE)((uintptr_t)localLoadLib
+                                           - (uintptr_t)localK32
+                                           + (uintptr_t)remoteK32);
     }
-    VirtualFreeEx(hProc, remote, 0, MEM_RELEASE);
-    if (!ok) return false;
+    LogLine("RemoteLoadLibrary: kernel32 local=%p remote=%p LoadLibraryW local=%p remote=%p",
+            (void*)localK32, (void*)remoteK32, (void*)localLoadLib, (void*)loadLib);
+    if (!loadLib) {
+        LogLine("RemoteLoadLibrary: cannot resolve LoadLibraryW in the target");
+        VirtualFreeEx(hProc, remote, 0, MEM_RELEASE);
+        return false;
+    }
+
+    HANDLE th = CreateRemoteThread(hProc, nullptr, 0, loadLib, remote, 0, nullptr);
+    DWORD wait = WAIT_FAILED;
+    DWORD code = 0;
+    if (th) {
+        wait = WaitForSingleObject(th, 15000);
+        if (wait == WAIT_OBJECT_0) GetExitCodeThread(th, &code);
+    }
+
+    // On anything but a clean finish, find out whether the load completed
+    // anyway: a slow target may have loaded the DLL after the timeout fired.
+    bool modulePresent = false;
+    if (wait != WAIT_OBJECT_0)
+        modulePresent = FindModuleInProcess(hProc, dllPath) != nullptr;
+
+    RemoteLoadDecision d = th
+        ? EvaluateRemoteLoad(wait, code, modulePresent)
+        : RemoteLoadDecision{ false, true, "no remote thread was created" };
+    LogLine("RemoteLoadLibrary(%ls) -> %s (wait=%lu code=%lu): %s%s",
+            dllPath.c_str(), d.ok ? "ok" : "FAILED", wait, code, d.reason,
+            d.freeBuffer ? "" : "; path buffer left allocated");
+    if (th) CloseHandle(th);
+    if (d.freeBuffer) VirtualFreeEx(hProc, remote, 0, MEM_RELEASE);
+    if (!d.ok) return false;
 
     // Resolve the real module base inside the target.
     if (baseOut) {
@@ -62,6 +83,26 @@ bool RemoteLoadLibrary(HANDLE hProc, const std::wstring& dllPath, HMODULE* baseO
 }
 
 }  // namespace
+
+// The decision table for the remote LoadLibrary thread. Kept pure: the unit
+// tests pin it down, so a future edit cannot silently reintroduce a free
+// under a still-running remote thread.
+RemoteLoadDecision EvaluateRemoteLoad(DWORD wait, DWORD exitCode, bool modulePresent) {
+    if (wait == WAIT_OBJECT_0) {
+        if (exitCode != 0 && exitCode != STILL_ACTIVE)
+            return { true, true, "the remote thread finished and returned a module handle" };
+        if (exitCode == 0)
+            return { false, true, "LoadLibraryW returned NULL" };
+        // A finished thread that reports STILL_ACTIVE is indistinguishable
+        // from a handle value of 259: neither is a base address we trust.
+        return { false, true, "the remote thread exited with code STILL_ACTIVE" };
+    }
+    // WAIT_TIMEOUT (and, hypothetically, WAIT_FAILED): the thread's fate is
+    // unknown, and the path buffer may still be read by it. Never freed.
+    if (modulePresent)
+        return { true, false, "timed out, but the module is loaded in the target" };
+    return { false, false, "injection hung: the remote thread did not finish" };
+}
 
 HMODULE FindModuleInProcess(HANDLE hProc, const std::wstring& dllPath) {
     const wchar_t* want = wcsrchr(dllPath.c_str(), L'\\');
@@ -115,14 +156,10 @@ bool StartPayloadThread(DWORD pid,
                         const wchar_t* sharedName,
                         HANDLE& hProcessOut,
                         HANDLE& hThreadOut,
-                        void*& remoteNameOut,
-                        void*& remoteArgsOut,
                         int& stageOut,
                         DWORD& win32ErrorOut) {
     hProcessOut = nullptr;
     hThreadOut = nullptr;
-    remoteNameOut = nullptr;
-    remoteArgsOut = nullptr;
     stageOut = kStageOpenProcess;
     win32ErrorOut = 0;
     if (!sharedName) { win32ErrorOut = ERROR_INVALID_PARAMETER; return false; }
@@ -189,8 +226,6 @@ bool StartPayloadThread(DWORD pid,
     stageOut = kStageOk;
     hProcessOut = hProc;
     hThreadOut = th;
-    remoteNameOut = nullptr;
-    remoteArgsOut = nullptr;
 
     // Ask the thread what happened: exit code 259 means it is still running,
     // anything else is the value v8i_probe returned (or a crash code).

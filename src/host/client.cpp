@@ -27,6 +27,11 @@ std::wstring FileNameOf(const std::wstring& path) {
 // created it and for SYSTEM, nobody else. The block's name is predictable
 // (Local\v8inject.<pid>), so without a DACL another process of the session
 // could open it, pose as the payload and answer the host.
+//
+// Fail closed: when the descriptor cannot be built, the block is not created
+// at all. A default-DACL block would be a silent downgrade of the protection
+// the protocol relies on -- refusing is the honest answer (see plan_roadmap
+// Ф1.3).
 bool MakeBlockSecurityDescriptor(PSECURITY_DESCRIPTOR* out) {
     *out = nullptr;
     HANDLE token = nullptr;
@@ -73,13 +78,9 @@ void Client::ReleaseHandles() {
     if (hMap_)        { CloseHandle(hMap_);   hMap_ = nullptr; }
     if (hThread_)     { CloseHandle(hThread_); hThread_ = nullptr; }
     if (hProc_) {
-        if (remoteName_) VirtualFreeEx(hProc_, remoteName_, 0, MEM_RELEASE);
-        if (remoteArgs_) VirtualFreeEx(hProc_, remoteArgs_, 0, MEM_RELEASE);
         CloseHandle(hProc_);
         hProc_ = nullptr;
     }
-    remoteName_ = nullptr;
-    remoteArgs_ = nullptr;
 }
 
 bool Client::WaitForState(LONG expected, int timeoutMs) {
@@ -140,8 +141,7 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
 
     // Copy the payload into the target and start v8i_probe on its own thread.
     if (!StartPayloadThread(pid, payloadDll, sharedName_,
-                            hProc_, hThread_, remoteName_, remoteArgs_,
-                            lastStage_, lastWin32_)) {
+                            hProc_, hThread_, lastStage_, lastWin32_)) {
         _snwprintf_s(lastError_, _countof(lastError_), _TRUNCATE,
                      L"start-up failed at stage %d (win32=%lu)",
                      lastStage_, lastWin32_);
