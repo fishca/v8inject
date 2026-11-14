@@ -78,17 +78,84 @@ static void Fail(const char* what, unsigned got, unsigned want) {
     exit(3);
 }
 
+// ---- stress mode -----------------------------------------------------------
+//
+// --stress <ms> turns the target into a multi-threaded hammer: worker threads
+// call TargetTick in a tight loop while the main thread keeps the self-checks.
+// The stress test on the host side installs and removes hooks while these
+// threads run, so the detour engine has to cope with calls arriving from
+// several threads at once. A wrong return value in a worker -- the signature
+// of a mis-relocated trampoline -- fails the run with exit code 3, like any
+// other self-check.
+
+static volatile LONG g_stressStop = 0;
+static StubFn g_stub = nullptr;   // set by main before RunStress
+
+static DWORD WINAPI StressThread(LPVOID) {
+    unsigned mismatches = 0;
+    for (unsigned i = 0; !g_stressStop; ++i) {
+        const unsigned r = TargetTick(1, 2, 3, 4);
+        if (r != 10 && mismatches++ < 3) {
+            printf("stress thread saw a wrong result %u\n", r);
+            fflush(stdout);
+        }
+        // Yield now and then so four spinning threads do not starve the main
+        // thread (and its self-checks) on a single-core CI runner.
+        if ((i & 15) == 0) Sleep(0);
+    }
+    return mismatches ? 1 : 0;
+}
+
+static int RunStress(int durationMs) {
+    HANDLE threads[4] = {};
+    for (HANDLE& t : threads) t = CreateThread(nullptr, 0, StressThread, nullptr, 0, nullptr);
+    for (HANDLE t : threads) {
+        if (!t) { printf("cannot start a stress thread\n"); return 5; }
+    }
+
+    const DWORD until = GetTickCount() + (DWORD)durationMs;
+    while (GetTickCount() < until) {
+        // The same self-checks as the plain loop: a trampoline that lands on
+        // the wrong instruction fails the run even without the workers.
+        if (TargetBranchy(0) != 11) { Fail("TargetBranchy(0)", 0, 11); }
+        if (TargetBranchy(5) != 22) { Fail("TargetBranchy(5)", 0, 22); }
+        if (TargetTail(0) != 11)    { Fail("TargetTail(0)", 0, 11); }
+        if (g_stub() != 42)         { Fail("branch stub", 0, 42); }
+        Sleep(20);
+    }
+
+    InterlockedExchange(&g_stressStop, 1);
+    int bad = 0;
+    for (HANDLE t : threads) {
+        WaitForSingleObject(t, 5000);
+        DWORD code = 0;
+        GetExitCodeThread(t, &code);
+        if (code != 0) ++bad;
+        CloseHandle(t);
+    }
+    printf("stress done calls=%lu mismatches=%d\n",
+           (unsigned long)g_calls, bad);
+    fflush(stdout);
+    return bad ? 6 : 0;
+}
+
 int main(int argc, char** argv) {
     // --delay <ms> keeps the function idle after start-up, which is what lets a
     // diagnostic session inspect the generated stub and trampoline before the
     // first hooked call happens.
+    // --stress <ms> runs the multi-threaded hammer for that long, then exits
+    // (exit code 0 on success) -- the stress test hooks and unhooks while the
+    // workers run, and needs the target to finish on its own.
     int delayMs = 0;
+    int stressMs = 0;
     for (int i = 1; i + 1 < argc; ++i) {
-        if (strcmp(argv[i], "--delay") == 0) delayMs = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--delay") == 0)  delayMs = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--stress") == 0) stressMs = atoi(argv[i + 1]);
     }
 
     StubFn stub = MakeBranchStub();
     if (!stub) { printf("cannot allocate the test stub\n"); return 4; }
+    g_stub = stub;
 
     // The addresses have to be known to the test, and taking them also
     // guarantees the functions are not folded away. %p alone prints bare hex on
@@ -99,6 +166,8 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     if (delayMs > 0) Sleep((DWORD)delayMs);
+
+    if (stressMs > 0) return RunStress(stressMs);
 
     for (;;) {
         TargetTick(0x1111, 0x2222, 0x3333, 0x4444);

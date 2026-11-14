@@ -211,4 +211,13 @@ if(WIN32)
                      -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/hook_smoke.ps1"
                      -BinDir "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}")
     set_tests_properties(hook_smoke PROPERTIES TIMEOUT 120)
+
+    # Stress test: four worker threads hammer the hooked function while the
+    # host installs and removes the hook in cycles; then the target is killed
+    # mid-session and the host must terminate in bounded time.
+    add_test(NAME hook_stress
+             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                     -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/hook_stress.ps1"
+                     -BinDir "${CMAKE_BINARY_DIR}/bin/${V8I_ARCH}")
+    set_tests_properties(hook_stress PROPERTIES TIMEOUT 300)
 endif()

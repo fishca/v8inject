@@ -158,6 +158,23 @@ struct Tokenizer {
 // refuses to patch when one of them is executing the bytes about to be
 // overwritten -- resuming such a thread would land it in the middle of a jump
 // we just wrote.
+//
+// Lifecycle audit (plan_roadmap Ф1.4, 2026-11-14). The risks of suspending a
+// process to patch its code, and what became of each:
+//
+// 1. A thread *inside* the stolen window at snapshot time is caught by the IP
+//    check below; the patch is refused and the caller reports "try again".
+// 2. A thread created *after* the snapshot but before the write is not in the
+//    list. The window between the snapshot and the 5-byte write is a few
+//    microseconds; the residual risk is documented and accepted for a
+//    diagnostic tool whose targets are chosen by the user, not hot internal
+//    functions of 1C. The stress test (tests/hook_stress.ps1) hammers the
+//    target from four threads across repeated install/remove cycles to keep
+//    this honest.
+// 3. A thread already executing the trampoline when a hook is removed is
+//    safe: the trampoline block is deliberately never freed (HookRemove).
+// 4. The heap lock: nothing allocates between Suspend and ResumeAll -- the
+//    fixed handles_ array exists for exactly that reason.
 class Suspender {
 public:
     ~Suspender() { ResumeAll(); }
@@ -660,7 +677,6 @@ bool HookRemove(uint32_t id) {
         for (int i = 0; i < g_hookCount; ++i) {
             if (g_hooks[i]->id == id) {
                 ctx = g_hooks[i];
-                g_hooks[i] = g_hooks[--g_hookCount];
                 break;
             }
         }
@@ -670,9 +686,29 @@ bool HookRemove(uint32_t id) {
     {
         Suspender sus;
         std::string why;
-        if (sus.Suspend(ctx->target, ctx->target + ctx->stolen, why)) {
-            PatchBytes(ctx->target, ctx->original, ctx->stolen);
+        if (!sus.Suspend(ctx->target, ctx->target + ctx->stolen, why)) {
+            // The restore was refused (a thread is executing the prologue).
+            // Dropping the hook from the registry while its detour is still
+            // patched would hide a live hook: keep it registered and report
+            // the refusal -- the caller can try again (plan_roadmap Ф1.4).
+            LogLine("hook %u not removed: %s", id, why.c_str());
+            return false;
+        }
+        if (!PatchBytes(ctx->target, ctx->original, ctx->stolen)) {
             sus.ResumeAll();
+            LogLine("hook %u not removed: cannot restore the original bytes", id);
+            return false;
+        }
+        sus.ResumeAll();
+    }
+
+    {   // taken out of the registry only once the original bytes are back
+        LockGuard guard;
+        for (int i = 0; i < g_hookCount; ++i) {
+            if (g_hooks[i] == ctx) {
+                g_hooks[i] = g_hooks[--g_hookCount];
+                break;
+            }
         }
     }
     ctx->active = false;
