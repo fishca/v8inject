@@ -108,21 +108,35 @@ kStateResponse(2) ──хост читает──▶ kStateIdle(0)   (и kStat
 1. `OpenProcess(PROCESS_CREATE_THREAD | QUERY_INFORMATION | VM_OPERATION |
    VM_WRITE | VM_READ)`. Отказ → stage `kStageOpenProcess` (1).
 2. `VirtualAllocEx` + `WriteProcessMemory` — путь к DLL в целевом процессе.
-3. `CreateRemoteThread(LoadLibraryW, path)` — адрес `LoadLibraryW` берётся из
-   **своего** kernel32 (совпадает для процессов одной разрядности). Отказ →
-   stage `kStageLoadLibrary` (2).
-4. Реальная база модуля в цели — `EnumProcessModulesEx` + сравнение имён. Нужна,
+3. Разрешение `LoadLibraryW`: адрес берётся из **своего** kernel32 и
+   пересчитывается в цель через дельту баз (`local − localK32 + remoteK32`);
+   удалённая база kernel32 ищется перечислением модулей цели. Совпадение баз
+   на одной загрузке Windows ожидаемо, но не предполагается: несовпадение даёт
+   чистый отказ, а не вызов по чужому адресу. Отказ → stage
+   `kStageResolveKernel32` (8).
+4. `CreateRemoteThread(LoadLibraryW, path)`. Отказ → stage
+   `kStageLoadLibrary` (2).
+5. Реальная база модуля в цели — `EnumProcessModulesEx` + сравнение имён. Нужна,
    потому что `GetExitCodeThread` несёт только 32 бита (на x64 HMODULE
    обрезался бы).
-5. Локальная загрузка той же DLL и `GetProcAddress("v8i_probe")` (для x86 —
+6. Локальная загрузка той же DLL и `GetProcAddress("v8i_probe")` (для x86 —
    запасной декорированный `_v8i_probe@4`).
-6. Пересчёт адреса: `delta = targetBase − localBase`. Своя копия выгружается.
-7. `CreateRemoteThread(v8i_probe)` — без аргументов. Отказ → stage
+7. Пересчёт адреса: `delta = targetBase − localBase`. Своя копия выгружается.
+8. `CreateRemoteThread(v8i_probe)` — без аргументов. Отказ → stage
    `kStageCreateThread` (7).
-8. Проверка: ожидание 3 с; exit code `259 (STILL_ACTIVE)` = поток жив и
+9. Проверка: ожидание 3 с; exit code `259 (STILL_ACTIVE)` = поток жив и
    обслуживает сессию.
 
-Полный перечень стадий отказа — `include/v8inject/injector.h:15-24`; CLI/GUI
+**Исход ожидания `LoadLibraryW`** решает чистая функция
+`EvaluateRemoteLoad` (`injector.cpp`, таблица закреплена юнит-тестом
+`unit_injector.cpp`): при `WAIT_OBJECT_0` поток завершился — буфер с путём
+освобождается; при таймауте буфер **не освобождается никогда** — поток может
+ещё читать путь; если модуль тем не менее появился в цели, внедрение
+считается успешным. Политика диагностики: решение и причина пишутся в лог
+(`"path buffer left allocated"`), агент не повторяет попытку в тот же pid до
+перезапуска 1С.
+
+Полный перечень стадий отказа — `include/v8inject/injector.h`; CLI/GUI
 печатают их при неудаче.
 
 Запуск 1С из хоста — команда `launch`: обычный `CreateProcessW` + немедленный
@@ -152,6 +166,18 @@ APC успевает выполниться до инициализации ntdl
 `1cv8.exe`/`1cv8c.exe`, и вызывает `V8iArmEarly` (WH_CBT для перехвата создания
 главного окна 1С). Логирование в DllMain запрещено — риск падения под loader
 lock.
+
+**Контракт loader lock.** Под `DLL_PROCESS_ATTACH` разрешено только:
+`IsTargetProcess` (`GetModuleFileNameW` + сравнение), `GetModuleHandleExW`
+(модуль уже загружен), `SetWindowsHookExW` (hook-модуль — собственный, уже
+отмапирован) и `CreateThread` — поток, созданный в DllMain, стартует только
+после снятия loader lock. Всё тяжёлое — установка inline-хука
+`CreateWindowExW` с остановкой потоков, цепочка подписки 8.5, логирование —
+исполняется в воркерах (`V8iInstallCreateWindowThread`,
+`V8iEarlySubscribeThread`); новые ранние работы оформляются так же: поднять
+в DllMain — исполнять в воркере. `AppInit_DLLs` — гипотетический путь
+доставки, совместимость с которым держится сознательно; проект его не
+настраивает.
 
 ### Полный список команд payload
 
@@ -215,6 +241,20 @@ thunk (для x86-достижимости), `trampoline@64` — копия пе
 5. Патч под `Suspender`: все прочие потоки замораживаются; отказ, если чей-то
    IP внутри патчируемого диапазона. `VirtualProtect` + memcpy +
    `FlushInstructionCache`.
+
+**Аудит жизненного цикла** (план `plan_roadmap.md` Ф1.4, 2026-11-14):
+
+| Риск | Разбор |
+|---|---|
+| Поток внутри окна перезаписи | ловится проверкой IP при снимке — патч отказывается («try again») |
+| Поток, созданный после снимка | не приостановлен; окно между снимком и 5-байтной записью — микросекунды; остаточный риск задокументирован в `hook.cpp` и принят для диагностического инструмента; держится честным стресс-тестом |
+| Поток внутри трамплина при снятии | безопасен: блок трамплина сознательно не освобождается |
+| Heap lock у остановленного потока | между Suspend и ResumeAll нет аллокаций — фиксированный массив хендлов |
+| Отказ восстановления байтов | хук **остаётся зарегистрированным и активным**, `HookRemove` возвращает отказ — «живой» детур не остаётся без трассировки и без записи в реестре |
+
+**Снятие** (`HookRemove`): сначала восстановление байтов под тем же
+`Suspender`, и только при успехе хук убирается из реестра. Блок с трамплином
+не освобождается (поток мог быть в трамплине).
 
 **Runtime**: перехваченная функция → stub → asm-thunk (`hook_thunk_x64.asm`,
 `hook_thunk_x86.asm`) → `V8iHookEnter(ctx, retAddr, entryRbp, args[4])`.
@@ -424,9 +464,10 @@ GitBar. Клиентский деструктор **не** выгружает pa
 
 | Что | Как запускать | Покрывает |
 |---|---|---|
-| `ctest` (unit + cli_help + hook_smoke) | `ctest --test-dir build/<arch> -C Release` | юнит-тесты общего модуля, help, полный цикл хуков: 4 хука разных типов релокации → трасса → снятие |
-| `v8i_tests` | `build/<arch>/bin/<arch>/v8i_tests.exe` | 41 юнит-тест: разбор PE (в том числе заголовков PE32+), перечисление модулей, проба читаемости, JSON-отчёт, текстовые хелперы, ini, протокол хост↔payload, диспетчер команд payload |
+| `ctest` (unit + cli_help + hook_smoke + hook_stress) | `ctest --test-dir build/<arch> -C Release` | юнит-тесты общего модуля, help, полный цикл хуков, стресс и устойчивость хуков |
+| `v8i_tests` | `build/<arch>/bin/<arch>/v8i_tests.exe` | юнит-тесты: разбор PE (в том числе заголовков PE32+), перечисление модулей, проба читаемости, JSON-отчёт, текстовые хелперы, ini, протокол хост↔payload, диспетчер команд payload, таблица решений таймаута внедрения |
 | `tests/hook_smoke.ps1 -BinDir <dir>` | напрямую | тот же сценарий руками |
+| `tests/hook_stress.ps1 -BinDir <dir>` | напрямую | стресс хуков: 4 потока × циклы hook/unhook; убийство цели посреди сессии — хост обязан завершиться за отведённое время |
 | `tools/check_gitbar.sh [8.3\|8.5]` | локально, нужна установленная 1С | E2E GitBar: запуск Конфигуратора → инжект → окно `V8iGitBar` живо |
 | `tools/recon_exports.py` | python + pefile | инвентарь экспортов 8.5/8.3 с диска |
 | `tools/recon_coreas_cbt.py`, `recon_snegopat_hooks.py` | python + capstone | дизасм Снегопата: как ставятся WH_CBT-хуки |
