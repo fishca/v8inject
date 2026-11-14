@@ -585,49 +585,47 @@ void MMRebuildStep(void* arg) {
 // --- поддержка версий и запуск ---------------------------------------------
 
 // Ветки v8snack: 8.3.27 и 8.5 — одна раскладка (entry 0x68, SSO); прочие — отказ.
+// Семья платформы определяется по пути модуля (…\1cv8\8.3.27.2342\bin\…):
+// профильные API KERNELBASE (GetPrivateProfileStringW, GetFileVersionInfoSizeW)
+// роняли поток на канонизации пути (GetFinalPathNameByHandleA+0x20, live
+// 8.3.27.2342) и здесь не используются вовсе.
 bool MMSupported(bool* is85) {
     ModuleRange m;
     if (FindModule(L"core85.dll", m)) { *is85 = true; return true; }
     *is85 = false;
     if (!FindModule(L"core83.dll", m)) return false;
-    // Внутри процесса база модуля — это и есть HMODULE: путь берём без psapi.
-    wchar_t path[MAX_PATH] = {};
-    if (!GetModuleFileNameW((HMODULE)m.base, path, MAX_PATH)) return false;
-    // версия файла — через version.dll динамически (hermetic-сборка, без импорта);
-    // version.dll в GUI-процессе уже загружена — сначала GetModuleHandleW,
-    // чтобы не звать LoadLibrary в первые секунды после инъекции.
-    HMODULE ver = GetModuleHandleW(L"version.dll");
-    if (!ver) ver = LoadLibraryW(L"version.dll");
-    if (!ver) return false;
-    typedef DWORD(WINAPI* FnSize)(LPCWSTR);
-    typedef BOOL(WINAPI* FnGet)(LPCWSTR, DWORD, DWORD, LPVOID);
-    typedef BOOL(WINAPI* FnQuery)(LPCVOID, LPCWSTR, LPVOID*, UINT*);
-    FnSize sizeFn = (FnSize)GetProcAddress(ver, "GetFileVersionInfoSizeW");
-    FnGet getFn = (FnGet)GetProcAddress(ver, "GetFileVersionInfoW");
-    FnQuery queryFn = (FnQuery)GetProcAddress(ver, "VerQueryValueW");
-    if (!sizeFn || !getFn || !queryFn) return false;
-    DWORD sz = sizeFn(path);
-    if (!sz) return false;
-    void* data = HeapAlloc(GetProcessHeap(), 0, sz);
-    if (!data) return false;
-    bool ok = false;
-    if (getFn(path, 0, sz, data)) {
-        VS_FIXEDFILEINFO* fi = nullptr;
-        UINT len = 0;
-        if (queryFn(data, L"\\", (LPVOID*)&fi, &len) && fi && len >= sizeof(*fi)) {
-            int a = HIWORD(fi->dwFileVersionMS), b = LOWORD(fi->dwFileVersionMS);
-            int c = HIWORD(fi->dwFileVersionLS);
-            ok = (a == 8 && b == 3 && c == 27);
-            LogLine("mainmenu: платформа %d.%d.%d.%d — %s", a, b, c,
-                    LOWORD(fi->dwFileVersionLS), ok ? "раскладка 8.3.27" : "не поддержана");
-        }
-    }
-    HeapFree(GetProcessHeap(), 0, data);
-    return ok;
+    bool family27 = m.path.find(L"\\8.3.27.") != std::wstring::npos;
+    LogLine("mainmenu: core83 — семья 8.3.27 по пути %ls: %s", m.path.c_str(),
+            family27 ? "да" : "нет");
+    return family27;
 }
 
+// Ключ [git] nativemenu=0 читается вручную (CreateFileW/ReadFile): профильные
+// API KERNELBASE (GetPrivateProfileStringW) роняли поток на канонизации пути
+// (GetFinalPathNameByHandleA+0x20, live 8.3.27.2342) и здесь не используются.
 bool MMNativeMenuEnabled() {
-    return IniGet(V8iGitBarIniPath(), L"git", L"nativemenu", L"1") != L"0";
+    wchar_t path[MAX_PATH] = {};
+    ExpandEnvironmentStringsW(L"%APPDATA%\\v8inject\\gitbar.ini", path, MAX_PATH);
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return true;   // нет файла — включён по умолчанию
+    char buf[4096] = {};
+    DWORD got = 0;
+    ReadFile(f, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(f);
+    buf[got < sizeof(buf) - 1 ? got : sizeof(buf) - 1] = 0;
+    const char* p = strstr(buf, "nativemenu");
+    while (p) {
+        const char* eq = strchr(p, '=');
+        const char* eol = strchr(p, '\n');
+        if (eq && (!eol || eq < eol)) {
+            ++eq;
+            while (*eq == ' ' || *eq == '\t' || *eq == '\r') ++eq;
+            return _strnicmp(eq, "0", 1) != 0;
+        }
+        p = eol ? eol + 1 : nullptr;
+    }
+    return true;
 }
 
 // Тело рабочего потока. Вызывается из SEH-обёртки: любое исключение в нашем
