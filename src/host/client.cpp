@@ -99,12 +99,21 @@ bool Client::OpenBlock(uint32_t pid, const std::wstring& logDir) {
     LogLine("Client::OpenBlock pid=%u name=%ls logDir=%ls", pid, sharedName_, logDir.c_str());
 
     // 2 GB block is virtual; only touched pages become resident.
+    // No fallback to a default DACL: without the expected rights the block is
+    // not created (fail closed) -- a stranger answering it would be worse than
+    // a refused session.
     PSECURITY_DESCRIPTOR sd = nullptr;
-    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, FALSE };
-    if (MakeBlockSecurityDescriptor(&sd)) sa.lpSecurityDescriptor = sd;
+    if (!MakeBlockSecurityDescriptor(&sd)) {
+        _snwprintf_s(lastError_, _countof(lastError_), _TRUNCATE,
+                     L"failed to build the security descriptor of the shared "
+                     L"block; refusing to create it with default rights");
+        LogLine("Client::OpenBlock: security descriptor failed");
+        return false;
+    }
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), sd, FALSE };
     hMap_ = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
                                0, (DWORD)sizeof(SharedIo), sharedName_);
-    if (sd) LocalFree(sd);
+    LocalFree(sd);
     if (!hMap_) return false;
     // A block with that name already existed: another host is already talking
     // to this pid, or somebody else got there first and the payload would
