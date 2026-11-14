@@ -1,10 +1,13 @@
 # Stress and resilience tests for the inline hook engine (plan_roadmap Ф1.4).
 #
 # Scenario A (stress): the target runs four worker threads hammering the hooked
-# function while the host installs and removes a hook in repeated cycles. The
-# trace must capture calls from several threads, the target must keep its
-# self-checks green while its prologue is rewritten under running threads, and
-# it must exit cleanly on its own at the end of the hammer run.
+# function while the host installs and removes a hook in repeated cycles. Under
+# that load the engine may legitimately REFUSE an install ("a thread is
+# executing the prologue; try again" -- documented audit item 1 in hook.cpp):
+# the test retries and requires eventual success, which is exactly the recovery
+# a host user relies on. The trace must capture calls from several threads, the
+# target must keep its self-checks green, and it must exit cleanly on its own
+# at the end of the hammer run.
 #
 # Scenario B (target dies mid-session): the host must terminate the attach
 # session in bounded time after the target process is killed -- no infinite
@@ -12,8 +15,6 @@
 # `sleep 3000`, i.e. after the hook has been confirmed: the attach command
 # timeout is 120 s, so a kill in the middle of an in-flight command would make
 # the session wait that timeout out legitimately, which would test nothing.
-# The session ends with an explicit `exit` (EOF delivery through a closed
-# StandardInput is less reliable).
 
 param(
     [Parameter(Mandatory = $true)][string]$BinDir
@@ -28,6 +29,7 @@ function Fail($msg) {
     if ($flat.Length -gt 1200) { $flat = "..." + $flat.Substring($flat.Length - 1200) }
     Write-Host "FAIL: $flat"
     Get-Process -Name 'v8i_hook_target' -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process -Name 'v8inject' -ErrorAction SilentlyContinue | Stop-Process -Force
     exit 1
 }
 
@@ -52,50 +54,114 @@ function Wait-AddressLine($outFile, $proc) {
     return $null
 }
 
+# Interactive attach session: one command in, one reply line out. The attach
+# prints one JSON line per command, so a reply can be awaited and inspected --
+# that is what makes the refusal-retry loop possible.
+function Start-Session {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = 'attach v8i_hook_target.exe'
+    $psi.WorkingDirectory = $BinDir
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    [void]$p.Handle   # cache the handle now: ExitCode is empty otherwise (PS 5.1)
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $line = Read-Reply $p 'attached' 30000
+    if ($line -notmatch '^attached:') { Fail "unexpected first session line: $line" }
+    return $p
+}
+
+function Read-Reply([System.Diagnostics.Process]$p, [string]$forCmd, [int]$timeoutMs = 20000) {
+    $task = $p.StandardOutput.ReadLineAsync()
+    if (-not $task.Wait($timeoutMs)) {
+        Fail "no reply to '$forCmd' within $timeoutMs ms"
+    }
+    return $task.Result
+}
+
+function Send-Cmd([System.Diagnostics.Process]$p, [string]$cmd) {
+    $p.StandardInput.WriteLine($cmd)
+    $p.StandardInput.Flush()
+    return Read-Reply $p $cmd
+}
+
 # ---------------------------------------------------------------------------
 # Scenario A: multi-threaded stress across repeated install/remove cycles
 # ---------------------------------------------------------------------------
 
 $outFile = Join-Path ([System.IO.Path]::GetTempPath()) ("v8i_hook_stress_" + [guid]::NewGuid().ToString('N') + ".txt")
 
-$script:proc = Start-Process -FilePath $target -ArgumentList '--stress', '12000' `
+$script:proc = Start-Process -FilePath $target -ArgumentList '--stress', '15000' `
     -RedirectStandardOutput $outFile -PassThru -NoNewWindow
-# Cache the process handle now: without this the ExitCode property comes back
-# empty on Windows PowerShell 5.1 when the process has already exited by the
-# time it is read.
-[void]$script:proc.Handle
+[void]$script:proc.Handle   # cache the handle now: ExitCode is empty otherwise (PS 5.1)
 $tick = Wait-AddressLine $outFile $script:proc
 if (-not $tick) { Fail "stress target did not report its function address" }
 Write-Host "stress target pid=$($script:proc.Id) tick=$tick"
 
+$p = Start-Session
+
 # Five install/remove cycles while four worker threads call the hooked
-# function. Each cycle: install, let the calls pile up, read the trace, remove.
+# function. An install may be refused under load (a thread inside the stolen
+# window) -- retrying until success is the documented recovery path.
 $cycles = 5
-$script = ""
-for ($c = 0; $c -lt $cycles; $c++) {
-    $script += "hook $tick`nsleep 400`ntrace --count 12`nunhook all`nsleep 200`n"
+$installed = 0
+$removed = 0
+$retries = 0
+$allTids = New-Object 'System.Collections.Generic.HashSet[string]'
+
+for ($c = 1; $c -le $cycles; $c++) {
+    $reply = Send-Cmd $p "hook $tick"
+    $tries = 0
+    while ($reply -match 'a thread is executing the prologue') {
+        $tries++; $retries++
+        if ($tries -gt 20) { Fail "hook install kept being refused: $reply" }
+        Start-Sleep -Milliseconds 50
+        $reply = Send-Cmd $p "hook $tick"
+    }
+    if ($reply -notmatch '"id":\d+') { Fail "hook install failed: $reply" }
+    $installed++
+
+    [void](Send-Cmd $p 'sleep 400')
+    $trace = Send-Cmd $p 'trace --count 12'
+    foreach ($m in [regex]::Matches($trace, '"tid":(\d+)')) {
+        [void]$allTids.Add($m.Groups[1].Value)
+    }
+
+    # Same story for removal: the restore is refused while a thread is inside
+    # the prologue ("removed":0, refusal logged) -- retry until the bytes are
+    # back, that is the documented recovery.
+    $reply = Send-Cmd $p 'unhook all'
+    $utries = 0
+    while ($reply -match '"removed":0') {
+        $utries++; $retries++
+        if ($utries -gt 20) { Fail "unhook kept being refused: $reply" }
+        Start-Sleep -Milliseconds 50
+        $reply = Send-Cmd $p 'unhook all'
+    }
+    if ($reply -notmatch '"removed":1') { Fail "unhook did not remove exactly one hook: $reply" }
+    $removed++
+
+    [void](Send-Cmd $p 'sleep 200')
 }
-$script += "exit`n"
 
-# Force BOM-less UTF-8 into the pipe (same reason as hook_smoke.ps1).
-$OutputEncoding = New-Object System.Text.UTF8Encoding $false
-$out = $script | & $exe attach 'v8i_hook_target.exe' 2>&1 | Out-String
-Write-Host $out.Trim()
-
-$installed = ([regex]::Matches($out, '"id":\d+,')).Count
-if ($installed -lt $cycles) { Fail "expected $cycles hook installs, got $installed : $out" }
-$removed = ([regex]::Matches($out, '"removed":1')).Count
-if ($removed -lt $cycles) { Fail "expected $cycles unhook cycles, got $removed : $out" }
+if ($installed -ne $cycles -or $removed -ne $cycles) {
+    Fail "cycles incomplete: installed=$installed removed=$removed"
+}
 
 # The calls came from four worker threads: the trace must show at least two
 # distinct thread ids, otherwise the engine recorded only one of them.
-$tids = [regex]::Matches($out, '"tid":(\d+)') |
-    ForEach-Object { $_.Groups[1].Value } |
-    Sort-Object -Unique
-if ($tids.Count -lt 2) {
-    Fail ("trace captured calls from " + $tids.Count + " thread(s), expected >= 2 : " + $out)
+if ($allTids.Count -lt 2) {
+    Fail ("trace captured calls from " + $allTids.Count + " thread(s), expected >= 2")
 }
-Write-Host ("trace tids: " + ($tids -join ','))
+Write-Host ("trace tids: " + ($allTids -join ',') + "; install retries: $retries")
+
+$p.StandardInput.WriteLine('exit')
+$p.StandardInput.Flush()
+$p.StandardInput.Close()
+if (-not $p.WaitForExit(20000)) { Fail "attach session did not exit" }
 
 # The target must finish the hammer run on its own, with green self-checks.
 if (-not $script:proc.WaitForExit(40000)) { Fail "stress target did not exit in time" }
@@ -120,43 +186,28 @@ $script:proc2 = Start-Process -FilePath $target `
 $tick2 = Wait-AddressLine $outFile2 $script:proc2
 if (-not $tick2) { Fail "target (kill scenario) did not report its function address" }
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $exe
-$psi.Arguments = 'attach v8i_hook_target.exe'
-$psi.WorkingDirectory = $BinDir
-$psi.RedirectStandardInput = $true
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-$p = [System.Diagnostics.Process]::Start($psi)
-$outTask = $p.StandardOutput.ReadToEndAsync()
-$errTask = $p.StandardError.ReadToEndAsync()
-$in = $p.StandardInput
+$p2 = Start-Session
 
 # Injection plus handshake takes ~2 s (up to more on a slow CI runner); only
 # after the hook has been answered is the session in a known state.
-$in.WriteLine('hook ' + $tick2)
-$in.Flush()
-Start-Sleep -Milliseconds 5000
-$in.WriteLine('sleep 3000')
-$in.Flush()
-Start-Sleep -Milliseconds 1500         # the host is inside its sleep now
+$reply = Send-Cmd $p2 "hook $tick2" 60000
+if ($reply -notmatch '"id":\d+') { Fail "hook install failed (kill scenario): $reply" }
+[void](Send-Cmd $p2 'sleep 3000')
+
 Stop-Process -Id $script:proc2.Id -Force
 Write-Host "target killed mid-session"
 Start-Sleep -Milliseconds 200
-$in.WriteLine('exit')                  # end the session; no command in flight
-$in.Flush()
-$in.Close()
+$p2.StandardInput.WriteLine('exit')    # end the session; no command in flight
+$p2.StandardInput.Flush()
+$p2.StandardInput.Close()
 
 # Bounded termination is the whole point: a hang here is the failure.
-if (-not $p.WaitForExit(45000)) {
+if (-not $p2.WaitForExit(45000)) {
     Fail "attach session did not terminate within 45 s after the target died"
 }
-$tail = $outTask.Result
-$tail = $tail.Substring([Math]::Max(0, $tail.Length - 200))
-Write-Host "attach session ended: $tail"
-Remove-Item $outFile2 -ErrorAction SilentlyContinue
+Write-Host "attach session ended"
 
 Get-Process -Name 'v8i_hook_target' -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process -Name 'v8inject' -ErrorAction SilentlyContinue | Stop-Process -Force
 Write-Host "hook stress test passed"
 exit 0
