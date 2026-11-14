@@ -3863,17 +3863,18 @@ void MenuReposition(HWND frame) {
     }
     // While the mouse is captured by a modal loop on this thread (1C's native
     // menu tracking after a forwarded click, our own popups, a drag), or right
-    // after a forwarded click, leave the row to 1C and hide the replica: a UIA
-    // re-query from the UI thread re-enters 1C's provider while that thread
-    // runs the menu's modal loop, and on a live 8.3.27.2342 that froze the
-    // Configurator when the user opened the native «Окна» menu from the
-    // overlay replica. Hiding is correct on its own: with the overlay gone the
-    // real native buttons are back, and hover navigation across the top-level
-    // menus works again. The pause lifts after 10 s (the menu is long closed by
-    // then); a capture that is still held keeps it on regardless.
+    // after a forwarded click, leave the overlay strictly alone: do not re-query
+    // UIA, do not raise it, do not hide it. A UIA re-query from the UI thread
+    // re-enters 1C's provider while that thread runs the menu's modal loop, and
+    // on a live 8.3.27.2342 that froze the Configurator when the user opened
+    // the native «Окна» menu from the overlay replica. The overlay itself stays
+    // up -- hiding it would pull the «GitBar» item off the row together with
+    // the replicas (that was the first attempt: no hang, but the item visibly
+    // vanished for the whole pause). While the menu keeps the capture the
+    // overlay receives no mouse input anyway, so the replicas just sit there
+    // until the menu closes. The pause lifts after 10 s.
     if (GetCapture() != nullptr ||
         (g_menu.forwardedAt != 0 && GetTickCount() - g_menu.forwardedAt < 10000)) {
-        if (g_menu.hwnd) { ShowWindow(g_menu.hwnd, SW_HIDE); g_menu.hover = -1; }
         return;
     }
     RECT fr{}; GetWindowRect(frame, &fr);
