@@ -87,9 +87,11 @@ struct MMState {
     GUID group{};
     uintptr_t groupBytes = 0;       // 32 байта: GUID + номер (для mmIsOurs)
     uintptr_t svc = 0, manager = 0, src = 0, proc = 0;
+    int getServiceSlot = 14;        // кандидат слота getService SCOM_Process
     bool built = false;             // registerCommands/addBand/addSource прошли
     bool failed = false;            // непоправимый шаг, повторять бессмысленно
     bool confirmed = false;         // платформа запросила updateState нашего popup
+    const char* stage = "?";        // текущий шаг — логируется при падении
     char err[160] = {};
     // перехваты на приёмнике главного окна
     uintptr_t* recvVt = nullptr;
@@ -307,6 +309,10 @@ LRESULT CALLBACK MMSubclassProc(HWND h, UINT m, WPARAM w, LPARAM l,
             p->fn(p->arg);
             p->rc = 0;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Имя текущего шага — главная диагностика: журнал показывает
+            // точный вызов платформы, на котором поток упал.
+            LogLine("mainmenu: шаг «%s» упал (0x%08X)",
+                    g_mm.stage ? g_mm.stage : "?", GetExceptionCode());
             p->rc = -1;
         }
         InterlockedExchange(&p->done, 1);
@@ -350,10 +356,10 @@ bool MMEnsureMarshal(HWND* out) {
 }
 
 // Один шаг построения/перестройки — строго на UI-потоке платформы.
-bool MMRunOnUi(void (*fn)(void*), void* arg) {
+bool MMRunOnUi(void (*fn)(MMState*), MMState* arg) {
     HWND h = nullptr;
     if (!MMEnsureMarshal(&h)) return false;
-    g_mmPending.fn = fn;
+    g_mmPending.fn = (void (*)(void*))fn;
     g_mmPending.arg = arg;
     g_mmPending.rc = -2;
     InterlockedExchange(&g_mmPending.done, 0);
@@ -458,44 +464,59 @@ __declspec(naked) static void MMTransmitTrapX86() {
 #endif
 
 // --- построение (на UI-потоке через маршал) ---------------------------------
+//
+// Каждый шаг — отдельный маршал-вызов со своим именем: падение шага ловится
+// SEH-обработчиком маршала (в журнале — «шаг «имя» упал»), а рабочий поток
+// решает — повторить цепочку или отказаться. Первый большой MMBuildStep падал
+// целиком и бесконечно повторялся без диагностики (live 8.3.27.2342).
 
-void MMBuildStep(void* arg) {
-    MMState* m = (MMState*)arg;
+void MMStepProcess(MMState* m) {
+    m->stage = "current_process";
     m->proc = MMCurrentProcess();
-    if (!m->proc) { m->failed = true; strcpy_s(m->err, "current_process() не найден"); return; }
+    if (!m->proc) { m->failed = true; strcpy_s(m->err, "current_process() не найден"); }
+}
 
+void MMStepGetService(MMState* m) {
     GUID iidSvc = MMGuid(kMMIidSvcStr);
-    m->svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + kMMSlotProcGetService * 8),
-                     m->proc, (uintptr_t)&iidSvc);
-    if (!m->svc) { m->failed = true; strcpy_s(m->err, "нет ICommandService"); return; }
-    uintptr_t svcVt = *(uintptr_t*)m->svc;
-    if (!IsReadable((void*)svcVt, 16 * sizeof(void*))) {
-        m->failed = true; strcpy_s(m->err, "vtable ICommandService нечитаем"); return;
-    }
+    uintptr_t svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + m->getServiceSlot * 8),
+                            m->proc, (uintptr_t)&iidSvc);
+    if (!svc) return;
+    uintptr_t svcVt = *(uintptr_t*)svc;
+    if (!IsReadable((void*)svcVt, 16 * sizeof(void*))) return;
+    m->svc = svc;
+    LogLine("mainmenu: ICommandService на слоте %d (svc=0x%llX)",
+            m->getServiceSlot, (unsigned long long)svc);
+}
 
+void MMStepManager(MMState* m) {
+    m->stage = "менеджер панелей";
     m->manager = *(uintptr_t*)(m->svc + kMMManagerOff);
-    if (!m->manager) { m->failed = true; strcpy_s(m->err, "нет менеджера панелей"); return; }
+    if (!m->manager) { strcpy_s(m->err, "нет менеджера панелей"); return; }
     uintptr_t mgrVt = *(uintptr_t*)m->manager;
     if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) {
-        m->failed = true; strcpy_s(m->err, "vtable менеджера нечитаем"); return;
+        strcpy_s(m->err, "vtable менеджера нечитаем");
+        return;
     }
+    LogLine("mainmenu: менеджер панелей 0x%llX", (unsigned long long)m->manager);
+}
 
-    // образцы пунктов — у живых панелей платформы
+void MMStepTemplates(MMState* m) {
+    m->stage = "образцы пунктов";
     GUID frameGroup = MMGuid(kMMFrameStr);
     uintptr_t tmplPopup = MMTemplate(m->manager, frameGroup, 1);
     uintptr_t tmplLeaf = MMTemplate(m->manager, frameGroup, kMMServiceBandNum);
-    if (!tmplPopup || !tmplLeaf) {
-        m->failed = true;
-        strcpy_s(m->err, "не найдены образцы пунктов");
-        return;
-    }
+    if (!tmplPopup || !tmplLeaf) { strcpy_s(m->err, "не найдены образцы пунктов"); return; }
+    LogLine("mainmenu: образцы пунктов получены (popup=0x%llX leaf=0x%llX)",
+            (unsigned long long)tmplPopup, (unsigned long long)tmplLeaf);
+}
 
-    // 1. команды нашей группы
-    uintptr_t bundle = MMNewAnsi("frame");
-    uintptr_t entries = MMAlloc(kMMEntrySize * 2);
+void MMStepRegister(MMState* m) {
+    m->stage = "registerCommands";
     GUID group = MMGuid(kMMGroupStr);
     GUID catPopup = MMGuid(kMMCatPopupStr);
     GUID catOwn = MMGuid(kMMCatOwnStr);
+    uintptr_t bundle = MMNewAnsi("frame");
+    uintptr_t entries = MMAlloc(kMMEntrySize * 2);
     memcpy((void*)entries,
            (void*)MMCmdEntry(group, kMMPopupNum, catPopup, "GitBarPopup", bundle),
            kMMEntrySize);
@@ -505,17 +526,28 @@ void MMBuildStep(void* arg) {
     uintptr_t svt = *(uintptr_t*)m->svc;
     MMCall3(*(uintptr_t*)(svt + kMMSlotRegisterCommands * 8),
             m->svc, bundle, entries, 2);
+    m->stage = "тексты пунктов";
     MMSetCommandText(m->svc, group, kMMPopupNum, L"GitBar");
     MMSetCommandText(m->svc, group, kMMSettingsNum, L"Настройки");
+    LogLine("mainmenu: команды группы зарегистрированы");
+}
 
-    // 2. источник панелей: пункт в «Сервисе» и содержимое popup
+void MMStepSource(MMState* m) {
+    m->stage = "источник панелей";
+    GUID frameGroup = MMGuid(kMMFrameStr);
+    GUID group = MMGuid(kMMGroupStr);
+    // образцы заново: между register и source платформа могла перестроиться
+    uintptr_t tmplPopup = MMTemplate(m->manager, frameGroup, 1);
+    uintptr_t tmplLeaf = MMTemplate(m->manager, frameGroup, kMMServiceBandNum);
+    if (!tmplPopup || !tmplLeaf) { strcpy_s(m->err, "не найдены образцы пунктов"); return; }
+
     uintptr_t clsid = MMAlloc(16), iid = MMAlloc(16), outp = MMAlloc(16);
     MMPutGuid(clsid, MMGuid(kMMClsidCIStr));
     MMPutGuid(iid, MMGuid(kMMIidCIStr));
     MMCall3(*(uintptr_t*)(*(uintptr_t*)m->proc + kMMSlotProcCreate * 8),
             m->proc, clsid, iid, outp);
     m->src = *(uintptr_t*)outp;
-    if (!m->src) { m->failed = true; strcpy_s(m->err, "не создан источник панелей"); return; }
+    if (!m->src) { strcpy_s(m->err, "не создан источник панелей"); return; }
 
     // разделитель перед пунктом: образец — разделитель панели «Сервис»
     uintptr_t sepTmpl = 0;
@@ -552,8 +584,12 @@ void MMBuildStep(void* arg) {
     MMCall3(*(uintptr_t*)(sv + kMMSlotAddBand * 8), m->src,
             MMNewCid(group, kMMPopupNum), MMVector(popItems, 1), 0);
     MMCall0(*(uintptr_t*)(sv + kMMSlotFinish * 8), m->src);
+    LogLine("mainmenu: панели подключены (разделитель %s)",
+            sepTmpl ? "найден" : "нет образца");
+}
 
-    // 3. перехваты на приёмнике главного окна
+void MMStepTraps(MMState* m) {
+    m->stage = "перехваты приёмника";
     int txSlot = 0, updSlot = 0, hasSlot = 0;
     void* recv = nullptr;
     uintptr_t* recvVt = nullptr;
@@ -564,19 +600,17 @@ void MMBuildStep(void* arg) {
         m->recv = recv;
         m->recvVt = recvVt;
         m->groupBytes = MMAlloc(32);
-        MMPutGuid(m->groupBytes, group);
+        MMPutGuid(m->groupBytes, MMGuid(kMMGroupStr));
         LogLine("mainmenu: перехваты установлены на приёмник 0x%llX",
                 (unsigned long long)(uintptr_t)recv);
     } else {
         LogLine("mainmenu: приёмник для перехватов не получен — пункты останутся неактивными");
     }
-
     m->built = true;
     LogLine("mainmenu: пункт «GitBar» добавлен в меню «Сервис»");
 }
 
-void MMRebuildStep(void* arg) {
-    MMState* m = (MMState*)arg;
+void MMRebuildStep(MMState* m) {
     if (!m->manager) return;
     uintptr_t vt = *(uintptr_t*)m->manager;
     MMCall0(*(uintptr_t*)(vt + kMMSlotRebuild * 8), m->manager);
@@ -640,25 +674,71 @@ void MMWorkerInner() {
         return;
     }
     bool is85 = false;
-    if (!MMSupported(&is85)) return;
+    if (!MMSupported(&is85)) {
+        LogLine("mainmenu: версия платформы не поддержана — пункт не добавлен");
+        return;
+    }
     if (is85) {
         LogLine("mainmenu: 8.5 — приёмник для перехватов ещё не подключён, пункт не добавлен");
         return;
     }
-    for (int attempt = 0; attempt < 40 && !g_mm.built && !g_mm.failed; ++attempt) {
-        LogLine("mainmenu: попытка построения %d", attempt + 1);
-        MMRunOnUi(MMBuildStep, &g_mm);
-        if (g_mm.built || g_mm.failed) break;
-        Sleep(2500);   // рамка/маршал ещё не готовы
-    }
-    if (!g_mm.built) {
-        LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "построение не удалось за отведённые попытки");
+
+    // 1. current_process — именованный экспорт ядра.
+    g_mm.stage = "current_process";
+    if (!MMRunOnUi(MMStepProcess, &g_mm) || !g_mm.proc) {
+        LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "current_process не получен");
         return;
     }
-    if (g_mm.failed) {
-        LogLine("mainmenu: %s", g_mm.err);
+
+    // 2. getService: слот не выверен на живой 2342 — кандидаты по порядку,
+    //    каждый под SEH маршала; неверный слот ловится и пропускается.
+    const int svcSlots[] = { 14, 13, 15, 12, 16 };
+    bool svcFound = false;
+    char stage[64];
+    for (int slot : svcSlots) {
+        g_mm.getServiceSlot = slot;
+        _snprintf_s(stage, sizeof(stage), _TRUNCATE, "getService слот %d", slot);
+        g_mm.stage = stage;
+        if (MMRunOnUi(MMStepGetService, &g_mm) && g_mm.svc) {
+            svcFound = true;
+            break;
+        }
+        LogLine("mainmenu: слот %d не подошёл, пробуем следующий", slot);
+    }
+    if (!svcFound) {
+        LogLine("mainmenu: getService не найден ни на одном кандидате слотов");
         return;
     }
+
+    // 3. цепочка построения: шаги по отдельности, падение шага — повтор цепочки.
+    struct MMStepDef { const char* name; void (*fn)(MMState*); };
+    const MMStepDef steps[] = {
+        {"менеджер панелей", MMStepManager},
+        {"образцы пунктов",  MMStepTemplates},
+        {"registerCommands", MMStepRegister},
+        {"источник панелей", MMStepSource},
+        {"перехваты",        MMStepTraps},
+    };
+    bool built = false;
+    for (int attempt = 1; attempt <= 8 && !built; ++attempt) {
+        LogLine("mainmenu: цепочка построения, попытка %d", attempt);
+        bool ok = true;
+        for (const MMStepDef& s : steps) {
+            g_mm.stage = s.name;
+            if (!MMRunOnUi(s.fn, &g_mm)) {
+                LogLine("mainmenu: шаг «%s» не прошёл (попытка %d)", s.name, attempt);
+                ok = false;
+                break;
+            }
+        }
+        if (ok) built = true;
+        else Sleep(2500);
+    }
+    if (!built) {
+        LogLine("mainmenu: %s", g_mm.err[0] ? g_mm.err : "цепочка построения не прошла");
+        return;
+    }
+
     // Платформа отбрасывает перестройку, пока достраивает меню (загрузка
     // конфигурации, восстановление окон), сигнала готовности нет — запрос
     // updateState нашего popup приходит только от нарисованного пункта.
@@ -679,8 +759,8 @@ DWORD WINAPI MMWorkerThread(LPVOID) {
     __try {
         MMWorkerInner();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogLine("mainmenu: поток упал (0x%08X), пункт не добавлен — 1С не тронута",
-                GetExceptionCode());
+        LogLine("mainmenu: поток упал (0x%08X) на шаге «%s», пункт не добавлен — 1С не тронута",
+                GetExceptionCode(), g_mm.stage ? g_mm.stage : "?");
     }
     return 0;
 }
