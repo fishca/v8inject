@@ -468,9 +468,17 @@ void MMBuildStep(void* arg) {
     m->svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + kMMSlotProcGetService * 8),
                      m->proc, (uintptr_t)&iidSvc);
     if (!m->svc) { m->failed = true; strcpy_s(m->err, "нет ICommandService"); return; }
+    uintptr_t svcVt = *(uintptr_t*)m->svc;
+    if (!IsReadable((void*)svcVt, 16 * sizeof(void*))) {
+        m->failed = true; strcpy_s(m->err, "vtable ICommandService нечитаем"); return;
+    }
 
     m->manager = *(uintptr_t*)(m->svc + kMMManagerOff);
     if (!m->manager) { m->failed = true; strcpy_s(m->err, "нет менеджера панелей"); return; }
+    uintptr_t mgrVt = *(uintptr_t*)m->manager;
+    if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) {
+        m->failed = true; strcpy_s(m->err, "vtable менеджера нечитаем"); return;
+    }
 
     // образцы пунктов — у живых панелей платформы
     GUID frameGroup = MMGuid(kMMFrameStr);
@@ -585,8 +593,11 @@ bool MMSupported(bool* is85) {
     // Внутри процесса база модуля — это и есть HMODULE: путь берём без psapi.
     wchar_t path[MAX_PATH] = {};
     if (!GetModuleFileNameW((HMODULE)m.base, path, MAX_PATH)) return false;
-    // версия файла — через version.dll динамически (hermetic-сборка, без импорта)
-    HMODULE ver = LoadLibraryW(L"version.dll");
+    // версия файла — через version.dll динамически (hermetic-сборка, без импорта);
+    // version.dll в GUI-процессе уже загружена — сначала GetModuleHandleW,
+    // чтобы не звать LoadLibrary в первые секунды после инъекции.
+    HMODULE ver = GetModuleHandleW(L"version.dll");
+    if (!ver) ver = LoadLibraryW(L"version.dll");
     if (!ver) return false;
     typedef DWORD(WINAPI* FnSize)(LPCWSTR);
     typedef BOOL(WINAPI* FnGet)(LPCWSTR, DWORD, DWORD, LPVOID);
@@ -619,27 +630,36 @@ bool MMNativeMenuEnabled() {
     return IniGet(V8iGitBarIniPath(), L"git", L"nativemenu", L"1") != L"0";
 }
 
-DWORD WINAPI MMWorkerThread(LPVOID) {
-    if (!MMNativeMenuEnabled()) return 0;
+// Тело рабочего потока. Вызывается из SEH-обёртки: любое исключение в нашем
+// потоке не должно убивать 1С (payload-правило «каждый поток под SEH»).
+// Первая версия потока работала без обёртки — исключение на первом шаге
+// роняло конфигуратор (live 8.3.27.2342, AV через 1 мс после старта).
+void MMWorkerInner() {
+    LogLine("mainmenu: поток запущен, ждём устояния платформы");
+    Sleep(3000);
+    if (!MMNativeMenuEnabled()) {
+        LogLine("mainmenu: отключён ([git] nativemenu=0)");
+        return;
+    }
     bool is85 = false;
-    if (!MMSupported(&is85)) return 0;
+    if (!MMSupported(&is85)) return;
     if (is85) {
         LogLine("mainmenu: 8.5 — приёмник для перехватов ещё не подключён, пункт не добавлен");
-        return 0;
+        return;
     }
-    Sleep(3000);   // платформа достраивает окна после старта
     for (int attempt = 0; attempt < 40 && !g_mm.built && !g_mm.failed; ++attempt) {
+        LogLine("mainmenu: попытка построения %d", attempt + 1);
         MMRunOnUi(MMBuildStep, &g_mm);
         if (g_mm.built || g_mm.failed) break;
         Sleep(2500);   // рамка/маршал ещё не готовы
     }
     if (!g_mm.built) {
         LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "построение не удалось за отведённые попытки");
-        return 0;
+        return;
     }
     if (g_mm.failed) {
         LogLine("mainmenu: %s", g_mm.err);
-        return 0;
+        return;
     }
     // Платформа отбрасывает перестройку, пока достраивает меню (загрузка
     // конфигурации, восстановление окон), сигнала готовности нет — запрос
@@ -654,6 +674,15 @@ DWORD WINAPI MMWorkerThread(LPVOID) {
         V8iGitBarSetNativeMenu();
     } else {
         LogLine("mainmenu: updateState пункта не пришёл за отведённые перестройки");
+    }
+}
+
+DWORD WINAPI MMWorkerThread(LPVOID) {
+    __try {
+        MMWorkerInner();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("mainmenu: поток упал (0x%08X), пункт не добавлен — 1С не тронута",
+                GetExceptionCode());
     }
     return 0;
 }
