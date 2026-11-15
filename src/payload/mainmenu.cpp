@@ -611,6 +611,18 @@ bool MMNativeMenuEnabled() {
 // потоке не должно убивать 1С (payload-правило «каждый поток под SEH»).
 void MMWorkerInner() {
     LogLine("mainmenu: поток запущен, ждём устояния платформы");
+    // 0b. перехват обёртки getService: 1С сама передаёт в неё SCOM_Process.
+    // Хуки на ОБЕ обёртки getService: 1cv8.exe+0xBFCB0 и config.dll+0xCF320
+    // (обе калиброваны для 8.3.27.2342 x64 по статическому анализу xref
+    // IID_ICommandService). Живые вызовы идут через config.dll.
+    ModuleRange exeM;
+    if (FindModule(L"1cv8.exe", exeM)) {
+        std::string hookErr;
+        uint32_t hookId = HookInstallObserved(exeM.base + kMMWrapperRva,
+                "getServiceWrapper", MMObsTakeProc, hookErr);
+        LogLine("mainmenu: хук обёртки getService (1cv8+0xBFCB0): %s",
+                hookId ? "установлен" : hookErr.c_str());
+    }
     Sleep(3000);
     if (!MMNativeMenuEnabled()) {
         LogLine("mainmenu: отключён ([git] nativemenu=0)");
@@ -654,30 +666,39 @@ void MMWorkerInner() {
     LogLine("mainmenu: приёмник 0x%llX (core 0x%llX, рамка 0x%llX), слоты tx/upd/has %d/%d/%d",
             (unsigned long long)(uintptr_t)recv, (unsigned long long)(uintptr_t)core,
             (unsigned long long)(uintptr_t)frameObj, txSlot, updSlot, hasSlot);
-
-    // 0b. перехват обёртки getService: 1С сама передаёт в неё SCOM_Process.
-    ModuleRange exeM;
-    if (FindModule(L"1cv8.exe", exeM)) {
+    ModuleRange cfgM;
+    if (FindModule(L"config.dll", cfgM)) {
         std::string hookErr;
-        uint32_t hookId = HookInstallObserved(exeM.base + kMMWrapperRva,
-                "getServiceWrapper", MMObsTakeProc, hookErr);
-        LogLine("mainmenu: хук обёртки getService (1cv8+0xBFCB0): %s",
+        constexpr uintptr_t kMMCfgWrapperRva = 0xCF320;   // 8.3.27.2342 x64
+        uint32_t hookId = HookInstallObserved(cfgM.base + kMMCfgWrapperRva,
+                "getServiceWrapperCfg", MMObsTakeProc, hookErr);
+        LogLine("mainmenu: хук обёртки getService (config+0xCF320): %s",
                 hookId ? "установлен" : hookErr.c_str());
     }
 
-    // 1. QueryInterface за ICommandService (UI-поток): захваченный объект —
-    //    первый кандидат, затем приёмник/core/рамка. Сервис может
-    //    регистрироваться позже — ретраи до минуты.
-    bool svcFound = false;
-    for (int i = 0; i < 20 && !svcFound; ++i) {
-        m->stage = "QueryInterface";
-        m->svc = 0;
-        m->manager = 0;
-        v8i::V8iRunOnUi(MMStepQI, m);
-        if (m->svc && m->manager) { svcFound = true; break; }
+
+    // 1. ожидание захвата объекта через хуки обёрток (до 5 минут; журнал
+    //    каждые 15 с). Обёртка getService вызывается платформой при работе
+    //    с командами — провоцируется отправкой команд дизайнера.
+    for (int i = 0; i < 100 && !g_mm.proc; ++i) {
+        if ((i % 5) == 4)
+            LogLine("mainmenu: ожидание захвата объекта через хук (%d с)", (i + 1) * 3);
         Sleep(3000);
     }
-    if (!svcFound) {
+    if (!g_mm.proc) {
+        LogLine("mainmenu: обёртка не вызвана платформой — пункт не добавлен");
+        return;
+    }
+    LogLine("mainmenu: объект процесса 0x%llX — QI за ICommandService",
+            (unsigned long long)g_mm.proc);
+
+    // 2. QueryInterface за ICommandService (UI-поток): захваченный объект —
+    //    первый кандидат, затем приёмник/core/рамка.
+    m->stage = "QueryInterface";
+    m->svc = 0;
+    m->manager = 0;
+    v8i::V8iRunOnUi(MMStepQI, m);
+    if (!(m->svc && m->manager)) {
         LogLine("mainmenu: QI не дал ICommandService — пробуем getService (слот 14)");
         m->stage = "getService слот 14";
         m->svc = 0;
@@ -689,7 +710,7 @@ void MMWorkerInner() {
         }
     }
 
-    // 2. цепочка построения: образцы, registerCommands, источник, перехваты.
+    // 3. цепочка построения: образцы, registerCommands, источник, перехваты.
     struct MMStepDef { const char* name; void (*fn)(void*); };
     const MMStepDef steps[] = {
         {"образцы пунктов",  MMStepTemplates},
@@ -716,7 +737,6 @@ void MMWorkerInner() {
         LogLine("mainmenu: %s", m->err[0] ? m->err : "цепочка построения не прошла");
         return;
     }
-
     // Платформа отбрасывает перестройку, пока достраивает меню (загрузка
     // конфигурации, восстановление окон), сигнала готовности нет — запрос
     // updateState нашего popup приходит только от нарисованного пункта.
