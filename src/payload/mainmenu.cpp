@@ -1,4 +1,4 @@
-// Нативный пункт «GitBar» в главном меню Конфигуратора.
+﻿// Нативный пункт «GitBar» в главном меню Конфигуратора.
 //
 // Платформа не даёт публичного API для добавления пунктов в главное меню, но
 // рисует его из внутренних «панелей» (bands): панель — CommandID {GUID группы,
@@ -433,10 +433,17 @@ void MMStepGetService(void* arg) {
                             m->proc, (uintptr_t)&iidSvc);
     if (!svc) return;
     uintptr_t svcVt = *(uintptr_t*)svc;
-    if (!IsReadable((void*)svcVt, 16 * sizeof(void*))) return;
+    if (!IsReadable((void*)svcVt, 20 * sizeof(void*))) return;
+    // Поведенческая проверка слота: у ICommandService на [svc+0xD0] лежит
+    // менеджер панелей с читаемой vtable. Неверный слот отсекается здесь.
+    uintptr_t manager = *(uintptr_t*)(svc + kMMManagerOff);
+    if (!manager) return;
+    uintptr_t mgrVt = *(uintptr_t*)manager;
+    if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) return;
     m->svc = svc;
-    LogLine("mainmenu: ICommandService на слоте %d (svc=0x%llX)",
-            m->getServiceSlot, (unsigned long long)svc);
+    m->manager = manager;
+    LogLine("mainmenu: ICommandService на слоте %d (svc=0x%llX, менеджер 0x%llX)",
+            m->getServiceSlot, (unsigned long long)svc, (unsigned long long)manager);
 }
 
 void MMStepManager(void* arg) {
@@ -677,7 +684,10 @@ void MMWorkerInner() {
 
     // 2. getService: слот не выверен на живой 2342 — кандидаты по порядку,
     //    каждый под SEH маршала; неверный слот ловится и пропускается.
-    const int svcSlots[] = { 14, 13, 15, 12, 16 };
+    // Слот getService не выверен документально — перебор 8..24: неверные ловятся
+    // SEH маршала, правильный подтверждается менеджером на [svc+0xD0].
+    int svcSlots[17];
+    for (int i = 0; i < 17; ++i) svcSlots[i] = 8 + i;
     bool svcFound = false;
     for (int slot : svcSlots) {
         g_mm.getServiceSlot = slot;
