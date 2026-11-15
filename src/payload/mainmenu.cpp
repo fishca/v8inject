@@ -10,18 +10,18 @@
 // engine/mainmenu.as, v8api/process.v); эта реализация — перевод того рецепта
 // на C++ payloads v8inject.
 //
-// Точка входа в сервисы — именованный экспорт ядра
-// ?current_process@core@@… (process.v:43), getService — слот 14 SCOM_Process.
-// Наши команды живут в отдельной группе и перехватываются на приёмнике
-// главного окна: vtable-патч updateState/hasHandler/transmitCommand, команды
-// нашей группы на платформу не уходят.
+// Объект процесса берётся не из ?current_process@core (тот возвращает объект,
+// у которого getService отвечает null на live 8.3.27.2342), а перехватом
+// обёртки getService в 1cv8.exe (rva 0xBFCB0, калибровка 2342 x64): 1С сама
+// передаёт в неё настоящий SCOM_Process — наблюдатель хука его захватывает.
+// Слоты getService = 14 подтверждены той же обёрткой (call [rax+0x70]).
 //
-// Ветки раскладки v8snack: 8.3.27 и 8.5 совпадают (запись 0x68, SSO-текст).
-// Здесь подключена 8.3.27; на прочих версиях пункт не добавляется.
+// Ветки раскладки v8snack: 8.3.27 и 8.5 совпадают (entry 0x68, SSO-текст).
 // Наши тексты («GitBar», «Настройки») короче 10 символов и целиком помещаются
 // в SSO-описание команды — ICommandState.setText не требуется.
 
 #include "v8inject/diag.h"
+#include "v8inject/hook.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/v8i_export.h"
@@ -35,11 +35,8 @@
 namespace v8i {
 
 // Из src/payload/gitbar.cpp (namespace v8i).
-const wchar_t* V8iGitBarIniPath();
-void V8iGitBarSetNativeMenu();
 void V8iGitBarMenuAction(unsigned num);
-
-namespace {
+void V8iGitBarSetNativeMenu();
 
 // --- константы рецепта (v8snack mainmenu.as:10-30, MAINMENU.md §2-§6) ------
 
@@ -49,6 +46,7 @@ const wchar_t kMMCatOwnStr[] = L"{8B4A6E2F-7D31-4A9C-B5F4-2C6E9D1A47B4}";    // 
 const wchar_t kMMFrameStr[] = L"{B78F2E80-EC68-11D4-9DCF-0050BAE2BC79}";     // группа команд главного окна
 const wchar_t kMMClsidCIStr[] = L"{F459D5F0-E7C0-11D4-9DCD-0050BAE2BC79}";   // CommandInterface
 const wchar_t kMMIidCIStr[] = L"{7DF15090-7A63-11D4-84A1-008048DA06DF}";
+const wchar_t kMMIidSvcStr[] = L"{8F885821-D353-11D3-8A57-008048DA06DF}";   // IID ICommandService
 const unsigned kMMPopupNum = 1;       // popup «GitBar»
 const unsigned kMMSettingsNum = 2;    // «Настройки»
 const unsigned kMMServiceBandNum = 52;   // панель меню «Сервис» ({MM_FRAME}/52)
@@ -68,17 +66,20 @@ constexpr int kMMSlotAddSource = 10;        // менеджер: подключ�
 constexpr int kMMSlotRebuild = 13;          // менеджер: перестроить панели
 constexpr int kMMSlotAddBand = 4;           // источник: addBand(CommandID*, vector*, bool)
 constexpr int kMMSlotFinish = 13;           // источник: завершить
-constexpr int kMMSlotProcCreate = 5;        // SCOM_Process.createByClsid
-constexpr int kMMSlotProcGetService = 14;   // SCOM_Process.getService (process.v)
+constexpr int kMMSlotProcCreate = 5;        // SCOM_Process.createByClsid (v8snack, live)
+constexpr int kMMSlotProcGetService = 14;   // SCOM_Process.getService — обёртка
+                                            // 1cv8.exe зовёт [rax+0x70] (2342)
 constexpr int kMMSlotStateId = 3;           // ICommandState.id()
 constexpr int kMMSlotStateEnable = 6;       // ICommandState.enable(bool)
 constexpr size_t kMMItemSize = 0x70;
 constexpr size_t kMMEntrySize = 0x68;
 constexpr size_t kMMEStr = 0x40, kMMEInt1 = 0x58, kMMEInt2 = 0x5C, kMMEByte = 0x60;
 
-const char kMMExportX64[] = "?current_process@core@@YAPEAVSCOM_Process@1@XZ";
-const char kMMExportX86[] = "?current_process@core@@YAPAVSCOM_Process@1@XZ";
-const wchar_t kMMIidSvcStr[] = L"{8F885821-D353-11D3-8A57-008048DA06DF}";   // IID ICommandService
+// Обёртка getService внутри 1cv8.exe (8.3.27.2342 x64, rva 0xBFCB0):
+// test rcx / mov rax,[rcx] / lea rdx,[IID_ICommandService] / call [rax+0x70].
+// Смещение привязано к сборке — перекалибровка по билду (дорожная карта Ф2.1);
+// на прочих версиях пункт не добавляется и работает fallback-оверлей.
+constexpr uintptr_t kMMWrapperRva = 0xBFCB0;
 
 // --- состояние --------------------------------------------------------------
 
@@ -89,10 +90,11 @@ struct MMState {
     void* core = nullptr;           // объекты цепочки рамки (для QueryInterface)
     void* frameObj = nullptr;
     int trapTx = 3, trapUpd = 4, trapHas = 5;   // слоты приёмника (8.3)
+    volatile LONG procTaken = 0;    // обёртка getService: объект захвачен
+    bool stepRan = false;           // шаг был выполнен (маршал готов)
     bool built = false;             // registerCommands/addBand/addSource прошли
     bool failed = false;            // непоправимый шаг, повторять бессмысленно
     bool confirmed = false;         // платформа запросила updateState нашего popup
-    bool stepRan = false;           // шаг был выполнен (маршал готов)
     const char* stage = "?";        // текущий шаг — логируется при падении
     char err[160] = {};
     // перехваты на приёмнике главного окна
@@ -100,7 +102,19 @@ struct MMState {
     void* recv = nullptr;
     uintptr_t origUpdate = 0, origHas = 0, origTransmit = 0;
 };
+
 MMState g_mm;
+
+// Наблюдатель хука обёртки: 1С сама передаёт сюда SCOM_Process. Захват один
+// раз; POD-правила соблюдены (Interlocked + присвоение).
+void MMObsTakeProc(uintptr_t a0, uintptr_t, uintptr_t, uintptr_t) {
+    if (!a0) return;
+    if (!g_mm.proc && InterlockedCompareExchange((volatile LONG*)&g_mm.procTaken, 1, 0) == 0) {
+        g_mm.proc = a0;
+        LogLine("mainmenu: объект процесса захвачен из обёртки getService: 0x%llX",
+                (unsigned long long)a0);
+    }
+}
 
 // --- сырые вызовы слотов ----------------------------------------------------
 
@@ -264,61 +278,6 @@ void MMSetCommandText(uintptr_t svc, const GUID& group, unsigned num, const wcha
     MMSetShort(b + 0x50, text);
 }
 
-// --- сервисы ----------------------------------------------------------------
-
-// SCOM_Process* current_process() — именованный экспорт ядра (process.v:43).
-// В Конфигураторе ядро может быть core_as.dll (именно его ядро грузит модули
-// Снегопата), поэтому ищем по всем core*-модулям; не нашли — в журнал идут
-// загруженные core*-модули и экспорты с подстрокой current_process.
-uintptr_t MMCurrentProcess() {
-#if defined(_WIN64)
-    const char* exportName = kMMExportX64;
-#else
-    const char* exportName = kMMExportX86;
-#endif
-    const wchar_t* mods[] = { L"core_as.dll", L"core83.dll", L"core85.dll", L"core.dll" };
-    for (const wchar_t* mod : mods) {
-        ModuleRange m;
-        if (!FindModule(mod, m)) continue;
-        PeImage img = ParsePe(m.base);
-        if (!img.valid) continue;
-        for (const PeExport& e : img.exports) {
-            if (e.forwarded || e.name != exportName) continue;
-            LogLine("mainmenu: current_process найден в %ls (rva 0x%X)", mod, e.rva);
-            typedef uintptr_t (*FnCurrentProcess)();
-            return ((FnCurrentProcess)(m.base + e.rva))();
-        }
-    }
-
-    // Диагностика: что вообще есть из core* и что похоже на current_process.
-    for (const ModuleRange& m : EnumModules()) {
-        const wchar_t* fname = wcsrchr(m.path.c_str(), L'\\');
-        fname = fname ? fname + 1 : m.path.c_str();
-        if (_wcsnicmp(fname, L"core", 4) != 0) continue;
-        PeImage img = ParsePe(m.base);
-        if (!img.valid) continue;
-        int hits = 0;
-        for (const PeExport& e : img.exports) {
-            if (e.name.find("current_process") == std::string::npos) continue;
-            LogLine("mainmenu: %ls экспортирует %s (rva 0x%X)", fname, e.name.c_str(), e.rva);
-            ++hits;
-        }
-        LogLine("mainmenu: модуль %ls — экспортов %zu, похожих на current_process: %d",
-                fname, img.exports.size(), hits);
-    }
-    return 0;
-}
-
-// --- маршал на UI-поток -----------------------------------------------------
-//
-// Шаги построения выполняются через ОБЩИЙ cmd-маршал (v8i::V8iRunOnUi ->
-// EnsureCmdUi -> g_pending, режим 3): у cmd-маршала проверены на живой 1С и
-// comctl32-subclass, и fallback через замену WndProc, и повторная
-// переустановка, когда 1С пересоздаёт свои окна. Собственный subclass (id 2)
-// дублировал это и промахивался: SetWindowSubclass через GetModuleHandleW
-// comctl32 в 1С недоступен, а fallback-а у собственного маршала не было
-// (live 8.3.27.2342: рамка была, маршал — нет).
-
 // --- перехваты на приёмнике -------------------------------------------------
 
 bool MMPatchSlot(uintptr_t* vt, int slot, void* hookFn, uintptr_t* origOut) {
@@ -412,23 +371,21 @@ __declspec(naked) static void MMTransmitTrapX86() {
 #define MMTransmitTrap MMTransmitTrapX86
 #endif
 
-// --- построение (на UI-потоке через маршал) ---------------------------------
-//
-// Каждый шаг — отдельный маршал-вызов со своим именем: падение шага ловится
-// SEH-обработчиком маршала (в журнале — «шаг «имя» упал»), а рабочий поток
-// решает — повторить цепочку или отказаться. Первый большой MMBuildStep падал
-// целиком и бесконечно повторялся без диагностики (live 8.3.27.2342).
+// --- шаги построения (на UI-потоке через общий cmd-маршал) ------------------
 
 // QueryInterface за ICommandService на объектах цепочки рамки (UI-поток).
 // Стандартный COM-вызов: безопасен при любом ответе (E_NOINTERFACE просто
-// отказ). Слоты SCOM_Process::getService не использованы вовсе - их
+// отказ). Слоты SCOM_Process::getService не использованы вовсе — их
 // документальной раскладки нет, а перебор вызовами деструктивен (live:
 // падение 1С).
 void MMStepQI(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
     GUID iid = MMGuid(kMMIidSvcStr);
-    uintptr_t tryObj[] = { (uintptr_t)m->recv, (uintptr_t)m->core, (uintptr_t)m->frameObj };
+    // Захваченный из обёртки объект — первый кандидат: это тот самый объект,
+    // с которым 1С сама получает сервисы.
+    uintptr_t tryObj[] = { (uintptr_t)m->proc, (uintptr_t)m->recv,
+                           (uintptr_t)m->core, (uintptr_t)m->frameObj };
     for (uintptr_t obj : tryObj) {
         if (!obj) continue;
         uintptr_t vt = *(uintptr_t*)obj;
@@ -456,6 +413,34 @@ void MMStepQI(void* arg) {
         }
     }
 }
+
+// getService на захваченном объекте, слот 14 (обёртка 1cv8.exe зовёт
+// [rax+0x70]) — fallback, если QI не дал сервис.
+void MMStepGetService(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
+    GUID iidSvc = MMGuid(kMMIidSvcStr);
+    uintptr_t svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + kMMSlotProcGetService * 8),
+                            m->proc, (uintptr_t)&iidSvc);
+    uintptr_t manager = 0;
+    if (svc) {
+        uintptr_t svcVt = *(uintptr_t*)svc;
+        if (IsReadable((void*)svcVt, 20 * sizeof(void*))) {
+            manager = *(uintptr_t*)(svc + kMMManagerOff);
+            if (manager) {
+                uintptr_t mgrVt = *(uintptr_t*)manager;
+                if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) manager = 0;
+            }
+        }
+    }
+    // Значения пишутся всегда: они и есть диагностика слота и момента.
+    LogLine("mainmenu: getService слот %d -> svc=0x%llX менеджер=0x%llX",
+            kMMSlotProcGetService, (unsigned long long)svc, (unsigned long long)manager);
+    if (!svc || !manager) return;
+    m->svc = svc;
+    m->manager = manager;
+}
+
 void MMStepTemplates(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
@@ -558,11 +543,10 @@ void MMStepTraps(void* arg) {
         MMPatchSlot(m->recvVt, m->trapUpd, (void*)&MMUpdateTrap, &m->origUpdate) &&
         MMPatchSlot(m->recvVt, m->trapHas, (void*)&MMHasTrap, &m->origHas) &&
         MMPatchSlot(m->recvVt, m->trapTx, (void*)&MMTransmitTrap, &m->origTransmit)) {
-        void* recv = m->recv;
         m->groupBytes = MMAlloc(32);
         MMPutGuid(m->groupBytes, MMGuid(kMMGroupStr));
         LogLine("mainmenu: перехваты установлены на приёмник 0x%llX",
-                (unsigned long long)(uintptr_t)recv);
+                (unsigned long long)(uintptr_t)m->recv);
     } else {
         LogLine("mainmenu: приёмник для перехватов не получен — пункты останутся неактивными");
     }
@@ -625,8 +609,6 @@ bool MMNativeMenuEnabled() {
 
 // Тело рабочего потока. Вызывается из SEH-обёртки: любое исключение в нашем
 // потоке не должно убивать 1С (payload-правило «каждый поток под SEH»).
-// Первая версия потока работала без обёртки — исключение на первом шаге
-// роняло конфигуратор (live 8.3.27.2342, AV через 1 мс после старта).
 void MMWorkerInner() {
     LogLine("mainmenu: поток запущен, ждём устояния платформы");
     Sleep(3000);
@@ -644,7 +626,6 @@ void MMWorkerInner() {
         return;
     }
 
-    MMState* m = &g_mm;
     // 0. приёмник и объекты цепочки рамки (рабочий поток, безопасно):
     //    та же дискавери+проба, что у cmd-цепочки.
     void* recv = nullptr;
@@ -662,6 +643,7 @@ void MMWorkerInner() {
         LogLine("mainmenu: приёмник не захвачен за отведённое время — пункт не добавлен");
         return;
     }
+    MMState* m = &g_mm;
     m->recv = recv;
     m->recvVt = recvVt;
     m->core = core;
@@ -673,8 +655,19 @@ void MMWorkerInner() {
             (unsigned long long)(uintptr_t)recv, (unsigned long long)(uintptr_t)core,
             (unsigned long long)(uintptr_t)frameObj, txSlot, updSlot, hasSlot);
 
-    // 1. QueryInterface за ICommandService на объектах цепочки (UI-поток).
-    //    Сервис может регистрироваться позже — ретраи до минуты.
+    // 0b. перехват обёртки getService: 1С сама передаёт в неё SCOM_Process.
+    ModuleRange exeM;
+    if (FindModule(L"1cv8.exe", exeM)) {
+        std::string hookErr;
+        uint32_t hookId = HookInstallObserved(exeM.base + kMMWrapperRva,
+                "getServiceWrapper", MMObsTakeProc, hookErr);
+        LogLine("mainmenu: хук обёртки getService (1cv8+0xBFCB0): %s",
+                hookId ? "установлен" : hookErr.c_str());
+    }
+
+    // 1. QueryInterface за ICommandService (UI-поток): захваченный объект —
+    //    первый кандидат, затем приёмник/core/рамка. Сервис может
+    //    регистрироваться позже — ретраи до минуты.
     bool svcFound = false;
     for (int i = 0; i < 20 && !svcFound; ++i) {
         m->stage = "QueryInterface";
@@ -685,8 +678,15 @@ void MMWorkerInner() {
         Sleep(3000);
     }
     if (!svcFound) {
-        LogLine("mainmenu: ICommandService недоступен через QueryInterface — пункт не добавлен");
-        return;
+        LogLine("mainmenu: QI не дал ICommandService — пробуем getService (слот 14)");
+        m->stage = "getService слот 14";
+        m->svc = 0;
+        m->manager = 0;
+        if (!v8i::V8iRunOnUi(MMStepGetService, m) || !(m->svc && m->manager)) {
+            LogLine("mainmenu: getService на захваченном объекте не подтвердился "
+                    "— пункт не добавлен");
+            return;
+        }
     }
 
     // 2. цепочка построения: образцы, registerCommands, источник, перехваты.
@@ -716,15 +716,16 @@ void MMWorkerInner() {
         LogLine("mainmenu: %s", m->err[0] ? m->err : "цепочка построения не прошла");
         return;
     }
+
     // Платформа отбрасывает перестройку, пока достраивает меню (загрузка
     // конфигурации, восстановление окон), сигнала готовности нет — запрос
     // updateState нашего popup приходит только от нарисованного пункта.
     // Ретраи по расписанию v8snack: 3 с, далее 2 с (до 40), далее 10 с, до 60.
-    for (int i = 0; i < 60 && !g_mm.confirmed; ++i) {
+    for (int i = 0; i < 60 && !m->confirmed; ++i) {
         Sleep(i == 0 ? 3000 : (i < 40 ? 2000 : 10000));
-        v8i::V8iRunOnUi(MMRebuildStep, &g_mm);
+        v8i::V8iRunOnUi(MMRebuildStep, m);
     }
-    if (g_mm.confirmed) {
+    if (m->confirmed) {
         LogLine("mainmenu: пункт «GitBar» в главном меню работает");
         V8iGitBarSetNativeMenu();
     } else {
@@ -741,8 +742,6 @@ DWORD WINAPI MMWorkerThread(LPVOID) {
     }
     return 0;
 }
-
-}  // namespace
 
 void V8iStartNativeMenu() {
     HANDLE t = CreateThread(nullptr, 0, MMWorkerThread, nullptr, 0, nullptr);
