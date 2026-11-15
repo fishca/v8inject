@@ -35,4 +35,10 @@ bool V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
 // by [git] nativemenu=0). Called once from the payload start-up.
 void V8iStartNativeMenu();
 
+// Runs a functor on the 1C UI thread through the cmd marshal (EnsureCmdUi +
+// the shared pending slot). Returns false when the marshal is not ready (the
+// frame window does not exist yet), the step crashed (logged), or the send
+// timed out.
+bool V8iRunOnUi(void (*fn)(void*), void* arg, int timeoutMs = 30000);
+
 }  // namespace v8i

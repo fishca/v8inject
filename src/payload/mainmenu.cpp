@@ -22,8 +22,6 @@
 // в SSO-описание команды — ICommandState.setText не требуется.
 
 #include "v8inject/diag.h"
-#include "v8inject/ini.h"
-#include "v8inject/objects.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/v8i_export.h"
@@ -92,6 +90,7 @@ struct MMState {
     bool built = false;             // registerCommands/addBand/addSource прошли
     bool failed = false;            // непоправимый шаг, повторять бессмысленно
     bool confirmed = false;         // платформа запросила updateState нашего popup
+    bool stepRan = false;           // шаг был выполнен (маршал готов)
     const char* stage = "?";        // текущий шаг — логируется при падении
     char err[160] = {};
     // перехваты на приёмнике главного окна
@@ -309,98 +308,14 @@ uintptr_t MMCurrentProcess() {
 }
 
 // --- маршал на UI-поток -----------------------------------------------------
-
-// Отдельный subclass рамки (id 2) со своим сообщением: не пересекается с
-// маршалом cmd (id 1, WM_APP+0x2F11) ни сообщением, ни структурой.
-struct MMPending {
-    void (*fn)(void*);
-    void* arg;
-    volatile LONG done;
-    int rc;
-};
-MMPending g_mmPending = {};
-HWND g_mmHwnd = nullptr;
-const UINT kMMCmdMsg = WM_APP + 0x2F13;
-
-LRESULT CALLBACK MMSubclassProc(HWND h, UINT m, WPARAM w, LPARAM l,
-                                UINT_PTR id, DWORD_PTR data) {
-    (void)id;
-    if (m == kMMCmdMsg) {
-        MMPending* p = (MMPending*)data;
-        __try {
-            p->fn(p->arg);
-            p->rc = 0;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Имя текущего шага — главная диагностика: журнал показывает
-            // точный вызов платформы, на котором поток упал.
-            LogLine("mainmenu: шаг «%s» упал (0x%08X)",
-                    g_mm.stage ? g_mm.stage : "?", GetExceptionCode());
-            p->rc = -1;
-        }
-        InterlockedExchange(&p->done, 1);
-        return 0;
-    }
-    return DefSubclassProc(h, m, w, l);
-}
-
-HWND MMFindFrame() {
-    // Тот же поиск рамки, что у cmd-маршала (EnsureCmdUi → EnumProcessWindows):
-    // классы рамок зависят от версии платформы, и собственный EnumWindows с
-    // «теми же» классами промахивался на живой 2342, хотя рамка была
-    // (панель была пристроена к ней). Диагностика печатает классы окон.
-    std::vector<WindowEntry> wins = EnumProcessWindows();
-    for (const WindowEntry& w : wins)
-        if (w.cls == L"V8TopLevelFrame" || w.cls.rfind(L"V8Window0", 0) == 0)
-            return w.hwnd;
-
-    static int diagCount = 0;
-    if ((diagCount++ % 10) == 0) {
-        std::string classes;
-        for (const WindowEntry& w : wins) {
-            if (w.cls.empty()) continue;
-            std::string c;
-            c.reserve(w.cls.size());
-            for (wchar_t ch : w.cls) c.push_back(ch < 128 ? (char)ch : '?');
-            classes += c + " ";
-            if (classes.size() > 220) break;
-        }
-        LogLine("mainmenu: рамка не найдена, окна процесса: %s", classes.c_str());
-    }
-    return nullptr;
-}
-
-bool MMEnsureMarshal(HWND* out) {
-    if (g_mmHwnd && IsWindow(g_mmHwnd)) { *out = g_mmHwnd; return true; }
-    HWND frame = MMFindFrame();
-    if (!frame) return false;
-    HMODULE ctl = GetModuleHandleW(L"comctl32.dll");
-    typedef BOOL(WINAPI* MMSetSubFn)(HWND, SUBCLASSPROC, UINT_PTR, DWORD_PTR);
-    MMSetSubFn setFn = ctl ? (MMSetSubFn)GetProcAddress(ctl, "SetWindowSubclass") : nullptr;
-    if (!setFn || !setFn(frame, MMSubclassProc, 2, (DWORD_PTR)&g_mmPending)) return false;
-    g_mmHwnd = frame;
-    *out = frame;
-    return true;
-}
-
-// Один шаг построения/перестройки — строго на UI-потоке платформы.
-// Таймаут 30 с и без SMTO_ABORTIFHUNG: во время загрузки базы UI-поток 1С
-// не разбирает сообщения десятки секунд — это не «зависание», и ранний
-// прерыватель превращал каждую посылку в мгновенный отказ.
-bool MMRunOnUi(void (*fn)(MMState*), MMState* arg) {
-    HWND h = nullptr;
-    if (!MMEnsureMarshal(&h)) return false;
-    g_mmPending.fn = (void (*)(void*))fn;
-    g_mmPending.arg = arg;
-    g_mmPending.rc = -2;
-    InterlockedExchange(&g_mmPending.done, 0);
-    DWORD_PTR res = 0;
-    LRESULT sent = SendMessageTimeoutW(h, kMMCmdMsg, 0, 0,
-                                       SMTO_BLOCK, 30000, &res);
-    bool ok = sent != 0 && g_mmPending.done && g_mmPending.rc == 0;
-    LogLine("mainmenu: шаг «%s» — %s", g_mm.stage ? g_mm.stage : "?",
-            ok ? "выполнен" : (sent ? "шаг упал" : "UI-поток не принял"));
-    return ok;
-}
+//
+// Шаги построения выполняются через ОБЩИЙ cmd-маршал (v8i::V8iRunOnUi ->
+// EnsureCmdUi -> g_pending, режим 3): у cmd-маршала проверены на живой 1С и
+// comctl32-subclass, и fallback через замену WndProc, и повторная
+// переустановка, когда 1С пересоздаёт свои окна. Собственный subclass (id 2)
+// дублировал это и промахивался: SetWindowSubclass через GetModuleHandleW
+// comctl32 в 1С недоступен, а fallback-а у собственного маршала не было
+// (live 8.3.27.2342: рамка была, маршал — нет).
 
 // --- перехваты на приёмнике -------------------------------------------------
 
@@ -502,13 +417,17 @@ __declspec(naked) static void MMTransmitTrapX86() {
 // решает — повторить цепочку или отказаться. Первый большой MMBuildStep падал
 // целиком и бесконечно повторялся без диагностики (live 8.3.27.2342).
 
-void MMStepProcess(MMState* m) {
+void MMStepProcess(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
     m->stage = "current_process";
     m->proc = MMCurrentProcess();
     if (!m->proc) { m->failed = true; strcpy_s(m->err, "current_process() не найден"); }
 }
 
-void MMStepGetService(MMState* m) {
+void MMStepGetService(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
     GUID iidSvc = MMGuid(kMMIidSvcStr);
     uintptr_t svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + m->getServiceSlot * 8),
                             m->proc, (uintptr_t)&iidSvc);
@@ -520,7 +439,9 @@ void MMStepGetService(MMState* m) {
             m->getServiceSlot, (unsigned long long)svc);
 }
 
-void MMStepManager(MMState* m) {
+void MMStepManager(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
     m->stage = "менеджер панелей";
     m->manager = *(uintptr_t*)(m->svc + kMMManagerOff);
     if (!m->manager) { strcpy_s(m->err, "нет менеджера панелей"); return; }
@@ -532,7 +453,9 @@ void MMStepManager(MMState* m) {
     LogLine("mainmenu: менеджер панелей 0x%llX", (unsigned long long)m->manager);
 }
 
-void MMStepTemplates(MMState* m) {
+void MMStepTemplates(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
     m->stage = "образцы пунктов";
     GUID frameGroup = MMGuid(kMMFrameStr);
     uintptr_t tmplPopup = MMTemplate(m->manager, frameGroup, 1);
@@ -542,7 +465,9 @@ void MMStepTemplates(MMState* m) {
             (unsigned long long)tmplPopup, (unsigned long long)tmplLeaf);
 }
 
-void MMStepRegister(MMState* m) {
+void MMStepRegister(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
     m->stage = "registerCommands";
     GUID group = MMGuid(kMMGroupStr);
     GUID catPopup = MMGuid(kMMCatPopupStr);
@@ -564,7 +489,9 @@ void MMStepRegister(MMState* m) {
     LogLine("mainmenu: команды группы зарегистрированы");
 }
 
-void MMStepSource(MMState* m) {
+void MMStepSource(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
     m->stage = "источник панелей";
     GUID frameGroup = MMGuid(kMMFrameStr);
     GUID group = MMGuid(kMMGroupStr);
@@ -620,7 +547,9 @@ void MMStepSource(MMState* m) {
             sepTmpl ? "найден" : "нет образца");
 }
 
-void MMStepTraps(MMState* m) {
+void MMStepTraps(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
     m->stage = "перехваты приёмника";
     int txSlot = 0, updSlot = 0, hasSlot = 0;
     void* recv = nullptr;
@@ -642,7 +571,8 @@ void MMStepTraps(MMState* m) {
     LogLine("mainmenu: пункт «GitBar» добавлен в меню «Сервис»");
 }
 
-void MMRebuildStep(MMState* m) {
+void MMRebuildStep(void* arg) {
+    MMState* m = (MMState*)arg;
     if (!m->manager) return;
     uintptr_t vt = *(uintptr_t*)m->manager;
     MMCall0(*(uintptr_t*)(vt + kMMSlotRebuild * 8), m->manager);
@@ -715,35 +645,33 @@ void MMWorkerInner() {
         return;
     }
 
-    // 0. ждём рамку конфигуратора: маршал строится на ней, а 1С достраивает
-    //    свои окна ещё долго после старта (загрузка базы, восстановление окон).
-    bool frameReady = false;
-    for (int i = 0; i < 60 && !frameReady; ++i) {
-        HWND h = nullptr;
-        frameReady = MMEnsureMarshal(&h);
-        if (!frameReady) {
-            // Окно конфигуратора появляется позже окна запуска; без этой
-            // строки ожидание выглядело как 2 минуты тишины в журнале.
+    // 0-1. current_process: маршал строится на рамке конфигуратора, а 1С
+    //      достраивает свои окна ещё долго после старта (загрузка базы,
+    //      восстановление окон) — шаг повторяется, пока маршал не готов.
+    //      Флаг stepRan отличает «маршал не готов» от «шаг выполнен,
+    //      экспорта нет».
+    bool procOk = false;
+    for (int i = 0; i < 30 && !procOk; ++i) {
+        g_mm.stepRan = false;
+        g_mm.stage = "current_process";
+        if (!v8i::V8iRunOnUi(MMStepProcess, &g_mm)) {
+            if (g_mm.stepRan) {
+                LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "current_process не получен");
+                return;   // шаг выполнен, экспорта нет — бессмысленно повторять
+            }
             if ((i % 10) == 9)
-                LogLine("mainmenu: рамки конфигуратора ещё нет (%d с) — ждём",
-                        (i + 1) * 2);
-            Sleep(2000);
+                LogLine("mainmenu: рамки конфигуратора ещё нет (%d с) — ждём", (i + 1) * 3);
+            Sleep(3000);
+            continue;
+        }
+        procOk = g_mm.proc != 0;
+        if (!procOk) {
+            LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "current_process не получен");
+            return;
         }
     }
-    if (!frameReady) {
+    if (!procOk) {
         LogLine("mainmenu: рамка конфигуратора не появилась за отведённое время, пункт не добавлен");
-        return;
-    }
-
-    // 1. current_process — именованный экспорт ядра.
-    g_mm.stage = "current_process";
-    if (!MMRunOnUi(MMStepProcess, &g_mm)) {
-        LogLine("mainmenu: маршал не готов — рамка конфигуратора не найдена "
-                "(норма, пока 1С не достроит свои окна; попытка повторится)");
-        return;
-    }
-    if (!g_mm.proc) {
-        LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "current_process не получен");
         return;
     }
 
@@ -751,12 +679,10 @@ void MMWorkerInner() {
     //    каждый под SEH маршала; неверный слот ловится и пропускается.
     const int svcSlots[] = { 14, 13, 15, 12, 16 };
     bool svcFound = false;
-    char stage[64];
     for (int slot : svcSlots) {
         g_mm.getServiceSlot = slot;
-        _snprintf_s(stage, sizeof(stage), _TRUNCATE, "getService слот %d", slot);
-        g_mm.stage = stage;
-        if (MMRunOnUi(MMStepGetService, &g_mm) && g_mm.svc) {
+        g_mm.stage = "getService";
+        if (v8i::V8iRunOnUi(MMStepGetService, &g_mm) && g_mm.svc) {
             svcFound = true;
             break;
         }
@@ -768,7 +694,7 @@ void MMWorkerInner() {
     }
 
     // 3. цепочка построения: шаги по отдельности, падение шага — повтор цепочки.
-    struct MMStepDef { const char* name; void (*fn)(MMState*); };
+    struct MMStepDef { const char* name; void (*fn)(void*); };
     const MMStepDef steps[] = {
         {"менеджер панелей", MMStepManager},
         {"образцы пунктов",  MMStepTemplates},
@@ -781,7 +707,7 @@ void MMWorkerInner() {
         bool ok = true;
         for (const MMStepDef& s : steps) {
             g_mm.stage = s.name;
-            if (!MMRunOnUi(s.fn, &g_mm)) {
+            if (!v8i::V8iRunOnUi(s.fn, &g_mm)) {
                 LogLine("mainmenu: цепочка прервана на шаге «%s» (попытка %d)",
                         s.name, attempt);
                 ok = false;
@@ -802,7 +728,7 @@ void MMWorkerInner() {
     // Ретраи по расписанию v8snack: 3 с, далее 2 с (до 40), далее 10 с, до 60.
     for (int i = 0; i < 60 && !g_mm.confirmed; ++i) {
         Sleep(i == 0 ? 3000 : (i < 40 ? 2000 : 10000));
-        MMRunOnUi(MMRebuildStep, &g_mm);
+        v8i::V8iRunOnUi(MMRebuildStep, &g_mm);
     }
     if (g_mm.confirmed) {
         LogLine("mainmenu: пункт «GitBar» в главном меню работает");

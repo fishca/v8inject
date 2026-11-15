@@ -1176,19 +1176,37 @@ struct V8iPending {
         V8Cmd cmd;
         unsigned char raw[48];
     } u;
+    // mode 3: a functor for the UI thread (the native-menu build steps).
+    void (*fun)(void*);
+    void* funArg;
     volatile LONG done;
     int rc;
     LONG exc;
     int mode;   // 0 = transmitCommand(recv, &cmd, 0), 1 = hasHandler(recv, &cmd),
-                // 2 = capture the 8.5 receiver from the frame object in recv
+                // 2 = capture the 8.5 receiver from the frame object in recv,
+                // 3 = run fun(funArg) on the UI thread
 };
 V8iPending g_pending = {};
+// The pending slot is shared by the io thread (cmd commands) and the
+// native-menu worker (functor steps) — fill+send+wait sections hold it.
+SRWLOCK g_pendingLock = SRWLOCK_INIT;
 HWND g_cmdHwnd = NULL;
 bool g_cmdSubclassed = false;
 bool g_cmdViaSubclass = false;
 LONG_PTR g_cmdOldWndProc = 0;
 
 typedef LRESULT(CALLBACK* V8iSubclassProc)(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+typedef LRESULT(WINAPI* V8iDefSubclassProcFn)(HWND, UINT, WPARAM, LPARAM);
+// Функция-получатель DefSubclassProc вынесена из V8iCmdSubclass: там __try,
+// а локальный статик с guard-объектом требует раскрутки (C2712).
+V8iDefSubclassProcFn V8iDefSubclassProcFnGet() {
+    static V8iDefSubclassProcFn defFn = []() -> V8iDefSubclassProcFn {
+        HMODULE ctl = GetModuleHandleW(L"comctl32.dll");
+        return ctl ? (V8iDefSubclassProcFn)GetProcAddress(ctl, "DefSubclassProc") : nullptr;
+    }();
+    return defFn;
+}
+
 LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                 UINT_PTR id, DWORD_PTR data) {
     (void)id;   // the subclass id is not used: one window, one pending slot
@@ -1199,6 +1217,15 @@ LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             // the UI thread — so the capture rides the same marshal bridge.
             V8iCaptureCmdRecv(p->recv);
             p->rc = g85_recv ? 0 : -1;
+        } else if (p->mode == 3) {
+            // UI-thread functor (native-menu build steps). An exception here
+            // must not kill 1C: caught and reported through rc.
+            __try {
+                p->fun(p->funArg);
+                p->rc = 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                p->rc = (int)GetExceptionCode();
+            }
         } else {
             p->rc = p->mode == 1 ? HasGuarded(p->trFn, p->recv, &p->u.cmd)
                                  : TransmitGuarded(p->trFn, p->recv, &p->u.cmd);
@@ -1207,11 +1234,7 @@ LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         InterlockedExchange(&p->done, 1);
         return 0;
     }
-    typedef LRESULT(WINAPI* V8iDefSubclassProcFn)(HWND, UINT, WPARAM, LPARAM);
-    static V8iDefSubclassProcFn defFn = []() -> V8iDefSubclassProcFn {
-        HMODULE ctl = GetModuleHandleW(L"comctl32.dll");
-        return ctl ? (V8iDefSubclassProcFn)GetProcAddress(ctl, "DefSubclassProc") : nullptr;
-    }();
+    V8iDefSubclassProcFn defFn = V8iDefSubclassProcFnGet();
     return defFn ? defFn(h, m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
@@ -1220,6 +1243,13 @@ LRESULT CALLBACK V8iCmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g_pending.mode == 2) {
             V8iCaptureCmdRecv(g_pending.recv);
             g_pending.rc = g85_recv ? 0 : -1;
+        } else if (g_pending.mode == 3) {
+            __try {
+                g_pending.fun(g_pending.funArg);
+                g_pending.rc = 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                g_pending.rc = (int)GetExceptionCode();
+            }
         } else {
             g_pending.rc = g_pending.mode == 1
                                ? HasGuarded(g_pending.trFn, g_pending.recv, &g_pending.u.cmd)
@@ -1402,6 +1432,7 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
                 break;   // no frame window yet — fall back to structural pick
             void* hasTr = (void*)((uintptr_t*)recvVt)[5];
             if (!IsReadable(hasTr, 1)) continue;
+            AcquireSRWLockExclusive(&g_pendingLock);
             g_pending.recv = (void*)recv;
             g_pending.trFn = hasTr;
             g_pending.mode = 1;
@@ -1413,11 +1444,14 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
             g_pending.exc = 0;
             InterlockedExchange(&g_pending.done, 0);
             DWORD_PTR probeRes = 0;
-            if (!SendMessageTimeoutW(probeHwnd, kV8iCmdMsg, 0, 0,
-                                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes))
-                continue;
+            LRESULT probeSent = SendMessageTimeoutW(probeHwnd, kV8iCmdMsg, 0, 0,
+                                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes);
+            bool probedOk = probeSent != 0 && g_pending.done && g_pending.exc == 0 &&
+                            g_pending.rc >= 0 && g_pending.rc == 0;
+            ReleaseSRWLockExclusive(&g_pendingLock);
+            if (!probeSent) continue;
             if (g_pending.exc != 0 || g_pending.rc < 0) continue;   // wrong chain
-            if (g_pending.rc == 0 && fallbackObj == 0) {
+            if (probedOk && fallbackObj == 0) {
                 fallbackObj = obj; fallbackOff = off;   // alive, no handler yet
                 continue;
             }
@@ -2112,6 +2146,7 @@ static int V8iCmd85Send(unsigned int num, int sub, bool has = false) {
     DWORD ensureErr = 0;
     const char* marshalPath = "";
     if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return -98;
+    AcquireSRWLockExclusive(&g_pendingLock);
     g_pending.recv = (void*)g85_recv;
     g_pending.trFn = (void*)tr;
     g_pending.mode = has ? 1 : 0;
@@ -2127,11 +2162,13 @@ static int V8iCmd85Send(unsigned int num, int sub, bool has = false) {
     g_pending.exc = 0;
     InterlockedExchange(&g_pending.done, 0);
     DWORD_PTR smRes = 0;
-    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes))
-        return -97;
+    LRESULT sent85 = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                                      SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes);
+    int rc85 = g_pending.done ? g_pending.rc : -96;
+    ReleaseSRWLockExclusive(&g_pendingLock);
+    if (!sent85) return -97;
     if (!g_pending.done) return -96;
-    return g_pending.rc;
+    return rc85;
 }
 
 // Post-start receiver capture for 8.5: the eventCreateFrame path only runs
@@ -3623,6 +3660,7 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     }
     j += std::string(",\"marshal\":\"") + marshalPath + "\"";
 
+    AcquireSRWLockExclusive(&g_pendingLock);
     g_pending.recv = recv;
     g_pending.trFn = trFn;
     g_pending.mode = wantHas ? 1 : 0;
@@ -3637,8 +3675,12 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     // Synchronous cross-thread dispatch: blocks until the UI thread's WndProc
     // runs (SMTO_BLOCK) or the target is hung (capped by the timeout).
     DWORD_PTR smRes = 0;
-    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes)) {
+    LRESULT cmdSent = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                                       SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes);
+    int cmdRc = g_pending.done ? g_pending.rc : -96;
+    LONG cmdExc = g_pending.exc;
+    ReleaseSRWLockExclusive(&g_pendingLock);
+    if (!cmdSent) {
         _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE,
                     ",\"error\":\"UI thread did not answer (0x%X)\"", (unsigned)GetLastError());
         return j + numBuf + "}";
@@ -3646,10 +3688,10 @@ static std::string CmdCommandToJson(const std::wstring& args0) {
     if (!g_pending.done)
         return j + ",\"error\":\"timeout waiting for UI thread\"}";
 
-    int rc = g_pending.rc;
+    int rc = cmdRc;
     if (rc < 0) {
         _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"error\":\"transmit exception 0x%X\"",
-                    (unsigned)g_pending.exc);
+                    (unsigned)cmdExc);
         return j + numBuf + "}";
     }
     if (wantHas) {
@@ -3832,6 +3874,7 @@ bool v8i::V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
     DWORD ensureErr = 0;
     const char* marshalPath = "";
     if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return false;
+    AcquireSRWLockExclusive(&g_pendingLock);
     g_pending.recv = recv;
     g_pending.trFn = hasTr;
     g_pending.mode = 1;
@@ -3843,10 +3886,11 @@ bool v8i::V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
     g_pending.exc = 0;
     InterlockedExchange(&g_pending.done, 0);
     DWORD_PTR probeRes = 0;
-    if (!SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes))
-        return false;
-    if (!g_pending.done || g_pending.exc != 0 || g_pending.rc < 0) return false;
+    LRESULT sent = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes);
+    bool probed = sent != 0 && g_pending.done && g_pending.exc == 0 && g_pending.rc >= 0;
+    ReleaseSRWLockExclusive(&g_pendingLock);
+    if (!probed) return false;
 
     *recvOut = recv;
     *recvVtOut = (uintptr_t*)vt;
@@ -3854,6 +3898,37 @@ bool v8i::V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
     *updateSlot = 4;
     *hasSlot = 5;
     return true;
+}
+
+// Runs a functor on the 1C UI thread through the cmd marshal. Used by the
+// native-menu build steps (src/payload/mainmenu.cpp): the same bridge the cmd
+// chain uses, with its WndProc re-assertion and fallbacks, instead of a
+// private subclass that duplicates them.
+bool v8i::V8iRunOnUi(void (*fn)(void*), void* arg, int timeoutMs) {
+    HWND cmdHwnd = nullptr;
+    DWORD ensureErr = 0;
+    const char* marshalPath = "";
+    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return false;
+    AcquireSRWLockExclusive(&g_pendingLock);
+    g_pending.recv = nullptr;
+    g_pending.trFn = nullptr;
+    g_pending.mode = 3;
+    g_pending.fun = fn;
+    g_pending.funArg = arg;
+    g_pending.rc = -2;
+    g_pending.exc = 0;
+    InterlockedExchange(&g_pending.done, 0);
+    DWORD_PTR res = 0;
+    // 30 s, no SMTO_ABORTIFHUNG: while the base loads, the UI thread does not
+    // pump for tens of seconds — that is business, not a hang.
+    LRESULT sent = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
+                                    SMTO_BLOCK, (UINT)timeoutMs, &res);
+    bool ok = sent != 0 && g_pending.done && g_pending.rc == 0;
+    int crashed = g_pending.rc;
+    ReleaseSRWLockExclusive(&g_pendingLock);
+    if (sent && g_pending.done && crashed != 0 && crashed != -2)
+        LogLine("mainmenu/UI: шаг упал (0x%08X)", (unsigned)crashed);
+    return ok;
 }
 
 static int RunPayload(const wchar_t* sharedName) {
