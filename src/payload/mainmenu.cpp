@@ -265,13 +265,16 @@ void MMSetCommandText(uintptr_t svc, const GUID& group, unsigned num, const wcha
 // --- сервисы ----------------------------------------------------------------
 
 // SCOM_Process* current_process() — именованный экспорт ядра (process.v:43).
+// В Конфигураторе ядро может быть core_as.dll (именно его ядро грузит модули
+// Снегопата), поэтому ищем по всем core*-модулям; не нашли — в журнал идут
+// загруженные core*-модули и экспорты с подстрокой current_process.
 uintptr_t MMCurrentProcess() {
-    const wchar_t* mods[] = { L"core83.dll", L"core85.dll", L"core.dll" };
 #if defined(_WIN64)
     const char* exportName = kMMExportX64;
 #else
     const char* exportName = kMMExportX86;
 #endif
+    const wchar_t* mods[] = { L"core_as.dll", L"core83.dll", L"core85.dll", L"core.dll" };
     for (const wchar_t* mod : mods) {
         ModuleRange m;
         if (!FindModule(mod, m)) continue;
@@ -279,9 +282,27 @@ uintptr_t MMCurrentProcess() {
         if (!img.valid) continue;
         for (const PeExport& e : img.exports) {
             if (e.forwarded || e.name != exportName) continue;
+            LogLine("mainmenu: current_process найден в %ls (rva 0x%X)", mod, e.rva);
             typedef uintptr_t (*FnCurrentProcess)();
             return ((FnCurrentProcess)(m.base + e.rva))();
         }
+    }
+
+    // Диагностика: что вообще есть из core* и что похоже на current_process.
+    for (const ModuleRange& m : EnumModules()) {
+        const wchar_t* fname = wcsrchr(m.path.c_str(), L'\\');
+        fname = fname ? fname + 1 : m.path.c_str();
+        if (_wcsnicmp(fname, L"core", 4) != 0) continue;
+        PeImage img = ParsePe(m.base);
+        if (!img.valid) continue;
+        int hits = 0;
+        for (const PeExport& e : img.exports) {
+            if (e.name.find("current_process") == std::string::npos) continue;
+            LogLine("mainmenu: %ls экспортирует %s (rva 0x%X)", fname, e.name.c_str(), e.rva);
+            ++hits;
+        }
+        LogLine("mainmenu: модуль %ls — экспортов %zu, похожих на current_process: %d",
+                fname, img.exports.size(), hits);
     }
     return 0;
 }
