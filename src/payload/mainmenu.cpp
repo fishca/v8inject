@@ -1,4 +1,4 @@
-﻿// Нативный пункт «GitBar» в главном меню Конфигуратора.
+// Нативный пункт «GitBar» в главном меню Конфигуратора.
 //
 // Платформа не даёт публичного API для добавления пунктов в главное меню, но
 // рисует его из внутренних «панелей» (bands): панель — CommandID {GUID группы,
@@ -682,27 +682,19 @@ void MMWorkerInner() {
         return;
     }
 
-    // 2. getService: слот не выверен на живой 2342 — кандидаты по порядку,
-    //    каждый под SEH маршала; неверный слот ловится и пропускается.
-    // Слот getService не выверен документально — перебор 8..24: неверные ловятся
-    // SEH маршала, правильный подтверждается менеджером на [svc+0xD0].
-    int svcSlots[17];
-    for (int i = 0; i < 17; ++i) svcSlots[i] = 8 + i;
-    bool svcFound = false;
-    for (int slot : svcSlots) {
-        g_mm.getServiceSlot = slot;
-        g_mm.stage = "getService";
-        if (v8i::V8iRunOnUi(MMStepGetService, &g_mm) && g_mm.svc) {
-            svcFound = true;
-            break;
-        }
-        LogLine("mainmenu: слот %d не подошёл, пробуем следующий", slot);
-    }
-    if (!svcFound) {
-        LogLine("mainmenu: getService не найден ни на одном кандидате слотов");
+    // 2. getService: слот 10, откалиброван СТАТИЧЕСКИ по бинарникам
+    //    8.3.27.2342 — в frame.dll/config.dll/1cv8.exe вызов ICommandService
+    //    идёт как lea rdx, [GUID {8F885821…}] + call [reg+0x50]
+    //    (0x50/8 = слот 10; три независимых модуля дают один ответ).
+    //    Перебор слотов вызовами ЗАПРЕЩЁН: неверный слот — чужой метод с
+    //    чужими аргументами, он может писать через pointer-аргументы и портить
+    //    платформу вне нашего SEH (live: падение 1С при инъекции).
+    g_mm.getServiceSlot = 10;
+    g_mm.stage = "getService";
+    if (!v8i::V8iRunOnUi(MMStepGetService, &g_mm) || !g_mm.svc) {
+        LogLine("mainmenu: getService на слоте 10 не подтвердился — пункт не добавлен");
         return;
     }
-
     // 3. цепочка построения: шаги по отдельности, падение шага — повтор цепочки.
     struct MMStepDef { const char* name; void (*fn)(void*); };
     const MMStepDef steps[] = {
