@@ -383,6 +383,9 @@ bool MMEnsureMarshal(HWND* out) {
 }
 
 // Один шаг построения/перестройки — строго на UI-потоке платформы.
+// Таймаут 30 с и без SMTO_ABORTIFHUNG: во время загрузки базы UI-поток 1С
+// не разбирает сообщения десятки секунд — это не «зависание», и ранний
+// прерыватель превращал каждую посылку в мгновенный отказ.
 bool MMRunOnUi(void (*fn)(MMState*), MMState* arg) {
     HWND h = nullptr;
     if (!MMEnsureMarshal(&h)) return false;
@@ -391,10 +394,12 @@ bool MMRunOnUi(void (*fn)(MMState*), MMState* arg) {
     g_mmPending.rc = -2;
     InterlockedExchange(&g_mmPending.done, 0);
     DWORD_PTR res = 0;
-    if (!SendMessageTimeoutW(h, kMMCmdMsg, 0, 0,
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 15000, &res))
-        return false;
-    return g_mmPending.done && g_mmPending.rc == 0;
+    LRESULT sent = SendMessageTimeoutW(h, kMMCmdMsg, 0, 0,
+                                       SMTO_BLOCK, 30000, &res);
+    bool ok = sent != 0 && g_mmPending.done && g_mmPending.rc == 0;
+    LogLine("mainmenu: шаг «%s» — %s", g_mm.stage ? g_mm.stage : "?",
+            ok ? "выполнен" : (sent ? "шаг упал" : "UI-поток не принял"));
+    return ok;
 }
 
 // --- перехваты на приёмнике -------------------------------------------------
@@ -772,19 +777,19 @@ void MMWorkerInner() {
         {"перехваты",        MMStepTraps},
     };
     bool built = false;
-    for (int attempt = 1; attempt <= 60 && !built; ++attempt) {
-        LogLine("mainmenu: цепочка построения, попытка %d", attempt);
+    for (int attempt = 1; attempt <= 20 && !built; ++attempt) {
         bool ok = true;
         for (const MMStepDef& s : steps) {
             g_mm.stage = s.name;
             if (!MMRunOnUi(s.fn, &g_mm)) {
-                LogLine("mainmenu: шаг «%s» не прошёл (попытка %d)", s.name, attempt);
+                LogLine("mainmenu: цепочка прервана на шаге «%s» (попытка %d)",
+                        s.name, attempt);
                 ok = false;
                 break;
             }
         }
-        if (ok) built = true;
-        else Sleep(2500);
+        if (ok) { built = true; break; }
+        Sleep(2500);
     }
     if (!built) {
         LogLine("mainmenu: %s", g_mm.err[0] ? g_mm.err : "цепочка построения не прошла");
