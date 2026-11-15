@@ -3840,7 +3840,8 @@ V8I_API int V8I_CALL v8i_version() {
 // 8.3 only: the 8.5 receiver is captured on the cmd85 path and its vtable
 // layout is not wired for the menu yet.
 bool v8i::V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
-                                int* transmitSlot, int* updateSlot, int* hasSlot) {
+                                int* transmitSlot, int* updateSlot, int* hasSlot,
+                                void** coreOut, void** frameObjOut) {
     ModuleRange cfg;
     if (!FindModule(L"config.dll", cfg)) return false;
     if (FindModule(L"core85.dll", cfg)) return false;   // 8.5: not wired yet
@@ -3897,6 +3898,8 @@ bool v8i::V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
     *transmitSlot = 3;
     *updateSlot = 4;
     *hasSlot = 5;
+    if (coreOut) *coreOut = (void*)core;
+    if (frameObjOut) *frameObjOut = (void*)frame;
     return true;
 }
 

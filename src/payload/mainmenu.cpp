@@ -1,4 +1,4 @@
-// Нативный пункт «GitBar» в главном меню Конфигуратора.
+﻿// Нативный пункт «GitBar» в главном меню Конфигуратора.
 //
 // Платформа не даёт публичного API для добавления пунктов в главное меню, но
 // рисует его из внутренних «панелей» (bands): панель — CommandID {GUID группы,
@@ -86,7 +86,9 @@ struct MMState {
     GUID group{};
     uintptr_t groupBytes = 0;       // 32 байта: GUID + номер (для mmIsOurs)
     uintptr_t svc = 0, manager = 0, src = 0, proc = 0;
-    int getServiceSlot = 14;        // кандидат слота getService SCOM_Process
+    void* core = nullptr;           // объекты цепочки рамки (для QueryInterface)
+    void* frameObj = nullptr;
+    int trapTx = 3, trapUpd = 4, trapHas = 5;   // слоты приёмника (8.3)
     bool built = false;             // registerCommands/addBand/addSource прошли
     bool failed = false;            // непоправимый шаг, повторять бессмысленно
     bool confirmed = false;         // платформа запросила updateState нашего popup
@@ -417,53 +419,43 @@ __declspec(naked) static void MMTransmitTrapX86() {
 // решает — повторить цепочку или отказаться. Первый большой MMBuildStep падал
 // целиком и бесконечно повторялся без диагностики (live 8.3.27.2342).
 
-void MMStepProcess(void* arg) {
+// QueryInterface за ICommandService на объектах цепочки рамки (UI-поток).
+// Стандартный COM-вызов: безопасен при любом ответе (E_NOINTERFACE просто
+// отказ). Слоты SCOM_Process::getService не использованы вовсе - их
+// документальной раскладки нет, а перебор вызовами деструктивен (live:
+// падение 1С).
+void MMStepQI(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
-    m->stage = "current_process";
-    m->proc = MMCurrentProcess();
-    if (!m->proc) { m->failed = true; strcpy_s(m->err, "current_process() не найден"); }
-}
-
-void MMStepGetService(void* arg) {
-    MMState* m = (MMState*)arg;
-    m->stepRan = true;
-    GUID iidSvc = MMGuid(kMMIidSvcStr);
-    uintptr_t svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + m->getServiceSlot * 8),
-                            m->proc, (uintptr_t)&iidSvc);
-    uintptr_t manager = 0;
-    if (svc) {
-        uintptr_t svcVt = *(uintptr_t*)svc;
-        if (IsReadable((void*)svcVt, 20 * sizeof(void*))) {
-            manager = *(uintptr_t*)(svc + kMMManagerOff);
-            if (manager) {
-                uintptr_t mgrVt = *(uintptr_t*)manager;
-                if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) manager = 0;
+    GUID iid = MMGuid(kMMIidSvcStr);
+    uintptr_t tryObj[] = { (uintptr_t)m->recv, (uintptr_t)m->core, (uintptr_t)m->frameObj };
+    for (uintptr_t obj : tryObj) {
+        if (!obj) continue;
+        uintptr_t vt = *(uintptr_t*)obj;
+        if (!IsReadable((void*)vt, 3 * sizeof(void*))) continue;
+        uintptr_t out = 0;
+        MMCall2(*(uintptr_t*)vt, obj, (uintptr_t)&iid, (uintptr_t)&out);   // QI
+        uintptr_t manager = 0;
+        if (out) {
+            uintptr_t svcVt = *(uintptr_t*)out;
+            if (IsReadable((void*)svcVt, 20 * sizeof(void*))) {
+                manager = *(uintptr_t*)(out + kMMManagerOff);
+                if (manager) {
+                    uintptr_t mgrVt = *(uintptr_t*)manager;
+                    if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) manager = 0;
+                }
             }
         }
+        LogLine("mainmenu: QI 0x%llX -> svc=0x%llX менеджер=0x%llX",
+                (unsigned long long)obj, (unsigned long long)out, (unsigned long long)manager);
+        if (out && manager) {
+            m->svc = out;
+            m->manager = manager;
+            LogLine("mainmenu: ICommandService получен через QueryInterface");
+            return;
+        }
     }
-    // Значения пишутся всегда: они и есть диагностика слота и момента.
-    LogLine("mainmenu: getService слот %d -> svc=0x%llX менеджер=0x%llX",
-            m->getServiceSlot, (unsigned long long)svc, (unsigned long long)manager);
-    if (!svc || !manager) return;
-    m->svc = svc;
-    m->manager = manager;
 }
-
-void MMStepManager(void* arg) {
-    MMState* m = (MMState*)arg;
-    m->stepRan = true;
-    m->stage = "менеджер панелей";
-    m->manager = *(uintptr_t*)(m->svc + kMMManagerOff);
-    if (!m->manager) { strcpy_s(m->err, "нет менеджера панелей"); return; }
-    uintptr_t mgrVt = *(uintptr_t*)m->manager;
-    if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) {
-        strcpy_s(m->err, "vtable менеджера нечитаем");
-        return;
-    }
-    LogLine("mainmenu: менеджер панелей 0x%llX", (unsigned long long)m->manager);
-}
-
 void MMStepTemplates(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
@@ -562,15 +554,11 @@ void MMStepTraps(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
     m->stage = "перехваты приёмника";
-    int txSlot = 0, updSlot = 0, hasSlot = 0;
-    void* recv = nullptr;
-    uintptr_t* recvVt = nullptr;
-    if (V8iGetCommandReceiver(&recv, &recvVt, &txSlot, &updSlot, &hasSlot) &&
-        MMPatchSlot(recvVt, updSlot, (void*)&MMUpdateTrap, &m->origUpdate) &&
-        MMPatchSlot(recvVt, hasSlot, (void*)&MMHasTrap, &m->origHas) &&
-        MMPatchSlot(recvVt, txSlot, (void*)&MMTransmitTrap, &m->origTransmit)) {
-        m->recv = recv;
-        m->recvVt = recvVt;
+    if (m->recv && m->recvVt &&
+        MMPatchSlot(m->recvVt, m->trapUpd, (void*)&MMUpdateTrap, &m->origUpdate) &&
+        MMPatchSlot(m->recvVt, m->trapHas, (void*)&MMHasTrap, &m->origHas) &&
+        MMPatchSlot(m->recvVt, m->trapTx, (void*)&MMTransmitTrap, &m->origTransmit)) {
+        void* recv = m->recv;
         m->groupBytes = MMAlloc(32);
         MMPutGuid(m->groupBytes, MMGuid(kMMGroupStr));
         LogLine("mainmenu: перехваты установлены на приёмник 0x%llX",
@@ -656,64 +644,54 @@ void MMWorkerInner() {
         return;
     }
 
-    // 0-1. current_process: маршал строится на рамке конфигуратора, а 1С
-    //      достраивает свои окна ещё долго после старта (загрузка базы,
-    //      восстановление окон) — шаг повторяется, пока маршал не готов.
-    //      Флаг stepRan отличает «маршал не готов» от «шаг выполнен,
-    //      экспорта нет».
-    bool procOk = false;
-    for (int i = 0; i < 30 && !procOk; ++i) {
-        g_mm.stepRan = false;
-        g_mm.stage = "current_process";
-        if (!v8i::V8iRunOnUi(MMStepProcess, &g_mm)) {
-            if (g_mm.stepRan) {
-                LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "current_process не получен");
-                return;   // шаг выполнен, экспорта нет — бессмысленно повторять
-            }
-            if ((i % 10) == 9)
-                LogLine("mainmenu: рамки конфигуратора ещё нет (%d с) — ждём", (i + 1) * 3);
-            Sleep(3000);
-            continue;
-        }
-        procOk = g_mm.proc != 0;
-        if (!procOk) {
-            LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "current_process не получен");
-            return;
-        }
+    MMState* m = &g_mm;
+    // 0. приёмник и объекты цепочки рамки (рабочий поток, безопасно):
+    //    та же дискавери+проба, что у cmd-цепочки.
+    void* recv = nullptr;
+    uintptr_t* recvVt = nullptr;
+    int txSlot = 3, updSlot = 4, hasSlot = 5;
+    void* core = nullptr;
+    void* frameObj = nullptr;
+    bool receiverOk = false;
+    for (int i = 0; i < 30 && !receiverOk; ++i) {
+        receiverOk = V8iGetCommandReceiver(&recv, &recvVt, &txSlot, &updSlot,
+                                           &hasSlot, &core, &frameObj);
+        if (!receiverOk) Sleep(3000);
     }
-    if (!procOk) {
-        LogLine("mainmenu: рамка конфигуратора не появилась за отведённое время, пункт не добавлен");
+    if (!receiverOk) {
+        LogLine("mainmenu: приёмник не захвачен за отведённое время — пункт не добавлен");
         return;
     }
+    m->recv = recv;
+    m->recvVt = recvVt;
+    m->core = core;
+    m->frameObj = frameObj;
+    m->trapTx = txSlot;
+    m->trapUpd = updSlot;
+    m->trapHas = hasSlot;
+    LogLine("mainmenu: приёмник 0x%llX (core 0x%llX, рамка 0x%llX), слоты tx/upd/has %d/%d/%d",
+            (unsigned long long)(uintptr_t)recv, (unsigned long long)(uintptr_t)core,
+            (unsigned long long)(uintptr_t)frameObj, txSlot, updSlot, hasSlot);
 
-    // 2. getService: слот 10, откалиброван СТАТИЧЕСКИ по бинарникам
-    //    8.3.27.2342 — в frame.dll/config.dll/1cv8.exe вызов ICommandService
-    //    идёт как lea rdx, [GUID {8F885821…}] + call [reg+0x50]
-    //    (0x50/8 = слот 10; три независимых модуля дают один ответ).
-    //    Перебор слотов вызовами ЗАПРЕЩЁН: неверный слот — чужой метод с
-    //    чужими аргументами, он может писать через pointer-аргументы и портить
-    //    платформу вне нашего SEH (live: падение 1С при инъекции).
-    g_mm.getServiceSlot = 10;
-    // Сервис может появиться позже первого опроса: платформа регистрирует
-    // сервисы при старте, а мы спрашиваем через 3 с после инъекции.
-    // Ретраи до минуты с полным логом значений.
+    // 1. QueryInterface за ICommandService на объектах цепочки (UI-поток).
+    //    Сервис может регистрироваться позже — ретраи до минуты.
     bool svcFound = false;
     for (int i = 0; i < 20 && !svcFound; ++i) {
-        g_mm.stage = "getService";
-        g_mm.svc = 0;
-        g_mm.manager = 0;
-        v8i::V8iRunOnUi(MMStepGetService, &g_mm);
-        if (g_mm.svc && g_mm.manager) { svcFound = true; break; }
+        m->stage = "QueryInterface";
+        m->svc = 0;
+        m->manager = 0;
+        v8i::V8iRunOnUi(MMStepQI, m);
+        if (m->svc && m->manager) { svcFound = true; break; }
         Sleep(3000);
     }
     if (!svcFound) {
-        LogLine("mainmenu: getService за минуту не дал валидного сервиса — пункт не добавлен");
+        LogLine("mainmenu: ICommandService недоступен через QueryInterface — пункт не добавлен");
         return;
     }
-    // 3. цепочка построения: шаги по отдельности, падение шага — повтор цепочки.
+
+    // 2. цепочка построения: образцы, registerCommands, источник, перехваты.
     struct MMStepDef { const char* name; void (*fn)(void*); };
     const MMStepDef steps[] = {
-        {"менеджер панелей", MMStepManager},
         {"образцы пунктов",  MMStepTemplates},
         {"registerCommands", MMStepRegister},
         {"источник панелей", MMStepSource},
@@ -723,8 +701,8 @@ void MMWorkerInner() {
     for (int attempt = 1; attempt <= 20 && !built; ++attempt) {
         bool ok = true;
         for (const MMStepDef& s : steps) {
-            g_mm.stage = s.name;
-            if (!v8i::V8iRunOnUi(s.fn, &g_mm)) {
+            m->stage = s.name;
+            if (!v8i::V8iRunOnUi(s.fn, m)) {
                 LogLine("mainmenu: цепочка прервана на шаге «%s» (попытка %d)",
                         s.name, attempt);
                 ok = false;
@@ -735,10 +713,9 @@ void MMWorkerInner() {
         Sleep(2500);
     }
     if (!built) {
-        LogLine("mainmenu: %s", g_mm.err[0] ? g_mm.err : "цепочка построения не прошла");
+        LogLine("mainmenu: %s", m->err[0] ? m->err : "цепочка построения не прошла");
         return;
     }
-
     // Платформа отбрасывает перестройку, пока достраивает меню (загрузка
     // конфигурации, восстановление окон), сигнала готовности нет — запрос
     // updateState нашего popup приходит только от нарисованного пункта.
