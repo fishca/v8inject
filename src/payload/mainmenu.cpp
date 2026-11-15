@@ -23,6 +23,7 @@
 
 #include "v8inject/diag.h"
 #include "v8inject/ini.h"
+#include "v8inject/objects.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/v8i_export.h"
@@ -343,24 +344,29 @@ LRESULT CALLBACK MMSubclassProc(HWND h, UINT m, WPARAM w, LPARAM l,
 }
 
 HWND MMFindFrame() {
-    DWORD pid = GetCurrentProcessId();
-    HWND found = nullptr;
-    struct Ctx { DWORD pid; HWND* out; } ctx = { pid, &found };
-    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-        Ctx* c = (Ctx*)lp;
-        DWORD wp = 0;
-        GetWindowThreadProcessId(h, &wp);
-        if (wp != c->pid) return TRUE;
-        wchar_t cls[64] = {};
-        GetClassNameW(h, cls, 64);
-        if (_wcsicmp(cls, L"V8TopLevelFrame") == 0 ||
-            wcsncmp(cls, L"V8Window0", 9) == 0) {
-            *c->out = h;
-            return FALSE;
+    // Тот же поиск рамки, что у cmd-маршала (EnsureCmdUi → EnumProcessWindows):
+    // классы рамок зависят от версии платформы, и собственный EnumWindows с
+    // «теми же» классами промахивался на живой 2342, хотя рамка была
+    // (панель была пристроена к ней). Диагностика печатает классы окон.
+    std::vector<WindowEntry> wins = EnumProcessWindows();
+    for (const WindowEntry& w : wins)
+        if (w.cls == L"V8TopLevelFrame" || w.cls.rfind(L"V8Window0", 0) == 0)
+            return w.hwnd;
+
+    static int diagCount = 0;
+    if ((diagCount++ % 10) == 0) {
+        std::string classes;
+        for (const WindowEntry& w : wins) {
+            if (w.cls.empty()) continue;
+            std::string c;
+            c.reserve(w.cls.size());
+            for (wchar_t ch : w.cls) c.push_back(ch < 128 ? (char)ch : '?');
+            classes += c + " ";
+            if (classes.size() > 220) break;
         }
-        return TRUE;
-    }, (LPARAM)&ctx);
-    return found;
+        LogLine("mainmenu: рамка не найдена, окна процесса: %s", classes.c_str());
+    }
+    return nullptr;
 }
 
 bool MMEnsureMarshal(HWND* out) {
