@@ -121,13 +121,25 @@ HMODULE FindModuleInProcess(HANDLE hProc, const std::wstring& dllPath) {
     if (!EnumProcessModulesEx(hProc, mods, sizeof(mods), &needed, LIST_MODULES_ALL))
         return nullptr;
 
+    // Two copies of the payload under different paths can be resident at once
+    // (rebuild + re-inject without restarting the target). Matching by base
+    // name alone returns whichever copy the enumeration lists first, and the
+    // probe address computed from it executes a foreign module (live
+    // 2026-11-15: that killed the target with 0x80000003). Exact path wins;
+    // the base-name pass remains for targets that canonicalize the injected
+    // path (short names, subst drives).
     DWORD count = needed / sizeof(HMODULE);
-    for (DWORD i = 0; i < count; ++i) {
-        wchar_t path[MAX_PATH] = {};
-        if (!GetModuleFileNameExW(hProc, mods[i], path, MAX_PATH)) continue;
-        const wchar_t* got = wcsrchr(path, L'\\');
-        got = got ? got + 1 : path;
-        if (_wcsicmp(got, want) == 0) return mods[i];
+    for (int pass = 0; pass < 2; ++pass) {
+        for (DWORD i = 0; i < count; ++i) {
+            wchar_t path[MAX_PATH] = {};
+            if (!GetModuleFileNameExW(hProc, mods[i], path, MAX_PATH)) continue;
+            const wchar_t* got = wcsrchr(path, L'\\');
+            got = got ? got + 1 : path;
+            if (pass == 0 ? _wcsicmp(path, dllPath.c_str()) == 0
+                          : _wcsicmp(got, want) == 0) {
+                return mods[i];
+            }
+        }
     }
     return nullptr;
 }
