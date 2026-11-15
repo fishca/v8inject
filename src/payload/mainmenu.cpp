@@ -431,19 +431,23 @@ void MMStepGetService(void* arg) {
     GUID iidSvc = MMGuid(kMMIidSvcStr);
     uintptr_t svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + m->getServiceSlot * 8),
                             m->proc, (uintptr_t)&iidSvc);
-    if (!svc) return;
-    uintptr_t svcVt = *(uintptr_t*)svc;
-    if (!IsReadable((void*)svcVt, 20 * sizeof(void*))) return;
-    // Поведенческая проверка слота: у ICommandService на [svc+0xD0] лежит
-    // менеджер панелей с читаемой vtable. Неверный слот отсекается здесь.
-    uintptr_t manager = *(uintptr_t*)(svc + kMMManagerOff);
-    if (!manager) return;
-    uintptr_t mgrVt = *(uintptr_t*)manager;
-    if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) return;
+    uintptr_t manager = 0;
+    if (svc) {
+        uintptr_t svcVt = *(uintptr_t*)svc;
+        if (IsReadable((void*)svcVt, 20 * sizeof(void*))) {
+            manager = *(uintptr_t*)(svc + kMMManagerOff);
+            if (manager) {
+                uintptr_t mgrVt = *(uintptr_t*)manager;
+                if (!IsReadable((void*)mgrVt, 14 * sizeof(void*))) manager = 0;
+            }
+        }
+    }
+    // Значения пишутся всегда: они и есть диагностика слота и момента.
+    LogLine("mainmenu: getService слот %d -> svc=0x%llX менеджер=0x%llX",
+            m->getServiceSlot, (unsigned long long)svc, (unsigned long long)manager);
+    if (!svc || !manager) return;
     m->svc = svc;
     m->manager = manager;
-    LogLine("mainmenu: ICommandService на слоте %d (svc=0x%llX, менеджер 0x%llX)",
-            m->getServiceSlot, (unsigned long long)svc, (unsigned long long)manager);
 }
 
 void MMStepManager(void* arg) {
@@ -690,9 +694,20 @@ void MMWorkerInner() {
     //    чужими аргументами, он может писать через pointer-аргументы и портить
     //    платформу вне нашего SEH (live: падение 1С при инъекции).
     g_mm.getServiceSlot = 10;
-    g_mm.stage = "getService";
-    if (!v8i::V8iRunOnUi(MMStepGetService, &g_mm) || !g_mm.svc) {
-        LogLine("mainmenu: getService на слоте 10 не подтвердился — пункт не добавлен");
+    // Сервис может появиться позже первого опроса: платформа регистрирует
+    // сервисы при старте, а мы спрашиваем через 3 с после инъекции.
+    // Ретраи до минуты с полным логом значений.
+    bool svcFound = false;
+    for (int i = 0; i < 20 && !svcFound; ++i) {
+        g_mm.stage = "getService";
+        g_mm.svc = 0;
+        g_mm.manager = 0;
+        v8i::V8iRunOnUi(MMStepGetService, &g_mm);
+        if (g_mm.svc && g_mm.manager) { svcFound = true; break; }
+        Sleep(3000);
+    }
+    if (!svcFound) {
+        LogLine("mainmenu: getService за минуту не дал валидного сервиса — пункт не добавлен");
         return;
     }
     // 3. цепочка построения: шаги по отдельности, падение шага — повтор цепочки.
