@@ -33,7 +33,15 @@ bool RemoteLoadLibrary(HANDLE hProc, const std::wstring& dllPath, HMODULE* baseO
 
     HMODULE localK32 = GetModuleHandleW(L"kernel32.dll");
     FARPROC localLoadLib = localK32 ? GetProcAddress(localK32, "LoadLibraryW") : nullptr;
-    HMODULE remoteK32 = localLoadLib ? FindModuleInProcess(hProc, L"kernel32.dll") : nullptr;
+    // Свежесозданный процесс (launch) может ещё мапить модули: kernel32 в
+    // списке целей появляется через миллисекунды. Ждём до 2 с вместо
+    // мгновенного отказа, иначе launch-инъекция в новый процесс нестабильна.
+    HMODULE remoteK32 = nullptr;
+    for (int i = 0; localLoadLib && i < 40; ++i) {
+        remoteK32 = FindModuleInProcess(hProc, L"kernel32.dll");
+        if (remoteK32) break;
+        Sleep(50);
+    }
     LPTHREAD_START_ROUTINE loadLib = nullptr;
     if (localLoadLib && remoteK32) {
         loadLib = (LPTHREAD_START_ROUTINE)((uintptr_t)localLoadLib

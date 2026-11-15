@@ -704,9 +704,34 @@ void MMWorkerInner() {
         return;
     }
 
+    // 0. ждём рамку конфигуратора: маршал строится на ней, а 1С достраивает
+    //    свои окна ещё долго после старта (загрузка базы, восстановление окон).
+    bool frameReady = false;
+    for (int i = 0; i < 60 && !frameReady; ++i) {
+        HWND h = nullptr;
+        frameReady = MMEnsureMarshal(&h);
+        if (!frameReady) {
+            // Окно конфигуратора появляется позже окна запуска; без этой
+            // строки ожидание выглядело как 2 минуты тишины в журнале.
+            if ((i % 10) == 9)
+                LogLine("mainmenu: рамки конфигуратора ещё нет (%d с) — ждём",
+                        (i + 1) * 2);
+            Sleep(2000);
+        }
+    }
+    if (!frameReady) {
+        LogLine("mainmenu: рамка конфигуратора не появилась за отведённое время, пункт не добавлен");
+        return;
+    }
+
     // 1. current_process — именованный экспорт ядра.
     g_mm.stage = "current_process";
-    if (!MMRunOnUi(MMStepProcess, &g_mm) || !g_mm.proc) {
+    if (!MMRunOnUi(MMStepProcess, &g_mm)) {
+        LogLine("mainmenu: маршал не готов — рамка конфигуратора не найдена "
+                "(норма, пока 1С не достроит свои окна; попытка повторится)");
+        return;
+    }
+    if (!g_mm.proc) {
         LogLine("mainmenu: %s", g_mm.failed ? g_mm.err : "current_process не получен");
         return;
     }
@@ -741,7 +766,7 @@ void MMWorkerInner() {
         {"перехваты",        MMStepTraps},
     };
     bool built = false;
-    for (int attempt = 1; attempt <= 8 && !built; ++attempt) {
+    for (int attempt = 1; attempt <= 60 && !built; ++attempt) {
         LogLine("mainmenu: цепочка построения, попытка %d", attempt);
         bool ok = true;
         for (const MMStepDef& s : steps) {
