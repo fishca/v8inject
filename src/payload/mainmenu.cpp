@@ -1,20 +1,30 @@
-﻿// Нативный пункт «GitBar» в главном меню Конфигуратора.
+﻿// Нативный пункт «GitBar» — отдельное подменю верхнего меню Конфигуратора
+// (между «Сервис» и «Окна»).
 //
 // Платформа не даёт публичного API для добавления пунктов в главное меню, но
 // рисует его из внутренних «панелей» (bands): панель — CommandID {GUID группы,
 // номер}, содержимое — вектор пунктов по 0x70 байт (CommandID + вес double,
-// порядок по весу). Модули платформы дополняют меню точно так же, как нужно
-// нам: создают CommandInterface (createByClsid), кладут в него панели
-// (addBand) и отдают менеджеру панелей (addSource + перестройка). Полный
-// реверс и раскладка — проект v8snack (tools/MAINMENU.md,
-// engine/mainmenu.as, v8api/process.v); эта реализация — перевод того рецепта
-// на C++ payloads v8inject.
+// порядок по весу). Верхнее меню — панель {MM_FRAME}/1 («Сервис» = вес 18.0,
+// «Окна» = 19.0, наш пункт = 18.5); содержимое popup — наша панель
+// {наши}/1. Модули платформы дополняют меню точно так же, как нужно нам:
+// создают CommandInterface (createByClsid), кладут в него панели (addBand)
+// и отдают менеджеру панелей (addSource + перестройка). Полный реверс и
+// раскладка — проект v8snack (tools/MAINMENU.md, engine/mainmenu.as,
+// v8api/process.v); эта реализация — перевод того рецепта на C++ payloads
+// v8inject (RE live 2342: docs/plan_mainmenu_re.md).
 //
-// Объект процесса берётся не из ?current_process@core (тот возвращает объект,
-// у которого getService отвечает null на live 8.3.27.2342), а перехватом
-// обёртки getService в 1cv8.exe (rva 0xBFCB0, калибровка 2342 x64): 1С сама
-// передаёт в неё настоящий SCOM_Process — наблюдатель хука его захватывает.
-// Слоты getService = 14 подтверждены той же обёрткой (call [rax+0x70]).
+// Объект процесса и сервис берутся чтением служебного реестра SCOM_Process
+// (RE 2026-11-15, docs/plan_mainmenu_re.md Ф1-Ф2): current_process@core — это
+// TlsGetValue(индекс из core83), а getService (vtable слот 14) ищет в хеш-мапе
+// по 16-байтовому ключу; для ICommandService ключ — сам IID {8F885821-…}.
+// Экземпляры находятся сканом кучи по vtable (core83 rva 0x3EAB68), запись —
+// обходом списка от сентинела [proc+0x58]; только чтение памяти, никаких
+// вызовов vtable — путь безопасен и не зависит от момента вызова обёртки.
+// ( getService на young-экземпляре возвращал null: сервисы регистрируются
+// постепенно — live: 29/76/377 записей на трёх экземплярах, ICommandService
+// есть только в полном. ) Хуки обёрток 1cv8/config остаются как диагностика
+// и fallback-захват объекта, старые шаги QI/getService сохранены как запасной
+// путь.
 //
 // Ветки раскладки v8snack: 8.3.27 и 8.5 совпадают (entry 0x68, SSO-текст).
 // Наши тексты («GitBar», «Настройки») короче 10 символов и целиком помещаются
@@ -22,21 +32,26 @@
 
 #include "v8inject/diag.h"
 #include "v8inject/hook.h"
+#include "v8inject/memscan.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/v8i_export.h"
 
 #include <windows.h>
 #include <commctrl.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <string>
+#include <vector>
 
 namespace v8i {
 
 // Из src/payload/gitbar.cpp (namespace v8i).
 void V8iGitBarMenuAction(unsigned num);
 void V8iGitBarSetNativeMenu();
+void V8iGitBarShowActionMenu();
 
 // --- константы рецепта (v8snack mainmenu.as:10-30, MAINMENU.md §2-§6) ------
 
@@ -47,18 +62,47 @@ const wchar_t kMMFrameStr[] = L"{B78F2E80-EC68-11D4-9DCF-0050BAE2BC79}";     // 
 const wchar_t kMMClsidCIStr[] = L"{F459D5F0-E7C0-11D4-9DCD-0050BAE2BC79}";   // CommandInterface
 const wchar_t kMMIidCIStr[] = L"{7DF15090-7A63-11D4-84A1-008048DA06DF}";
 const wchar_t kMMIidSvcStr[] = L"{8F885821-D353-11D3-8A57-008048DA06DF}";   // IID ICommandService
-const unsigned kMMPopupNum = 1;       // popup «GitBar»
-const unsigned kMMSettingsNum = 2;    // «Настройки»
-const unsigned kMMServiceBandNum = 52;   // панель меню «Сервис» ({MM_FRAME}/52)
-const uint64_t kMMWeightPopup = 0x4059000000000000ULL;  // 100.0 — конец «Сервиса»
-const uint64_t kMMWeightSep = 0x4058C00000000000ULL;    // 99.0 — разделитель перед пунктом
+const unsigned kMMPopupNum = 1;       // popup «GitBar» (верхний пункт)
+const unsigned kMMActionsNum = 10;    // «Действия…» — открывает popup оверлея
+const unsigned kMMSettingsNum = 2;    // «Настройки…»
+const unsigned kMMTopBandNum = 1;        // панель верхнего меню ({MM_FRAME}/1)
+const uint64_t kMMWeightTop = 0x4032800000000000ULL;    // 18.5 — верхнее меню:
+                                          // «Сервис» = 18.0, «Окна» = 19.0 (live 2342)
 const uint64_t kMMWeightItem = 0x3FF0000000000000ULL;   // 1.0 — пункт внутри popup
 
-// Разделитель «Сервиса»: {9D0A2E40-B978-11D4-84B6-008048DA06DF}/0
-constexpr uint64_t kMMSepGuidA = 0x11d4b9789d0a2e40ULL;
-constexpr uint64_t kMMSepGuidB = 0xdf06da488000b684ULL;
-
 constexpr uintptr_t kMMManagerOff = 0xD0;   // [ICommandService + 0xD0] — менеджер панелей
+
+// Служебный реестр сервисов SCOM_Process (RE: disasm impl getService, rva
+// 0x127470 core83, live 8.3.27.2342 x64). Хеш-мапа внутри объекта процесса:
+// сентинел списка [proc+0x58], число записей [proc+0x60], бакеты [proc+0x68]
+// (по 16 байт: начало цепочки + стоп-узел), маска [proc+0x80] (2^n − 1).
+// Узел: next +0x00, prev +0x08, ключ 16 байт +0x10/+0x18 (сравнение двух
+// qword getService'ом), связанный GUID +0x20/+0x28, указатель +0x30, сервис
+// +0x38. Ключ записи ICommandService — сам IID {8F885821-…} (дамп реестра
+// live: запись 52 из 377). vtable SCOM_Process — core83 rva 0x3EAB68.
+constexpr uintptr_t kMMProcVtableRva = 0x3EAB68;
+constexpr uintptr_t kMMRegSentinel = 0x58;
+constexpr uintptr_t kMMRegNodeKey = 0x10;
+constexpr uintptr_t kMMRegNodeSvc = 0x38;
+constexpr uint64_t kMMIidSvcQ0 = 0x11D3D3538F885821ULL;  // {8F885821-…} младшие 8 байт
+constexpr uint64_t kMMIidSvcQ1 = 0xDF06DA488000578AULL;  // …-008048DA06DF старшие
+
+// Менеджер панелей (RE live 2342 x64, 2026-11-15): [ICommandService+0xD0] —
+// экземпляр менеджера с ПУСТЫМИ источниками и картой (главное меню платформы
+// живёт в другом экземпляре того же класса; слот 27 ICommandService возвращает
+// тот же пустой объект). Правильный менеджер выбираем по содержимому: скан
+// объектов класса (vtable frame.dll rva 0xB097F0) и поиск в карте (std::map,
+// сентинел [mgr+0xD0], корень [sent+8]) панели рамки {MM_FRAME}/52.
+// Узел карты: _Left+0, _Parent+8, _Right+0x10, _Isnil байт +0x19, ключ
+// CommandID 32 байта +0x20 (GUID, dword номера на +0x30), панель +0x38.
+constexpr uintptr_t kMMMngrVtableRva = 0xB097F0;
+constexpr uint64_t kMMFrameQ0 = 0x11D4EC68B78F2E80ULL;   // {B78F2E80-EC68-11D4-…}
+constexpr uint64_t kMMFrameQ1 = 0x79BCE2BA5000CF9DULL;   // …-9DCF-0050BAE2BC79}
+constexpr uintptr_t kMMNodeIsnil = 0x19;
+constexpr uintptr_t kMMNodeRight = 0x10;                 // std::map: _Left+0/_Right+0x10
+constexpr uintptr_t kMMNodeKey = 0x20;                   // CommandID 32 байта +0x20
+constexpr uintptr_t kMMNodeNum = 0x30;                   // dword номера в CommandID
+constexpr uintptr_t kMMNodeBand = 0x38;                  // панель в узле карты
 constexpr int kMMSlotRegisterCommands = 11; // ICommandService
 constexpr int kMMSlotCommandDescription = 3; // ICommandService, после IUnknown
 constexpr int kMMSlotBandById = 3;          // менеджер: панель по CommandID
@@ -96,6 +140,10 @@ struct MMState {
     bool stepRan = false;           // шаг был выполнен (маршал готов)
     bool built = false;             // registerCommands/addBand/addSource прошли
     bool failed = false;            // непоправимый шаг, повторять бессмысленно
+    bool stepFailed = false;        // шаг просит повтор (меню ещё не построено)
+    bool registered = false;        // команды зарегистрированы (повтор нельзя)
+    bool sourceAdded = false;       // источник панелей подключён (повтор нельзя)
+    bool trapsSet = false;          // перехваты приёмника поставлены
     bool confirmed = false;         // платформа запросила updateState нашего popup
     const char* stage = "?";        // текущий шаг — логируется при падении
     char err[160] = {};
@@ -162,23 +210,35 @@ uintptr_t MMAlloc(size_t size) {
     return (uintptr_t)p;
 }
 
-GUID MMGuid(const wchar_t* s) {   // «{XXXXXXXX-XXXX-…}» в раскладке Windows GUID
+GUID MMGuid(const wchar_t* s) {   // «{8-4-4-4-12}» в раскладке Windows GUID
+    // Стандартный формат несёт тире и внутри Data4 («…-9DCF-0050BAE2BC79»):
+    // чтение фиксированными окнами по 2 символа съезжает на тире (live
+    // 2342: gq1 = 0xC72BAE0B0500CF9D вместо 0x79BCE2BA5000CF9D) — все
+    // getService/QI/bandById с такими GUID возвращали null. Читаем ровно
+    // 32 hex-цифры подряд, тире пропускаем.
     GUID g{};
-    auto hex = [](const wchar_t* p, int n) {
-        unsigned v = 0;
-        for (int i = 0; i < n; ++i) {
-            wchar_t c = p[i];
-            v <<= 4;
-            if (c >= L'0' && c <= L'9') v |= (unsigned)(c - L'0');
-            else if (c >= L'a' && c <= L'f') v |= (unsigned)(c - L'a' + 10);
-            else if (c >= L'A' && c <= L'F') v |= (unsigned)(c - L'A' + 10);
-        }
-        return v;
+    auto hx = [](wchar_t c) -> int {
+        if (c >= L'0' && c <= L'9') return c - L'0';
+        if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+        if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+        return -1;
     };
-    g.Data1 = hex(s + 1, 8);
-    g.Data2 = (unsigned short)hex(s + 10, 4);
-    g.Data3 = (unsigned short)hex(s + 15, 4);
-    for (int i = 0; i < 8; ++i) g.Data4[i] = (unsigned char)hex(s + 20 + i * 2, 2);
+    int d[32];
+    int nd = 0;
+    for (const wchar_t* p = s; *p && nd < 32; ++p) {
+        const int v = hx(*p);
+        if (v >= 0) d[nd++] = v;
+    }
+    if (nd < 32) return g;   // не GUID-строка — оставляем нулевой
+    g.Data1 = ((unsigned)d[0] << 28) | ((unsigned)d[1] << 24) | ((unsigned)d[2] << 20) |
+              ((unsigned)d[3] << 16) | ((unsigned)d[4] << 12) | ((unsigned)d[5] << 8) |
+              ((unsigned)d[6] << 4) | (unsigned)d[7];
+    g.Data2 = (unsigned short)(((unsigned)d[8] << 12) | ((unsigned)d[9] << 8) |
+                               ((unsigned)d[10] << 4) | (unsigned)d[11]);
+    g.Data3 = (unsigned short)(((unsigned)d[12] << 12) | ((unsigned)d[13] << 8) |
+                               ((unsigned)d[14] << 4) | (unsigned)d[15]);
+    for (int i = 0; i < 8; ++i)
+        g.Data4[i] = (unsigned char)(((unsigned)d[16 + 2 * i] << 4) | (unsigned)d[17 + 2 * i]);
     return g;
 }
 
@@ -224,9 +284,59 @@ uintptr_t MMBand(uintptr_t manager, uintptr_t cid) {
     return *(uintptr_t*)outp;
 }
 
+// Прямой поиск панели в карте менеджера (std::map) без вызова bandById:
+// live 2342 vtable-слот 3 возвращает 0 даже для существующих панелей, а
+// чтение дерева детерминированно (RE 2026-11-15). Полный обход всех вершин
+// (стек, лимит 256), возвращает указатель панели из узла (+0x38), без
+// AddRef — использование короткое, на UI-потоке.
+uintptr_t MMBandDirect(uintptr_t manager, const GUID& group, unsigned num) {
+    if (!IsReadable((void*)(manager + kMMManagerOff + 8), 8)) return 0;
+    const uintptr_t sent = *(uintptr_t*)(manager + kMMManagerOff);
+    if (!sent || !IsReadable((void*)(sent + 16), 1)) return 0;
+    const uintptr_t root = *(uintptr_t*)(sent + 8);   // _Parent
+    if (!root || root == sent) return 0;
+    uintptr_t stack[96];
+    int sp = 0;
+    stack[sp++] = root;
+    int visited = 0;
+    int guidMatch = 0, numMatch = 0;
+    const uint64_t gq0 = *(const uint64_t*)&group;
+    const uint64_t gq1 = *((const uint64_t*)&group + 1);
+    while (sp > 0 && visited < 256) {
+        const uintptr_t node = stack[--sp];
+        if (!node || node == sent) continue;
+        if (!IsReadable((void*)node, 0x40)) continue;
+        if (*(const uint8_t*)(node + kMMNodeIsnil)) continue;
+        ++visited;
+        const uintptr_t key = node + kMMNodeKey;
+        const uint64_t k0 = *(const uint64_t*)key;
+        const uint64_t k1 = *(const uint64_t*)(key + 8);
+        const unsigned kNum = *(const unsigned*)(node + kMMNodeNum);
+        if (k0 == gq0 && k1 == gq1) ++guidMatch;
+        if (kNum == num) ++numMatch;
+        if (k0 == gq0 && k1 == gq1 && kNum == num)
+            return *(uintptr_t*)(node + kMMNodeBand);
+        if (sp + 2 < 96) {
+            stack[sp++] = *(uintptr_t*)(node + kMMNodeRight);
+            stack[sp++] = *(uintptr_t*)node;              // _Left
+        }
+    }
+    static LONG dbgTick = 0;
+    // Аномалия выбора (_GUID узлов совпал, а номер нет — либо наоборот)
+    // означает рассинхрон раскладки узла карты с калибровкой сборки.
+    if ((InterlockedIncrement(&dbgTick) % 8) == 1 &&
+        ((guidMatch > 0 && numMatch == 0) || (guidMatch == 0 && numMatch > 0)))
+        LogLine("mainmenu: MMBandDirect: mgr=0x%llX visited=%d guidMatch=%d "
+                "numMatch=%d ищем gq0=0x%llX gq1=0x%llX num=%u",
+                (unsigned long long)manager, visited, guidMatch, numMatch,
+                (unsigned long long)gq0, (unsigned long long)gq1, num);
+    return 0;
+}
+
 // Первый пункт панели как образец (копируется целиком, потом правятся id и вес)
 uintptr_t MMTemplate(uintptr_t manager, const GUID& group, unsigned num) {
     uintptr_t band = MMBand(manager, MMNewCid(group, num));
+    if (!band) band = MMBandDirect(manager, group, num);   // bandById вернул 0
     if (!band) return 0;
     uintptr_t beg = *(uintptr_t*)(band + 0x30);
     uintptr_t end = *(uintptr_t*)(band + 0x38);
@@ -305,18 +415,34 @@ bool MMPatchSlot(uintptr_t* vt, int slot, void* hookFn, uintptr_t* origOut) {
     return true;
 }
 
+// Записываемые копии текстов команд: setText платформы может писать в
+// переданную строку — литералы лежат в .rdata (read-only) и запись в них
+// роняла 1С (0xC0000005, live 2342). Заполняется в MMStepRegister до
+// установки перехватов (один поток — без гонок).
+//
+// (Блок убран: длинные тексты в state-поле не рендерятся — рендерер читает
+// поле как SSO; полный список действий показывает owner-drawn popup
+// оверлея, см. MMTransmitOnCommand → V8iGitBarShowActionMenu.)
+
 size_t __fastcall MMUpdateTrap(size_t self, size_t state) {
     size_t r = MMCall1(g_mm.origUpdate, self, state);
     if (state) {
-        uintptr_t vt = *(uintptr_t*)state;
-        uintptr_t cid = MMCall0(*(uintptr_t*)(vt + kMMSlotStateId * 8), state);
-        if (MMIsOurs(cid)) {
-            unsigned num = *(unsigned*)(cid + 16);
-            if (num == kMMPopupNum && !g_mm.confirmed) {
-                g_mm.confirmed = true;
-                LogLine("mainmenu: пункт отрисован платформой");
+        // Наши дополнения под SEH: любой сбой здесь не должен убивать 1С —
+        // платформа продолжит с состоянием, которое выставила сама.
+        __try {
+            uintptr_t vt = *(uintptr_t*)state;
+            uintptr_t cid = MMCall0(*(uintptr_t*)(vt + kMMSlotStateId * 8), state);
+            if (MMIsOurs(cid)) {
+                unsigned num = *(unsigned*)(cid + 16);
+                if (num == kMMPopupNum && !g_mm.confirmed) {
+                    g_mm.confirmed = true;
+                    LogLine("mainmenu: пункт отрисован платформой");
+                }
+                MMCall1(*(uintptr_t*)(vt + kMMSlotStateEnable * 8), state, 1);
             }
-            MMCall1(*(uintptr_t*)(vt + kMMSlotStateEnable * 8), state, 1);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogLine("mainmenu: updateState-дополнения упали (0x%08X) — состояние не тронуто",
+                    GetExceptionCode());
         }
     }
     return r;
@@ -335,12 +461,15 @@ bool MMTransmitOnCommand(void* self, const void* cmd, DWORD deact) {
     if (!MMIsOurs((uintptr_t)cmd)) return false;
     unsigned num = *(const unsigned*)((uintptr_t)cmd + 16);
     LogLine("mainmenu: команда %u", num);
-    if (num == kMMSettingsNum) {
-        V8iGitBarMenuAction(kMMSettingsNum);
+    if (num == kMMActionsNum) {
+        // «Действия…»: owner-drawn popup оверлея под курсором — полный
+        // список действий с подсказками (нативный рендерер читает тексты
+        // пунктов как SSO, длинные названия в подменю невозможны).
+        V8iGitBarShowActionMenu();
         return true;
     }
-    if (num == 3) {   // показать/скрыть панель
-        V8iGitBarMenuAction(3);
+    if (num == kMMSettingsNum) {
+        V8iGitBarMenuAction(kMMSettingsNum);
         return true;
     }
     return false;
@@ -459,46 +588,68 @@ void MMStepTemplates(void* arg) {
     m->stage = "образцы пунктов";
     GUID frameGroup = MMGuid(kMMFrameStr);
     uintptr_t tmplPopup = MMTemplate(m->manager, frameGroup, 1);
-    uintptr_t tmplLeaf = MMTemplate(m->manager, frameGroup, kMMServiceBandNum);
-    if (!tmplPopup || !tmplLeaf) { strcpy_s(m->err, "не найдены образцы пунктов"); return; }
-    LogLine("mainmenu: образцы пунктов получены (popup=0x%llX leaf=0x%llX)",
-            (unsigned long long)tmplPopup, (unsigned long long)tmplLeaf);
+    if (!tmplPopup) {
+        // Меню ещё не построено (шаг идёт рано; v8snack работает на первом
+        // idle) — повтор через расписание цикла, а не отказ.
+        strcpy_s(m->err, "не найдены образцы пунктов");
+        m->stepFailed = true;
+        return;
+    }
+    m->stepFailed = false;
+    LogLine("mainmenu: образец пункта получен (0x%llX)",
+            (unsigned long long)tmplPopup);
 }
 
 void MMStepRegister(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
+    if (m->registered) return;   // повторная регистрация дублирует команды
     m->stage = "registerCommands";
     GUID group = MMGuid(kMMGroupStr);
     GUID catPopup = MMGuid(kMMCatPopupStr);
     GUID catOwn = MMGuid(kMMCatOwnStr);
     uintptr_t bundle = MMNewAnsi("frame");
-    uintptr_t entries = MMAlloc(kMMEntrySize * 2);
+    // Верхний пункт «GitBar» (popup) + два листовых пункта dropdown'а.
+    // Названия нативных пунктов ограничены 10 символами (SSO в описании
+    // команды, live 2342) — полный список действий открывает «Действия…»
+    // как owner-drawn popup оверлея (полные тексты + подсказки).
+    const size_t count = 3;
+    uintptr_t entries = MMAlloc(kMMEntrySize * count);
     memcpy((void*)entries,
            (void*)MMCmdEntry(group, kMMPopupNum, catPopup, "GitBarPopup", bundle),
            kMMEntrySize);
     memcpy((void*)(entries + kMMEntrySize),
+           (void*)MMCmdEntry(group, kMMActionsNum, catOwn, "GitBarActions", bundle),
+           kMMEntrySize);
+    memcpy((void*)(entries + 2 * kMMEntrySize),
            (void*)MMCmdEntry(group, kMMSettingsNum, catOwn, "GitBarSettings", bundle),
            kMMEntrySize);
     uintptr_t svt = *(uintptr_t*)m->svc;
     MMCall3(*(uintptr_t*)(svt + kMMSlotRegisterCommands * 8),
-            m->svc, bundle, entries, 2);
+            m->svc, bundle, entries, count);
+    m->registered = true;
     m->stage = "тексты пунктов";
     MMSetCommandText(m->svc, group, kMMPopupNum, L"GitBar");
-    MMSetCommandText(m->svc, group, kMMSettingsNum, L"Настройки");
-    LogLine("mainmenu: команды группы зарегистрированы");
+    MMSetCommandText(m->svc, group, kMMActionsNum, L"Действия…");
+    MMSetCommandText(m->svc, group, kMMSettingsNum, L"Настройки…");
+    LogLine("mainmenu: команды группы зарегистрированы (%u шт.)", (unsigned)count);
 }
 
 void MMStepSource(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
+    if (m->sourceAdded) return;   // источник уже подключён
     m->stage = "источник панелей";
     GUID frameGroup = MMGuid(kMMFrameStr);
     GUID group = MMGuid(kMMGroupStr);
     // образцы заново: между register и source платформа могла перестроиться
     uintptr_t tmplPopup = MMTemplate(m->manager, frameGroup, 1);
-    uintptr_t tmplLeaf = MMTemplate(m->manager, frameGroup, kMMServiceBandNum);
-    if (!tmplPopup || !tmplLeaf) { strcpy_s(m->err, "не найдены образцы пунктов"); return; }
+    uintptr_t tmplLeaf = MMTemplate(m->manager, frameGroup, 52);
+    if (!tmplPopup || !tmplLeaf) {
+        strcpy_s(m->err, "не найдены образцы пунктов (источник)");
+        m->stepFailed = true;
+        return;
+    }
 
     uintptr_t clsid = MMAlloc(16), iid = MMAlloc(16), outp = MMAlloc(16);
     MMPutGuid(clsid, MMGuid(kMMClsidCIStr));
@@ -506,50 +657,46 @@ void MMStepSource(void* arg) {
     MMCall3(*(uintptr_t*)(*(uintptr_t*)m->proc + kMMSlotProcCreate * 8),
             m->proc, clsid, iid, outp);
     m->src = *(uintptr_t*)outp;
-    if (!m->src) { strcpy_s(m->err, "не создан источник панелей"); return; }
-
-    // разделитель перед пунктом: образец — разделитель панели «Сервис»
-    uintptr_t sepTmpl = 0;
-    uintptr_t bandSvc = MMBand(m->manager, MMNewCid(frameGroup, kMMServiceBandNum));
-    if (bandSvc) {
-        uintptr_t b0 = *(uintptr_t*)(bandSvc + 0x30);
-        uintptr_t e0 = *(uintptr_t*)(bandSvc + 0x38);
-        for (uintptr_t p = b0; p + kMMItemSize <= e0; p += 8) {
-            uintptr_t it = *(uintptr_t*)p;
-            if (it && *(uintptr_t*)it == kMMSepGuidA && *(uintptr_t*)(it + 8) == kMMSepGuidB) {
-                sepTmpl = it;
-                break;
-            }
-        }
+    if (!m->src) {
+        strcpy_s(m->err, "не создан источник панелей");
+        m->stepFailed = true;
+        return;
     }
 
-    uintptr_t mainItems = MMAlloc(kMMItemSize * 2);
-    size_t mainCount = 0;
-    if (sepTmpl) {
-        memcpy((void*)mainItems, (void*)sepTmpl, kMMItemSize);
-        *(uint64_t*)(mainItems + 0x30) = kMMWeightSep;
-        mainCount = 1;
-    }
-    memcpy((void*)(mainItems + mainCount * kMMItemSize),
-           (void*)MMItem(tmplPopup, group, kMMPopupNum, kMMWeightPopup), kMMItemSize);
-    mainCount++;
-    uintptr_t popItems = MMAlloc(kMMItemSize);
+    // Пункт верхнего меню «GitBar» (отдельное подменю между «Сервис» и
+    // «Окна»): панель {MM_FRAME}/1, вес 18.5 (live 2342: «Сервис» = 18.0,
+    // «Окна» = 19.0). Содержимое popup — панель {наши}/1: «Действия…»
+    // (открывает owner-drawn popup оверлея с полными текстами и
+    // подсказками) и «Настройки…».
+    uintptr_t topItems = MMAlloc(kMMItemSize);
+    memcpy((void*)topItems,
+           (void*)MMItem(tmplPopup, group, kMMPopupNum, kMMWeightTop), kMMItemSize);
+    uintptr_t popItems = MMAlloc(kMMItemSize * 2);
     memcpy((void*)popItems,
+           (void*)MMItem(tmplLeaf, group, kMMActionsNum, kMMWeightItem), kMMItemSize);
+    memcpy((void*)(popItems + kMMItemSize),
            (void*)MMItem(tmplLeaf, group, kMMSettingsNum, kMMWeightItem), kMMItemSize);
 
     uintptr_t sv = *(uintptr_t*)m->src;
     MMCall3(*(uintptr_t*)(sv + kMMSlotAddBand * 8), m->src,
-            MMNewCid(frameGroup, kMMServiceBandNum), MMVector(mainItems, mainCount), 0);
+            MMNewCid(frameGroup, kMMTopBandNum), MMVector(topItems, 1), 0);
     MMCall3(*(uintptr_t*)(sv + kMMSlotAddBand * 8), m->src,
-            MMNewCid(group, kMMPopupNum), MMVector(popItems, 1), 0);
+            MMNewCid(group, kMMPopupNum), MMVector(popItems, 2), 0);
     MMCall0(*(uintptr_t*)(sv + kMMSlotFinish * 8), m->src);
-    LogLine("mainmenu: панели подключены (разделитель %s)",
-            sepTmpl ? "найден" : "нет образца");
+    // 4. подключаем источник к менеджеру и сразу перестраиваем (MM_REBUILD=1,
+    //    v8snack mainmenu.as шаг 4): без addSource менеджер не знает об
+    //    источнике — панели в его карте не появляются (live 2342).
+    MMCall2(*(uintptr_t*)(*(uintptr_t*)m->manager + kMMSlotAddSource * 8),
+            m->manager, m->src, 1);
+    m->sourceAdded = true;
+    LogLine("mainmenu: панели подключены, источник отдан менеджеру "
+            "(пункт в верхнем меню, вес 18.5)");
 }
 
 void MMStepTraps(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
+    if (m->trapsSet) { m->built = true; return; }   // повторный патч поймал бы свой хук
     m->stage = "перехваты приёмника";
     if (m->recv && m->recvVt &&
         MMPatchSlot(m->recvVt, m->trapUpd, (void*)&MMUpdateTrap, &m->origUpdate) &&
@@ -557,13 +704,14 @@ void MMStepTraps(void* arg) {
         MMPatchSlot(m->recvVt, m->trapTx, (void*)&MMTransmitTrap, &m->origTransmit)) {
         m->groupBytes = MMAlloc(32);
         MMPutGuid(m->groupBytes, MMGuid(kMMGroupStr));
+        m->trapsSet = true;
         LogLine("mainmenu: перехваты установлены на приёмник 0x%llX",
                 (unsigned long long)(uintptr_t)m->recv);
     } else {
         LogLine("mainmenu: приёмник для перехватов не получен — пункты останутся неактивными");
     }
     m->built = true;
-    LogLine("mainmenu: пункт «GitBar» добавлен в меню «Сервис»");
+    LogLine("mainmenu: пункт «GitBar» добавлен в верхнее меню");
 }
 
 void MMRebuildStep(void* arg) {
@@ -619,8 +767,193 @@ bool MMNativeMenuEnabled() {
     return true;
 }
 
+// --- R2: экземпляры SCOM_Process и чтение реестра getService -----------------
+
+// Скан всей доступной памяти по выровненным qword (шаг 8 байт): адреса объектов,
+// чьё первое поле равно vtable SCOM_Process. Чтение через ReadProcessMemory
+// самого себя — на отказ региона пропускается окно, а не весь скан.
+int MMFindInstances(uintptr_t vtVal, uintptr_t* out, int maxOut) {
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+    const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
+    const size_t kChunk = 1u << 20;
+    std::vector<unsigned char> buf(kChunk);
+    int n = 0;
+    while (addr < maxAddr && n < maxOut) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
+        const uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd <= addr) break;    // защита от отсутствия прогресса
+        bool usable = mbi.State == MEM_COMMIT;
+        if (usable) {
+            const DWORD prot = mbi.Protect & 0xFF;
+            usable = prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                     prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                     prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+            if (mbi.Protect & PAGE_GUARD) usable = false;
+        }
+        if (!usable) { addr = regionEnd; continue; }
+        uintptr_t cur = addr;
+        while (cur < regionEnd && n < maxOut) {
+            const size_t want = (size_t)(regionEnd - cur < kChunk ? regionEnd - cur : kChunk);
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)cur, buf.data(),
+                                   want, &got) || got < 8) {
+                cur += kChunk;
+                continue;
+            }
+            for (size_t off = 0; off + 8 <= got && n < maxOut; off += 8) {
+                if (*(const uint64_t*)(buf.data() + off) == (uint64_t)vtVal)
+                    out[n++] = cur + off;
+            }
+            if (got < want) break;
+            cur += kChunk;
+        }
+        addr = regionEnd;
+    }
+    return n;
+}
+
+// Обход списка записей реестра от сентинела: поиск ключа ICommandService
+// (точное сравнение двух qword — как в impl getService), возврат сервиса.
+// Только чтение памяти; битые узлы прерывают обход кандидата.
+bool MMRegistryFindSvc(uintptr_t proc, uintptr_t* svcOut) {
+    if (!IsReadable((void*)(proc + kMMRegSentinel), 8)) return false;
+    const uintptr_t sentinel = *(uintptr_t*)(proc + kMMRegSentinel);
+    if (!sentinel || !IsReadable((void*)sentinel, 16)) return false;
+    uintptr_t node = *(uintptr_t*)sentinel;
+    for (int i = 0; node && node != sentinel && i < 4096; ++i) {
+        if (!IsReadable((void*)node, 0x40)) return false;
+        if (*(const uint64_t*)(node + kMMRegNodeKey) == kMMIidSvcQ0 &&
+            *(const uint64_t*)(node + kMMRegNodeKey + 8) == kMMIidSvcQ1) {
+            const uintptr_t svc = *(uintptr_t*)(node + kMMRegNodeSvc);
+            if (svc && IsReadable((void*)svc, kMMManagerOff + 8)) {
+                *svcOut = svc;
+                return true;
+            }
+            return false;
+        }
+        node = *(uintptr_t*)node;
+    }
+    return false;
+}
+
+// Рекурсивный поиск панели {MM_FRAME}/52 в std::map-дереве менеджера панелей.
+// Битая вершина или превышение глубины завершают ветку (карта сбалансирована,
+// глубина живого меню — единицы).
+constexpr unsigned kMMFrameBand52 = 52;   // панель «Сервис» — маркер главного менеджера
+
+bool MMTreeHasFrameBand(uintptr_t node, int depth) {
+    if (!node || depth > 24) return false;
+    if (!IsReadable((void*)node, 0x40)) return false;
+    if (*(const uint8_t*)(node + kMMNodeIsnil)) return false;   // сентинел
+    if (*(const uint64_t*)(node + kMMNodeKey) == kMMFrameQ0 &&
+        *(const uint64_t*)(node + kMMNodeKey + 8) == kMMFrameQ1 &&
+        *(const unsigned*)(node + kMMNodeNum) == kMMFrameBand52)
+        return true;
+    return MMTreeHasFrameBand(*(const uintptr_t*)node, depth + 1) ||
+           MMTreeHasFrameBand(*(const uintptr_t*)(node + kMMNodeRight), depth + 1);
+}
+
+// Выбор менеджера панелей по содержимому: среди объектов класса менеджера
+// (vtable frame.dll+0xB097F0) берём тот, чья карта уже содержит панель рамки.
+bool MMFindMenuManager(uintptr_t mgrVtVal, uintptr_t* mgrOut) {
+    // Лимит велик: значение vtable встречается и в стековых слотах/коде, и
+    // лимит 32 заполнялся ложными попаданиями раньше кучи (live 2342).
+    uintptr_t cands[4096] = {};
+    const int n = MMFindInstances(mgrVtVal, cands, 4096);
+    // Диагностика выбора: счётчик кандидатов и состояние первых — в журнал
+    // (печатается не на каждом опросе, чтобы не заливать лог).
+    static LONG diagTick = 0;
+    const bool diag = (InterlockedIncrement(&diagTick) % 5) == 1;
+    if (diag) LogLine("mainmenu: менеджер-скан: кандидатов %d", n);
+    for (int i = 0; i < n; ++i) {
+        const uintptr_t mgr = cands[i];
+        if (!IsReadable((void*)(mgr + kMMManagerOff + 8), 8)) continue;
+        const uintptr_t sent = *(uintptr_t*)(mgr + kMMManagerOff);
+        if (!sent || !IsReadable((void*)(sent + 16), 1)) continue;
+        const uintptr_t root = *(uintptr_t*)(sent + 8);   // std::map _Parent
+        if (root && root != sent && MMTreeHasFrameBand(root, 0)) {
+            *mgrOut = mgr;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Один опрос: скан экземпляров SCOM_Process, из реестра первого с записью
+// ICommandService берём сервис (registerCommands); менеджер панелей ищем
+// сканом по содержимому карты. Сервисы и меню регистрируются по мере
+// инициализации платформы, поэтому опрос повторяется снаружи.
+bool MMScanRegistry(MMState* m) {
+    ModuleRange core;
+    if (!FindModule(L"core83.dll", core)) return false;
+    if (!m->svc) {
+        uintptr_t inst[64] = {};   // значение vtable также лежит в стековых слотах
+        const int n = MMFindInstances(core.base + kMMProcVtableRva, inst, 64);
+        for (int i = 0; i < n; ++i) {
+            uintptr_t svc = 0;
+            if (!MMRegistryFindSvc(inst[i], &svc)) continue;
+            if (!IsReadable((void*)svc, 0x40)) continue;
+            m->proc = inst[i];
+            m->svc = svc;
+            LogLine("mainmenu: экземпляр 0x%llX — ICommandService svc=0x%llX",
+                    (unsigned long long)inst[i], (unsigned long long)svc);
+            break;
+        }
+        if (!m->svc) return false;
+    }
+    // Менеджер: сначала по содержимому карты (главное меню), затем fallback —
+    // менеджер сервиса (v8snack-путь), если у него есть источники.
+    ModuleRange frame;
+    if (FindModule(L"frame.dll", frame)) {
+        uintptr_t menuMgr = 0;
+        if (MMFindMenuManager(frame.base + kMMMngrVtableRva, &menuMgr)) {
+            m->manager = menuMgr;
+            LogLine("mainmenu: менеджер панелей найден сканом: 0x%llX "
+                    "(карта содержит {MM_FRAME}/52)", (unsigned long long)menuMgr);
+            return true;
+        }
+    }
+    uintptr_t svcMgr = *(uintptr_t*)(m->svc + kMMManagerOff);
+    if (svcMgr && IsReadable((void*)(svcMgr + 0xB8 + 8), 8)) {
+        const uintptr_t srcs = *(uintptr_t*)(svcMgr + 0xB8);
+        if (srcs && IsReadable((void*)srcs, 8) && *(uintptr_t*)srcs != srcs) {
+            m->manager = svcMgr;
+            LogLine("mainmenu: менеджер из [svc+0xD0]=0x%llX (источники не пусты)",
+                    (unsigned long long)svcMgr);
+            return true;
+        }
+    }
+    return false;
+}
+
+// SEH-обёртки одной попытки: сами функции без C++-объектов, поэтому __try
+// здесь допустим (в MMWorkerInner unwind запрещает его — C2712).
+bool MMDiscoverReceiverGuarded(void** recvOut, uintptr_t** recvVtOut,
+                               int* transmitSlot, int* updateSlot, int* hasSlot,
+                               void** coreOut, void** frameObjOut) {
+    __try {
+        return V8iGetCommandReceiver(recvOut, recvVtOut, transmitSlot, updateSlot,
+                                     hasSlot, coreOut, frameObjOut);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void MMScanRegistryGuarded(MMState* m) {
+    __try {
+        MMScanRegistry(m);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogLine("mainmenu: скан реестра упал (0x%08X)", GetExceptionCode());
+    }
+}
+
 // Тело рабочего потока. Вызывается из SEH-обёртки: любое исключение в нашем
 // потоке не должно убивать 1С (payload-правило «каждый поток под SEH»).
+// SEH-обёртки отдельных попыток вынесены в функции без C++-объектов: __try
+// запрещён там, где компилятор строит unwind (C2712).
 void MMWorkerInner() {
     LogLine("mainmenu: поток запущен, ждём устояния платформы");
     // Хуки обёрток ставятся как можно раньше (1С вызывает getService при
@@ -650,7 +983,8 @@ void MMWorkerInner() {
     }
 
     // 0. приёмник и объекты цепочки рамки (рабочий поток, безопасно):
-    //    та же дискавери+проба, что у cmd-цепочки.
+    //    та же дискавери+проба, что у cmd-цепочки. Проба звает слоты чужих
+    //    vtable — падение одной попытки не должно убивать весь воркер.
     void* recv = nullptr;
     uintptr_t* recvVt = nullptr;
     int txSlot = 3, updSlot = 4, hasSlot = 5;
@@ -658,8 +992,8 @@ void MMWorkerInner() {
     void* frameObj = nullptr;
     bool receiverOk = false;
     for (int i = 0; i < 30 && !receiverOk; ++i) {
-        receiverOk = V8iGetCommandReceiver(&recv, &recvVt, &txSlot, &updSlot,
-                                           &hasSlot, &core, &frameObj);
+        receiverOk = MMDiscoverReceiverGuarded(&recv, &recvVt, &txSlot, &updSlot,
+                                               &hasSlot, &core, &frameObj);
         if (!receiverOk) Sleep(3000);
     }
     if (!receiverOk) {
@@ -689,40 +1023,60 @@ void MMWorkerInner() {
                 hookId ? "установлен" : hookErr.c_str());
     }
 
-    // 1. ожидание захвата объекта через хуки обёрток (до 5 минут; журнал
-    //    каждые 15 с). Обёртка getService вызывается платформой при работе
-    //    с командами — провоцируется отправкой команд дизайнера.
-    for (int i = 0; i < 100 && !m->proc; ++i) {
-        if ((i % 5) == 4)
-            LogLine("mainmenu: ожидание захвата объекта через хук (%d с)", (i + 1) * 3);
-        Sleep(3000);
+    // 1. R2-путь: скан экземпляров SCOM_Process по vtable и чтение реестра
+    //    getService. Сервисы регистрируются по мере инициализации — опрашиваем
+    //    до 5 минут (журнал каждые 30 с). Только чтение памяти: безопасно на
+    //    рабочем потоке, без маршала и без вызовов vtable.
+    bool scanRan = false;
+    for (int i = 0; i < 30 && !(m->svc && m->manager); ++i) {
+        if ((i % 3) == 2)
+            LogLine("mainmenu: скан реестра сервисов (%d с)", (i + 1) * 10);
+        scanRan = true;
+        MMScanRegistryGuarded(m);
+        if (m->svc && m->manager) break;
+        Sleep(10000);
     }
-    if (!m->proc) {
-        LogLine("mainmenu: обёртка не вызвана платформой — пункт не добавлен");
-        return;
-    }
-    LogLine("mainmenu: объект процесса 0x%llX — QI за ICommandService",
-            (unsigned long long)m->proc);
+    if (m->svc && m->manager) {
+        LogLine("mainmenu: ICommandService получен чтением реестра getService");
+    } else {
+        // 2. Fallback: прежний путь — захват объекта хуком обёртки getService
+        //    (до 5 минут; журнал каждые 15 с), затем QI и getService (слот 14)
+        //    на UI-потоке. Обёртка вызывается платформой при работе с командами.
+        for (int i = 0; i < 100 && !m->proc; ++i) {
+            if ((i % 5) == 4)
+                LogLine("mainmenu: ожидание захвата объекта через хук (%d с)", (i + 1) * 3);
+            Sleep(3000);
+        }
+        if (!m->proc) {
+            LogLine("mainmenu: %s — пункт не добавлен",
+                    scanRan ? "реестр сервисов не дал ICommandService и обёртка не вызвана"
+                            : "скан реестра не выполнялся, обёртка не вызвана");
+            return;
+        }
+        LogLine("mainmenu: объект процесса 0x%llX — QI за ICommandService",
+                (unsigned long long)m->proc);
 
-    // 2. QueryInterface за ICommandService (UI-поток): захваченный объект —
-    //    первый кандидат, затем приёмник/core/рамка.
-    m->stage = "QueryInterface";
-    m->svc = 0;
-    m->manager = 0;
-    v8i::V8iRunOnUi(MMStepQI, m);
-    if (!(m->svc && m->manager)) {
-        LogLine("mainmenu: QI не дал ICommandService — пробуем getService (слот 14)");
-        m->stage = "getService слот 14";
+        m->stage = "QueryInterface";
         m->svc = 0;
         m->manager = 0;
-        if (!v8i::V8iRunOnUi(MMStepGetService, m) || !(m->svc && m->manager)) {
-            LogLine("mainmenu: getService на захваченном объекте не подтвердился "
-                    "— пункт не добавлен");
-            return;
+        v8i::V8iRunOnUi(MMStepQI, m);
+        if (!(m->svc && m->manager)) {
+            LogLine("mainmenu: QI не дал ICommandService — пробуем getService (слот 14)");
+            m->stage = "getService слот 14";
+            m->svc = 0;
+            m->manager = 0;
+            if (!v8i::V8iRunOnUi(MMStepGetService, m) || !(m->svc && m->manager)) {
+                LogLine("mainmenu: getService на захваченном объекте не подтвердился "
+                        "— пункт не добавлен");
+                return;
+            }
         }
     }
 
     // 3. цепочка построения: образцы, registerCommands, источник, перехваты.
+    // Шаг с m->stepFailed (например, меню ещё не построено) повторяется по
+    // расписанию; шаги с побочным эффектом (регистрация, источник, перехваты)
+    // атомарны — повтор не дублирует их.
     struct MMStepDef { const char* name; void (*fn)(void*); };
     const MMStepDef steps[] = {
         {"образцы пунктов",  MMStepTemplates},
@@ -735,8 +1089,15 @@ void MMWorkerInner() {
         bool ok = true;
         for (const MMStepDef& s : steps) {
             m->stage = s.name;
+            m->stepFailed = false;
             if (!v8i::V8iRunOnUi(s.fn, m)) {
                 LogLine("mainmenu: цепочка прервана на шаге «%s» (попытка %d)",
+                        s.name, attempt);
+                ok = false;
+                break;
+            }
+            if (m->stepFailed) {
+                LogLine("mainmenu: шаг «%s» повторится (попытка %d)",
                         s.name, attempt);
                 ok = false;
                 break;
@@ -767,12 +1128,21 @@ void MMWorkerInner() {
 }
 
 DWORD WINAPI MMWorkerThread(LPVOID) {
+    // Один строитель на процесс: несколько копий payload в одном 1С каждая
+    // поднимают свой воркер, и двойное registerCommands/addSource роняет
+    // перестройку меню (live 2342: 0xC00000FD в rebuild). Мьютекс держится до
+    // конца потока — освобождается в любом исходе, включая исключение.
+    HANDLE buildMutex = CreateMutexW(nullptr, FALSE, L"Local\\v8inject.mainmenu.build");
+    bool mine = !buildMutex || WaitForSingleObject(buildMutex, 15000) == WAIT_OBJECT_0;
     __try {
-        MMWorkerInner();
+        if (mine) MMWorkerInner();
+        else LogLine("mainmenu: построение уже идёт в другом воркере — выходим");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         LogLine("mainmenu: поток упал (0x%08X) на шаге «%s», пункт не добавлен — 1С не тронута",
                 GetExceptionCode(), g_mm.stage ? g_mm.stage : "?");
     }
+    if (mine && buildMutex) ReleaseMutex(buildMutex);
+    if (buildMutex) CloseHandle(buildMutex);
     return 0;
 }
 

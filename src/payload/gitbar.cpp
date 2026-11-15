@@ -3504,6 +3504,35 @@ void ShowActionMenu(HWND owner) {
     if (cmd) DoAction(cmd);
 }
 
+// То же меню действий, но под курсором: вызывается из transmit-перехвата
+// нативного пункта «GitBar» в главном меню (mainmenu.cpp) — popup появляется
+// прямо под пунктом меню, где стоит курсор.
+void ShowActionMenuAtCursor(HWND owner) {
+    ActionMenuComputeMetrics();
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    for (const ActionItem& it : kActionItems) {
+        if (it.sepBefore) AppendMenuW(menu, MF_OWNERDRAW | MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_OWNERDRAW, (UINT_PTR)it.id, (LPCWSTR)&it);
+    }
+    MENUINFO mi{ sizeof(mi) };
+    mi.fMask = MIM_BACKGROUND;
+    mi.hbrBack = UiMenuBrush();
+    SetMenuInfo(menu, &mi);
+    POINT pt{};
+    GetCursorPos(&pt);
+    HWND top = GetAncestor(owner, GA_ROOT);
+    SetForegroundWindow(top ? top : owner);
+    g_bar.menuOpen = true;
+    int cmd = (int)TrackPopupMenu(
+        menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+        pt.x, pt.y, 0, owner, nullptr);
+    g_bar.menuOpen = false;
+    PostMessageW(owner, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    if (cmd) DoAction(cmd);
+}
+
 void DoAction(int id) {
     switch (id) {
     case kWinIdDump: {
@@ -4038,6 +4067,20 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ShowSettings(hwnd);
         return 0;
 
+    // Native GitBar menu action (mainmenu.cpp table, num = kWinId + 10):
+    // the same actions the overlay bar ran through DoAction, deferred the
+    // same way — modal dialogs must not open inside transmitCommand.
+    case WM_APP + 0x2F15:
+        DoAction((int)wp);
+        return 0;
+
+    // Click on the native top-level «GitBar» menu item (mainmenu.cpp):
+    // open the full owner-drawn action popup at the cursor — the platform
+    // menu cannot render long item texts (live 2342).
+    case WM_APP + 0x2F16:
+        ShowActionMenuAtCursor(hwnd);
+        return 0;
+
     case WM_MOUSEMOVE: {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
         if (g_bar.dragging && (wp & MK_LBUTTON)) {
@@ -4290,6 +4333,13 @@ void V8iGitBarSetNativeMenu() {
 // открывается отложенно — обычным сообщением бару, не внутри transmitCommand,
 // где платформа разбирает своё меню. «Скрыть» — WM_CLOSE напрямую (без
 // ожидания потока панели: UI-поток в transmit не должен блокироваться).
+// Клик по верхнему пункту «GitBar» в главном меню (mainmenu.cpp): открыть
+// owner-drawn popup действий под курсором. Отложенное сообщение — как и
+// остальные реакции на transmit, не внутри платформенного вызова.
+void V8iGitBarShowActionMenu() {
+    if (g_bar.hwnd) PostMessageW(g_bar.hwnd, WM_APP + 0x2F16, 0, 0);
+}
+
 void V8iGitBarMenuAction(unsigned num) {
     if (num == 2) {
         if (!g_bar.hwnd || !IsWindowVisible(g_bar.hwnd)) GitBarCommandToJson(L"");
