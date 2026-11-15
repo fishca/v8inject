@@ -90,7 +90,9 @@ struct MMState {
     void* core = nullptr;           // объекты цепочки рамки (для QueryInterface)
     void* frameObj = nullptr;
     int trapTx = 3, trapUpd = 4, trapHas = 5;   // слоты приёмника (8.3)
-    volatile LONG procTaken = 0;    // обёртка getService: объект захвачен
+    volatile LONG procTaken = 0;
+    GUID lastObservedIid{};
+    GUID getServiceIid{};    // обёртка getService: объект захвачен
     bool stepRan = false;           // шаг был выполнен (маршал готов)
     bool built = false;             // registerCommands/addBand/addSource прошли
     bool failed = false;            // непоправимый шаг, повторять бессмысленно
@@ -107,12 +109,22 @@ MMState g_mm;
 
 // Наблюдатель хука обёртки: 1С сама передаёт сюда SCOM_Process. Захват один
 // раз; POD-правила соблюдены (Interlocked + присвоение).
-void MMObsTakeProc(uintptr_t a0, uintptr_t, uintptr_t, uintptr_t) {
-    if (!a0) return;
-    if (!g_mm.proc && InterlockedCompareExchange((volatile LONG*)&g_mm.procTaken, 1, 0) == 0) {
-        g_mm.proc = a0;
-        LogLine("mainmenu: объект процесса захвачен из обёртки getService: 0x%llX",
-                (unsigned long long)a0);
+void MMObsTakeProc(uintptr_t a0, uintptr_t a1, uintptr_t, uintptr_t) {
+    if (!a0 || !a1) return;
+    // Лог запрашиваемого IID: обёртка generic — платформа просит разные
+    // сервисы; захват процесса имеет смысл только для нашего IID.
+    GUID iid = *(const GUID*)a1;
+    LogLine("mainmenu: wrapper: proc=0x%llX iid={%08X-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X}",
+            (unsigned long long)a0, iid.Data1, iid.Data2, iid.Data3,
+            iid.Data4[0], iid.Data4[1], iid.Data4[2], iid.Data4[3],
+            iid.Data4[4], iid.Data4[5], iid.Data4[6], iid.Data4[7]);
+    g_mm.lastObservedIid = iid;
+    if (iid.Data1 == 0x8F885821 && iid.Data2 == 0xD353) {   // ICommandService
+        if (InterlockedCompareExchange((volatile LONG*)&g_mm.procTaken, 1, 0) == 0) {
+            g_mm.proc = a0;
+            LogLine("mainmenu: объект процесса захвачен: 0x%llX",
+                    (unsigned long long)a0);
+        }
     }
 }
 
@@ -419,7 +431,7 @@ void MMStepQI(void* arg) {
 void MMStepGetService(void* arg) {
     MMState* m = (MMState*)arg;
     m->stepRan = true;
-    GUID iidSvc = MMGuid(kMMIidSvcStr);
+    GUID iidSvc = m->getServiceIid;
     uintptr_t svc = MMCall1(*(uintptr_t*)(*(uintptr_t*)m->proc + kMMSlotProcGetService * 8),
                             m->proc, (uintptr_t)&iidSvc);
     uintptr_t manager = 0;
@@ -611,10 +623,8 @@ bool MMNativeMenuEnabled() {
 // потоке не должно убивать 1С (payload-правило «каждый поток под SEH»).
 void MMWorkerInner() {
     LogLine("mainmenu: поток запущен, ждём устояния платформы");
-    // 0b. перехват обёртки getService: 1С сама передаёт в неё SCOM_Process.
-    // Хуки на ОБЕ обёртки getService: 1cv8.exe+0xBFCB0 и config.dll+0xCF320
-    // (обе калиброваны для 8.3.27.2342 x64 по статическому анализу xref
-    // IID_ICommandService). Живые вызовы идут через config.dll.
+    // Хуки обёрток ставятся как можно раньше (1С вызывает getService при
+    // загрузке базы; поздняя установка пропускает эти вызовы).
     ModuleRange exeM;
     if (FindModule(L"1cv8.exe", exeM)) {
         std::string hookErr;
@@ -623,6 +633,7 @@ void MMWorkerInner() {
         LogLine("mainmenu: хук обёртки getService (1cv8+0xBFCB0): %s",
                 hookId ? "установлен" : hookErr.c_str());
     }
+
     Sleep(3000);
     if (!MMNativeMenuEnabled()) {
         LogLine("mainmenu: отключён ([git] nativemenu=0)");
@@ -666,6 +677,8 @@ void MMWorkerInner() {
     LogLine("mainmenu: приёмник 0x%llX (core 0x%llX, рамка 0x%llX), слоты tx/upd/has %d/%d/%d",
             (unsigned long long)(uintptr_t)recv, (unsigned long long)(uintptr_t)core,
             (unsigned long long)(uintptr_t)frameObj, txSlot, updSlot, hasSlot);
+
+    // хук на обёртку config.dll (загружена к этому моменту)
     ModuleRange cfgM;
     if (FindModule(L"config.dll", cfgM)) {
         std::string hookErr;
@@ -676,21 +689,20 @@ void MMWorkerInner() {
                 hookId ? "установлен" : hookErr.c_str());
     }
 
-
     // 1. ожидание захвата объекта через хуки обёрток (до 5 минут; журнал
     //    каждые 15 с). Обёртка getService вызывается платформой при работе
     //    с командами — провоцируется отправкой команд дизайнера.
-    for (int i = 0; i < 100 && !g_mm.proc; ++i) {
+    for (int i = 0; i < 100 && !m->proc; ++i) {
         if ((i % 5) == 4)
             LogLine("mainmenu: ожидание захвата объекта через хук (%d с)", (i + 1) * 3);
         Sleep(3000);
     }
-    if (!g_mm.proc) {
+    if (!m->proc) {
         LogLine("mainmenu: обёртка не вызвана платформой — пункт не добавлен");
         return;
     }
     LogLine("mainmenu: объект процесса 0x%llX — QI за ICommandService",
-            (unsigned long long)g_mm.proc);
+            (unsigned long long)m->proc);
 
     // 2. QueryInterface за ICommandService (UI-поток): захваченный объект —
     //    первый кандидат, затем приёмник/core/рамка.
@@ -737,6 +749,7 @@ void MMWorkerInner() {
         LogLine("mainmenu: %s", m->err[0] ? m->err : "цепочка построения не прошла");
         return;
     }
+
     // Платформа отбрасывает перестройку, пока достраивает меню (загрузка
     // конфигурации, восстановление окон), сигнала готовности нет — запрос
     // updateState нашего popup приходит только от нарисованного пункта.
