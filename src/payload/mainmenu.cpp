@@ -26,9 +26,9 @@
 // и fallback-захват объекта, старые шаги QI/getService сохранены как запасной
 // путь.
 //
-// Ветки раскладки v8snack: 8.3.27 и 8.5 совпадают (entry 0x68, SSO-текст).
-// Наши тексты («GitBar», «Настройки») короче 10 символов и целиком помещаются
-// в SSO-описание команды — ICommandState.setText не требуется.
+// Ветки раскладки v8snack: 8.3.27 и 8.5 совпадают (entry 0x68, v8string
+// с SSO и кучевым хранилищем). Короткий «GitBar» записывается в SSO,
+// полные названия действий — в кучевые строки описания команды.
 
 #include "v8inject/diag.h"
 #include "v8inject/hook.h"
@@ -41,6 +41,7 @@
 #include <commctrl.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <string>
@@ -51,7 +52,6 @@ namespace v8i {
 // Из src/payload/gitbar.cpp (namespace v8i).
 void V8iGitBarMenuAction(unsigned num);
 void V8iGitBarSetNativeMenu();
-void V8iGitBarShowActionMenu();
 
 // --- константы рецепта (v8snack mainmenu.as:10-30, MAINMENU.md §2-§6) ------
 
@@ -63,12 +63,34 @@ const wchar_t kMMClsidCIStr[] = L"{F459D5F0-E7C0-11D4-9DCD-0050BAE2BC79}";   // 
 const wchar_t kMMIidCIStr[] = L"{7DF15090-7A63-11D4-84A1-008048DA06DF}";
 const wchar_t kMMIidSvcStr[] = L"{8F885821-D353-11D3-8A57-008048DA06DF}";   // IID ICommandService
 const unsigned kMMPopupNum = 1;       // popup «GitBar» (верхний пункт)
-const unsigned kMMActionsNum = 10;    // «Действия…» — открывает popup оверлея
 const unsigned kMMSettingsNum = 2;    // «Настройки…»
 const unsigned kMMTopBandNum = 1;        // панель верхнего меню ({MM_FRAME}/1)
 const uint64_t kMMWeightTop = 0x4032800000000000ULL;    // 18.5 — верхнее меню:
                                           // «Сервис» = 18.0, «Окна» = 19.0 (live 2342)
 const uint64_t kMMWeightItem = 0x3FF0000000000000ULL;   // 1.0 — пункт внутри popup
+
+// Действия «GitBar» в нативном подменю (перенос оверлей-меню из gitbar.cpp,
+// таблица kActionItems). Разделители групп — как в оверлей-таблице
+// (sepBefore). Полные тексты — в описания команд длинной v8string
+// (MMSetCommandTextLong).
+struct MMActionDef { unsigned num; const wchar_t* text; bool sepBefore; };
+const MMActionDef kMMActions[] = {
+    {11, L"Выгрузить исходники в файлы",         false},  // kWinIdDump
+    {24, L"Выгрузить расширение в файлы",        false},  // kWinIdDumpExt
+    {12, L"Создать репозиторий в папке выгрузки", false}, // kWinIdInit
+    {23, L"Клонировать репозиторий…",            false},  // kWinIdClone
+    {13, L"Коммит изменений…",                   false},  // kWinIdCommit
+    {14, L"Пуш в удалённый репозиторий",         false},  // kWinIdPush
+    {17, L"Забрать изменения",                   true},   // kWinIdPull
+    {18, L"Получить изменения",                  false},  // kWinIdFetch
+    {19, L"Ветки…",                              true},   // kWinIdBranches
+    {20, L"Отложенные изменения…",               false},  // kWinIdStash
+    {21, L"Теги…",                               false},  // kWinIdTags
+    {22, L"Рабочая копия…",                      false},  // kWinIdStatus
+    {16, L"История коммитов",                    false},  // kWinIdLog
+    {2,  L"Настройки…",                          true},   // kWinIdSettings
+};
+constexpr size_t kMMActionCount = sizeof(kMMActions) / sizeof(kMMActions[0]);
 
 constexpr uintptr_t kMMManagerOff = 0xD0;   // [ICommandService + 0xD0] — менеджер панелей
 
@@ -400,6 +422,34 @@ void MMSetCommandText(uintptr_t svc, const GUID& group, unsigned num, const wcha
     MMSetShort(b + 0x50, text);
 }
 
+// Длинная v8string 8.3.20+: data указывает на [refCount][UTF-16][0],
+// старший бит capacity отличает кучевое хранилище от SSO (v8api/string.v).
+void MMSetLong(uintptr_t dst, const wchar_t* text) {
+    const size_t len = wcslen(text);
+    unsigned char* data = (unsigned char*)malloc(len * 2 + 6);
+    if (!data) return;
+    *(unsigned*)data = 1;
+    memcpy(data + 4, text, (len + 1) * 2);
+    memset((void*)dst, 0, 24);
+    *(unsigned char**)dst = data;
+    *(uintptr_t*)(dst + 8) = len;
+    *(uintptr_t*)(dst + 16) = len | ((uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1));
+}
+
+void MMSetCommandTextLong(uintptr_t svc, const GUID& group, unsigned num,
+                          const wchar_t* text) {
+    uintptr_t svt = *(uintptr_t*)svc;
+    uintptr_t descr = 0;
+    uintptr_t cid = MMNewCid(group, num);
+    MMCall2(*(uintptr_t*)(svt + kMMSlotCommandDescription * 8), svc, (uintptr_t)&descr, cid);
+    if (!descr) return;
+    uintptr_t b = descr - 0x70;
+    *(uintptr_t*)(b + 0x68) = 1;
+    const uintptr_t slots[4] = { b + 0x08, b + 0x20, b + 0x38, b + 0x50 };
+    for (uintptr_t slot : slots)
+        MMSetLong(slot, text);
+}
+
 // --- перехваты на приёмнике -------------------------------------------------
 
 bool MMPatchSlot(uintptr_t* vt, int slot, void* hookFn, uintptr_t* origOut) {
@@ -414,15 +464,6 @@ bool MMPatchSlot(uintptr_t* vt, int slot, void* hookFn, uintptr_t* origOut) {
     *origOut = (uintptr_t)orig;
     return true;
 }
-
-// Записываемые копии текстов команд: setText платформы может писать в
-// переданную строку — литералы лежат в .rdata (read-only) и запись в них
-// роняла 1С (0xC0000005, live 2342). Заполняется в MMStepRegister до
-// установки перехватов (один поток — без гонок).
-//
-// (Блок убран: длинные тексты в state-поле не рендерятся — рендерер читает
-// поле как SSO; полный список действий показывает owner-drawn popup
-// оверлея, см. MMTransmitOnCommand → V8iGitBarShowActionMenu.)
 
 size_t __fastcall MMUpdateTrap(size_t self, size_t state) {
     size_t r = MMCall1(g_mm.origUpdate, self, state);
@@ -461,15 +502,15 @@ bool MMTransmitOnCommand(void* self, const void* cmd, DWORD deact) {
     if (!MMIsOurs((uintptr_t)cmd)) return false;
     unsigned num = *(const unsigned*)((uintptr_t)cmd + 16);
     LogLine("mainmenu: команда %u", num);
-    if (num == kMMActionsNum) {
-        // «Действия…»: owner-drawn popup оверлея под курсором — полный
-        // список действий с подсказками (нативный рендерер читает тексты
-        // пунктов как SSO, длинные названия в подменю невозможны).
-        V8iGitBarShowActionMenu();
+    if (num == kMMSettingsNum) {   // настройки — отложенный диалог
+        V8iGitBarMenuAction(kMMSettingsNum);
         return true;
     }
-    if (num == kMMSettingsNum) {
-        V8iGitBarMenuAction(kMMSettingsNum);
+    // Действия оверлей-меню (номер = kWinId + 10): бар исполняет их сам
+    // (DoAction) отложенным сообщением — модальные диалоги нельзя открывать
+    // внутри transmitCommand.
+    if (num >= 11 && num <= 24) {
+        V8iGitBarMenuAction(num);
         return true;
     }
     return false;
@@ -609,29 +650,30 @@ void MMStepRegister(void* arg) {
     GUID catPopup = MMGuid(kMMCatPopupStr);
     GUID catOwn = MMGuid(kMMCatOwnStr);
     uintptr_t bundle = MMNewAnsi("frame");
-    // Верхний пункт «GitBar» (popup) + два листовых пункта dropdown'а.
-    // Названия нативных пунктов ограничены 10 символами (SSO в описании
-    // команды, live 2342) — полный список действий открывает «Действия…»
-    // как owner-drawn popup оверлея (полные тексты + подсказки).
-    const size_t count = 3;
+    // popup + все действия оверлей-меню («Настройки» уже в таблице)
+    const size_t count = 1 + kMMActionCount;
     uintptr_t entries = MMAlloc(kMMEntrySize * count);
     memcpy((void*)entries,
            (void*)MMCmdEntry(group, kMMPopupNum, catPopup, "GitBarPopup", bundle),
            kMMEntrySize);
-    memcpy((void*)(entries + kMMEntrySize),
-           (void*)MMCmdEntry(group, kMMActionsNum, catOwn, "GitBarActions", bundle),
-           kMMEntrySize);
-    memcpy((void*)(entries + 2 * kMMEntrySize),
-           (void*)MMCmdEntry(group, kMMSettingsNum, catOwn, "GitBarSettings", bundle),
-           kMMEntrySize);
+    for (size_t i = 0; i < kMMActionCount; ++i) {
+        char name[40];
+        _snprintf_s(name, sizeof(name), _TRUNCATE, "GitBarAction%u",
+                    kMMActions[i].num);
+        memcpy((void*)(entries + (1 + i) * kMMEntrySize),
+               (void*)MMCmdEntry(group, kMMActions[i].num, catOwn, name, bundle),
+               kMMEntrySize);
+    }
     uintptr_t svt = *(uintptr_t*)m->svc;
     MMCall3(*(uintptr_t*)(svt + kMMSlotRegisterCommands * 8),
             m->svc, bundle, entries, count);
     m->registered = true;
     m->stage = "тексты пунктов";
+    // Описания: верхний пункт — короткий SSO «GitBar»; действия — полные
+    // тексты длинной v8string (MMSetCommandTextLong).
     MMSetCommandText(m->svc, group, kMMPopupNum, L"GitBar");
-    MMSetCommandText(m->svc, group, kMMActionsNum, L"Действия…");
-    MMSetCommandText(m->svc, group, kMMSettingsNum, L"Настройки…");
+    for (const MMActionDef& a : kMMActions)
+        MMSetCommandTextLong(m->svc, group, a.num, a.text);
     LogLine("mainmenu: команды группы зарегистрированы (%u шт.)", (unsigned)count);
 }
 
@@ -665,23 +707,38 @@ void MMStepSource(void* arg) {
 
     // Пункт верхнего меню «GitBar» (отдельное подменю между «Сервис» и
     // «Окна»): панель {MM_FRAME}/1, вес 18.5 (live 2342: «Сервис» = 18.0,
-    // «Окна» = 19.0). Содержимое popup — панель {наши}/1: «Действия…»
-    // (открывает owner-drawn popup оверлея с полными текстами и
-    // подсказками) и «Настройки…».
+    // «Окна» = 19.0). Содержимое popup — панель {наши}/1: все действия
+    // оверлей-меню с групповыми разделителями.
     uintptr_t topItems = MMAlloc(kMMItemSize);
     memcpy((void*)topItems,
            (void*)MMItem(tmplPopup, group, kMMPopupNum, kMMWeightTop), kMMItemSize);
-    uintptr_t popItems = MMAlloc(kMMItemSize * 2);
-    memcpy((void*)popItems,
-           (void*)MMItem(tmplLeaf, group, kMMActionsNum, kMMWeightItem), kMMItemSize);
-    memcpy((void*)(popItems + kMMItemSize),
-           (void*)MMItem(tmplLeaf, group, kMMSettingsNum, kMMWeightItem), kMMItemSize);
+
+    // Разделители групп — пункты с CommandID {9D0A2E40-…}/0, как в живых
+    // панелях платформы (копия чужого объекта-разделителя не прижилась:
+    // платформа отбрасывала её как {0}/0, live 2342).
+    const GUID sepGuid = { 0x9D0A2E40, 0xB978, 0x11D4,
+                           { 0x84, 0xB6, 0x00, 0x80, 0x48, 0xDA, 0x06, 0xDF } };
+    size_t seps = 0;
+    for (const MMActionDef& a : kMMActions) seps += a.sepBefore ? 1 : 0;
+    const size_t itemCount = kMMActionCount + seps;
+    uintptr_t popItems = MMAlloc(kMMItemSize * itemCount);
+    uintptr_t w = popItems;
+    for (const MMActionDef& a : kMMActions) {
+        if (a.sepBefore) {
+            memcpy((void*)w,
+                   (void*)MMItem(tmplLeaf, sepGuid, 0, kMMWeightItem), kMMItemSize);
+            w += kMMItemSize;
+        }
+        memcpy((void*)w,
+               (void*)MMItem(tmplLeaf, group, a.num, kMMWeightItem), kMMItemSize);
+        w += kMMItemSize;
+    }
 
     uintptr_t sv = *(uintptr_t*)m->src;
     MMCall3(*(uintptr_t*)(sv + kMMSlotAddBand * 8), m->src,
             MMNewCid(frameGroup, kMMTopBandNum), MMVector(topItems, 1), 0);
     MMCall3(*(uintptr_t*)(sv + kMMSlotAddBand * 8), m->src,
-            MMNewCid(group, kMMPopupNum), MMVector(popItems, 2), 0);
+            MMNewCid(group, kMMPopupNum), MMVector(popItems, itemCount), 0);
     MMCall0(*(uintptr_t*)(sv + kMMSlotFinish * 8), m->src);
     // 4. подключаем источник к менеджеру и сразу перестраиваем (MM_REBUILD=1,
     //    v8snack mainmenu.as шаг 4): без addSource менеджер не знает об
