@@ -54,6 +54,7 @@ src/common/         модули, используемые обеими стор
 src/host/           внедрение и клиент разделяемой памяти (снаружи)
 src/payload/        DLL, работающая ВНУТРИ 1С
 src/payload/commands/  команды payload, вынесенные из v8i_export.cpp
+src/payload/platform/  маршал команд 1С, ранняя подписка, cmdinfo/frames
 src/cli/            консольный интерфейс
 src/gui/            оконный интерфейс
 src/agent/          трей-агент
@@ -99,7 +100,7 @@ kStateResponse(2) ──хост читает──▶ kStateIdle(0)   (и kStat
 - Первый ответ готовности **потребляется** — иначе следующая команда получила
   бы «busy» (`client.cpp:54-116`).
 - `Close` шлёт `"exit"`, затем CAS → `kStateExit`; payload снимает все хуки и
-  завершает поток (`v8i_export.cpp:3608`).
+  завершает поток (`V8iRunCommandLoop`, `v8i_export.cpp`).
 
 ## 5. Внедрение DLL
 
@@ -150,7 +151,7 @@ APC успевает выполниться до инициализации ntdl
 
 | Экспорт | Назначение |
 |---|---|
-| `v8i_probe` | точка входа; хост стартует её на remote thread (`v8i_export.cpp:3625`) |
+| `v8i_probe` | точка входа; хост стартует её на remote thread (`v8i_export.cpp`) |
 | `v8i_version` | версия API (=1) |
 | `V8iArmEarly` | ранняя установка WH_CBT (вызывается из DllMain) |
 | `V8iCbtProcExport` | CBT-колбэк (используется и хостом для глобального хука) |
@@ -160,7 +161,7 @@ APC успевает выполниться до инициализации ntdl
 
 Жизненный цикл: `v8i_probe` мапит `SharedIo` (имя — из своего PID), пишет
 `{"status":"loaded"}` и крутит цикл команд. Каждая команда выполняется под SEH
-(`Guarded` + POD-структура `PackedThunk`, `v8i_export.cpp:3323-3360`) — крах
+(`Guarded` + POD-структура `PackedThunk`, `v8i_export.cpp`) — крах
 команды превращается в JSON-ошибку, а не в падение 1С.
 
 **DllMain** (`src/payload/dllmain.cpp`) при загрузке проверяет, что процесс —
@@ -182,7 +183,7 @@ lock.
 
 ### Полный список команд payload
 
-Диспетчер — `RunPayload` (`v8i_export.cpp:3387-3605`).
+Диспетчер — `V8iRunCommandLoop` (`v8i_export.cpp`).
 
 | Команда | Аргументы | Что делает |
 |---|---|---|
@@ -326,7 +327,7 @@ scratch-буфер, чтобы не словить fault на последней
 
 ### 10.1 Вызов команд дизайнера — 8.3 (`cmd`)
 
-Калиброванная цепочка на 8.3.27.1989 (`v8i_export.cpp:1044-1120`):
+Калиброванная цепочка на 8.3.27.1989 (`src/payload/platform/platform_commands.cpp`):
 
 ```
 frame (куча) ── vtable = config.dll+0x2EFB50 (ITopLevelFrame)
@@ -353,7 +354,7 @@ vtable, поэтому при провале цепочки включается
 
 > В [RECON-85.md](RECON-85.md) §3.3 размер `Command` указан как 40 байт
 > (CommandID с выравниванием 8); код использует 32-байтовую раскладку
-> (`v8i_export.cpp:1104-1110`). См. находку A8 в [AUDIT.md](AUDIT.md).
+> (`src/payload/platform/platform_commands.cpp`). См. находку A8 в [AUDIT.md](AUDIT.md).
 
 Маршалинг на UI-поток: subclass окна `V8TopLevelFrame`/`V8Window0*`, сообщение
 `kV8iCmdMsg = WM_APP+0x2F11`, `SendMessageTimeoutW(SMTO_BLOCK, 30 c)`. WndProc
