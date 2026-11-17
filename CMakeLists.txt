@@ -75,6 +75,7 @@ target_link_libraries(v8i_common PUBLIC oleaut32 ole32)
 add_library(v8i_payload SHARED
     src/payload/commands/inspect_commands.cpp
     src/payload/gitbar/git_service.cpp
+    src/payload/gitbar/git_ui.cpp
     src/payload/platform/platform_commands.cpp
     src/payload/dllmain.cpp
     src/payload/disasm.cpp
@@ -181,6 +182,7 @@ add_executable(v8i_tests
     # dllmain.cpp stays out - it belongs to the DLL.
     src/payload/commands/inspect_commands.cpp
     src/payload/gitbar/git_service.cpp
+    src/payload/gitbar/git_ui.cpp
     src/payload/platform/platform_commands.cpp
     src/payload/disasm.cpp
     src/payload/gitbar.cpp

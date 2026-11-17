@@ -55,7 +55,7 @@ src/host/           внедрение и клиент разделяемой п
 src/payload/        DLL, работающая ВНУТРИ 1С
 src/payload/commands/  команды payload, вынесенные из v8i_export.cpp
 src/payload/platform/  маршал команд 1С, ранняя подписка, cmdinfo/frames
-src/payload/gitbar/  git-сервис GitBar, вынесенный из gitbar.cpp
+src/payload/gitbar/  git-сервис и общая тема GitBar, вынесенные из gitbar.cpp
 src/cli/            консольный интерфейс
 src/gui/            оконный интерфейс
 src/agent/          трей-агент
