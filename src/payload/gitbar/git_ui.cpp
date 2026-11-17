@@ -147,6 +147,13 @@ void UiDrawButton(HDC dc, const RECT& rc, const wchar_t* text, HFONT font,
     SelectObject(dc, oldFont);
 }
 
+COLORREF Blend(COLORREF fg, COLORREF bg, int alpha) {
+    int r = (GetRValue(fg) * alpha + GetRValue(bg) * (255 - alpha)) / 255;
+    int g = (GetGValue(fg) * alpha + GetGValue(bg) * (255 - alpha)) / 255;
+    int b = (GetBValue(fg) * alpha + GetBValue(bg) * (255 - alpha)) / 255;
+    return RGB(r, g, b);
+}
+
 // Ownerdraw buttons would otherwise stay flat grey: the subclass only tracks
 // hover (the press state arrives as ODS_SELECTED) and redraws on change.
 const wchar_t* kBtnOldProc = L"v8i.oldBtnProc";

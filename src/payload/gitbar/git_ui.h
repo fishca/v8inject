@@ -60,6 +60,10 @@ void UiFrame(HDC dc, const RECT& rc, COLORREF color);
 void UiDrawButton(HDC dc, const RECT& rc, const wchar_t* text, HFONT font,
                   bool hover, bool press);
 
+// Mix `fg` over `bg`: alpha 255 keeps fg, 0 returns bg. Used for disabled
+// menu text and for accents that must sit on the cream face.
+COLORREF Blend(COLORREF fg, COLORREF bg, int alpha);
+
 // Ownerdraw buttons would otherwise stay flat grey: the subclass only tracks
 // hover (the press state arrives as ODS_SELECTED) and redraws on change.
 void ThemedButton(HWND btn, HFONT font);
@@ -77,6 +81,12 @@ struct PromptCtx {
 };
 
 LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
+
+// Modal windows of the panel. The main-menu overlay is a separate top-level
+// window and would otherwise float above a dialog, so it hides while one is up;
+// the bar is repositioned once the dialog closes. Implemented in gitbar.cpp.
+void ModalEnter();
+void ModalLeave(bool forceDock);
 
 }  // namespace gitbar
 }  // namespace v8i

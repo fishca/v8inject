@@ -74,6 +74,7 @@ target_link_libraries(v8i_common PUBLIC oleaut32 ole32)
 # ---- payload: loaded INTO the target process ----
 add_library(v8i_payload SHARED
     src/payload/commands/inspect_commands.cpp
+    src/payload/gitbar/git_log.cpp
     src/payload/gitbar/git_service.cpp
     src/payload/gitbar/git_ui.cpp
     src/payload/platform/platform_commands.cpp
@@ -181,6 +182,7 @@ add_executable(v8i_tests
     # the real command loop of the payload against a block of the test's own.
     # dllmain.cpp stays out - it belongs to the DLL.
     src/payload/commands/inspect_commands.cpp
+    src/payload/gitbar/git_log.cpp
     src/payload/gitbar/git_service.cpp
     src/payload/gitbar/git_ui.cpp
     src/payload/platform/platform_commands.cpp
