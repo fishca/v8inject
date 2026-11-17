@@ -53,6 +53,7 @@ include/v8inject/   публичные заголовки (протокол, API
 src/common/         модули, используемые обеими сторонами
 src/host/           внедрение и клиент разделяемой памяти (снаружи)
 src/payload/        DLL, работающая ВНУТРИ 1С
+src/payload/commands/  команды payload, вынесенные из v8i_export.cpp
 src/cli/            консольный интерфейс
 src/gui/            оконный интерфейс
 src/agent/          трей-агент
