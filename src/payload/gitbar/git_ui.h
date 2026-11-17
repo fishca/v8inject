@@ -88,5 +88,12 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
 void ModalEnter();
 void ModalLeave(bool forceDock);
 
+// Brings the bar back above the configurator frame after an action redraws a
+// dialog (the list windows call it after every git operation).
+void BarReposition(bool forceDock);
+
+// Bar action reused by dialogs: the working-copy list's "Commit" button.
+void RunCommitAction();
+
 }  // namespace gitbar
 }  // namespace v8i
