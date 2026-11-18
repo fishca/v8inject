@@ -474,7 +474,7 @@ GitBar. Клиентский деструктор **не** выгружает pa
 | `tools/check_gitbar.sh [8.3\|8.5]` | локально, нужна установленная 1С | E2E GitBar: запуск Конфигуратора → инжект → окно `V8iGitBar` живо |
 | `tools/recon_exports.py` | python + pefile | инвентарь экспортов 8.5/8.3 с диска |
 | `tools/recon_coreas_cbt.py`, `recon_snegopat_hooks.py` | python + capstone | дизасм Снегопата: как ставятся WH_CBT-хуки |
-| `tools/draw_icons.py` | python + Pillow | рисует 15 оригинальных глифов 16×16 в палитре Конфигуратора → `src/payload/icons/*.png` |
+| `tools/render_icons.cjs` | node + sharp (dev-only) | рендерит 16×16 PNG из SVG Phosphor Icons (`src/payload/icons/phosphor/`), перекрашивая их в палитру Конфигуратора |
 | `tools/gen_icons.py` | python | конвейер иконок: PNG → premultiplied BGRA → `icons.h`, PNG → `icons_png.h` |
 
 Юнит-тесты написаны на своём раннере (`tests/test_runner.h`, около сотни

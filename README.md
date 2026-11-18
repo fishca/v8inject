@@ -117,9 +117,10 @@ v8inject log [--clear]                                # лог хоста
 
 Панель живёт **внутри процесса 1С**: это дочернее окно окна конфигуратора,
 пристыкованное справа в ряду тулбара, поэтому выглядит как штатный тулбар —
-включая иконки: они нарисованы в палитре и «пластиковой» стилистике
-Конфигуратора, но это собственная графика проекта (`tools/draw_icons.py`,
-MIT), а не вырезанные картинки из ресурсов 1С.
+включая иконки: они взяты из открытого набора Phosphor Icons (MIT),
+перекрашены в палитру Конфигуратора и отрендерены в 16×16
+(`src/payload/icons/phosphor/`, `tools/render_icons.cjs`). Это не картинки
+из ресурсов 1С, поэтому их можно свободно распространять в составе проекта.
 При наведении на кнопку показывается подсказка с действием и git-командой.
 Подробно — [docs/GITBAR.md](docs/GITBAR.md).
 
@@ -273,3 +274,6 @@ MIT — см. [LICENSE](LICENSE).
   (University of Illinois/NCSA Open Source License). Тексты лицензий
   заведены рядом с исходниками: `third_party/capstone/LICENSE.TXT`
   и `third_party/capstone/LICENSE_LLVM.TXT`.
+- Иконки GitBar — Phosphor Icons (Fill), MIT, Copyright (c) 2023 Phosphor
+  Icons. SVG-исходники и текст лицензии: `src/payload/icons/phosphor/`
+  (`LICENSE.txt`, `ATTRIBUTION.md`).

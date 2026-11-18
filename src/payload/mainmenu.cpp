@@ -462,8 +462,9 @@ void MMSetCommandTextLong(uintptr_t svc, const GUID& group, unsigned num,
 // поэтому после регистрации кладём в описание готовый URL, собранный ШТАТНЫМ
 // конструктором core::URL из v8string (так его поля разбора корректны).
 //
-// Схема URL — file:///: payload пишет PNG-глифы (собственная графика проекта,
-// tools/draw_icons.py) во временный каталог, и платформа загружает их сама.
+// Схема URL — file:///: payload пишет PNG-глифы (Phosphor Icons, MIT,
+// перекрашены в палитру Конфигуратора: tools/render_icons.cjs) во временный
+// каталог, и платформа загружает их сама.
 // Меню выглядит пиксель-в-пиксель как панель на любой версии платформы.
 // v8res:// здесь не годится: во-первых, картинки из ресурсов 1С нельзя
 // распространять в составе проекта, во-вторых, набор ресурсов зависит от
@@ -620,8 +621,7 @@ bool MMIconsWriteFiles(std::wstring& urlDir) {
 
 // Положить URL картинки в описание команды: v8string → штатный core::URL.
 bool MMSetDescrUrl(uintptr_t svc, uintptr_t urlCtor, const GUID& group,
-                   unsigned num, const wchar_t* url) {
-    uintptr_t descr = 0;
+                   unsigned num, const wchar_t* url) {    uintptr_t descr = 0;
     if (!MMDescr(svc, group, num, &descr)) return false;
     const uintptr_t b = descr - 0x70;
     if (!IsReadable((void*)(b + 0xB0), 0x40)) return false;   // URL в описании
@@ -639,6 +639,22 @@ bool MMSetDescrUrl(uintptr_t svc, uintptr_t urlCtor, const GUID& group,
         ok = false;
     }
     return ok;
+}
+
+// Достаёт IImage из описания (слот 5) — так же, как это делает платформа при
+// отрисовке. Нужен как проверка: по нашему file:/// URL платформа обязана
+// собрать картинку, иначе пункт нарисуется без иконки.
+uintptr_t MMDescrImage(uintptr_t descr) {
+    if (!descr) return 0;
+    uintptr_t img = 0;
+    __try {
+        const uintptr_t vt = *(uintptr_t*)descr;
+        if (!IsReadable((void*)vt, 10 * 8)) return 0;
+        MMCall1(*(uintptr_t*)(vt + 5 * 8), descr, (uintptr_t)&img);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return img;
 }
 
 // Глиф каждого пункта нативного подменю — те же имена, что IconFor в
@@ -690,9 +706,16 @@ void MMStepIcons(void* arg) {
                      L"file:///%ls/%hs.png", urlDir.c_str(), def.role);
         if (MMSetDescrUrl(m->svc, urlCtor, group, def.num, url)) ++set;
     }
-    LogLine("mainmenu: иконки заданы в описаниях (%d/%d, каталог %ls, "
-            "core::URL=core83+0x%llX)",
-            set, total, urlDir.c_str(),
+    // Проверка загрузки: платформа должна собрать IImage по нашим URL.
+    int loaded = 0;
+    for (const MMIconDef& def : kMMIconDefs) {
+        uintptr_t descr = 0;
+        if (MMDescr(m->svc, group, def.num, &descr) && MMDescrImage(descr))
+            ++loaded;
+    }
+    LogLine("mainmenu: иконки заданы в описаниях (%d/%d, загружено платформой "
+            "%d/%d, каталог %ls, core::URL=core83+0x%llX)",
+            set, total, loaded, total, urlDir.c_str(),
             (unsigned long long)(urlCtor - core.base));
 }
 

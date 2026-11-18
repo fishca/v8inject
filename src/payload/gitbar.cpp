@@ -155,9 +155,10 @@ void SetCompact(bool compact) {
 
 int BarW() { return g_bar.compact ? kCompactW : kBarW; }
 
-// Every glyph is original artwork drawn in the Configurator's palette by
-// tools/draw_icons.py and baked to premultiplied BGRA by tools/gen_icons.py:
-// 1C's own resource pictures must not be redistributed, so the shapes are ours.
+// Every glyph is a Phosphor Icons picture (Fill, MIT), recoloured in the
+// Configurator's palette by tools/render_icons.cjs and baked to premultiplied
+// BGRA by tools/gen_icons.py: 1C's own resource pictures must not be
+// redistributed, and the open set gives a consistent professional look.
 const unsigned char* IconFor(int id) {
     switch (id) {
     case kWinIdDump: return icons::kIconDump;

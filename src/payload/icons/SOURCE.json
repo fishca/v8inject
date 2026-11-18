@@ -1,32 +1,44 @@
 {
-  "note": "Original artwork, NOT extracted from 1C resource bundles. Every GitBar glyph is drawn from scratch by tools/draw_icons.py (Pillow, 16x16 supersampled) in the Configurator's palette and beveled style. Copyright (c) the v8inject authors, MIT license (see LICENSE). Regenerate PNGs with `python tools/draw_icons.py`, then headers with `python tools/gen_icons.py`.",
-  "style": {
-    "grid": "16x16",
-    "outline": "#4A4234",
-    "paper": "#FDFDF6 -> #E2DBC9",
-    "folder": "#F6D17C -> #CD9C3E",
-    "blue": "#80B8F1 -> #346CB4",
-    "green": "#5EC56A -> #2A8A3C",
-    "gold": "#F7CF5A -> #C28C1A",
-    "gray": "#D0CBBD -> #908B7E",
-    "source": "tools/draw_icons.py",
-    "license": "MIT (same as the v8inject repository)"
+  "note": "Icons are NOT taken from 1C resource bundles. The 16x16 PNGs are rendered from the open Phosphor Icons set (Fill style), recoloured into the Configurator's palette. Phosphor Icons is MIT-licensed; the copyright notice is in phosphor/LICENSE.txt and notice is kept in README/RELEASE.md.",
+  "source": {
+    "set": "Phosphor Icons (Fill)",
+    "url": "https://phosphoricons.com",
+    "package": "@phosphor-icons/core 2.1.1",
+    "license": "MIT",
+    "license_file": "phosphor/LICENSE.txt",
+    "attribution": "phosphor/ATTRIBUTION.md"
+  },
+  "pipeline": {
+    "svg_sources": "src/payload/icons/phosphor/<role>.svg",
+    "render": "node tools/render_icons.cjs (sharp; dev-only, needs `npm install --no-save sharp`)",
+    "png": "src/payload/icons/<role>.png (16x16 RGBA)",
+    "headers": "python tools/gen_icons.py -> icons.h (premultiplied BGRA) + icons_png.h (file:/// URLs for the native menu)"
+  },
+  "palette": {
+    "note": "vertical gradient light-to-dark, sampled from the Configurator chrome",
+    "green": ["#6FD07C", "#2E8B47"],
+    "blue": ["#7FA8E8", "#2F5CA8"],
+    "sync": ["#7FB6EC", "#255F9E"],
+    "teal": ["#68C9C0", "#1F7A73"],
+    "gold": ["#E8C46A", "#9A6E12"],
+    "brown": ["#D9A75C", "#8A5518"],
+    "gray": ["#C9C3B4", "#6E685B"]
   },
   "roles": {
-    "dump": "выгрузить исходники в файлы: лист с зелёной стрелкой вниз",
-    "dumpext": "выгрузить расширение в файлы: два листа с зелёной стрелкой вниз",
-    "init": "создать репозиторий в папке выгрузки: жёлтая папка с зелёным плюсом",
-    "clone": "клонировать репозиторий: две карточки-копии репозитория",
-    "commit": "коммит изменений: лист с зелёной галочкой",
-    "push": "пуш в удалённый репозиторий: синяя стрелка вверх из лотка",
-    "pull": "забрать изменения: синяя стрелка вниз в лоток",
-    "fetch": "получить изменения: две круговые стрелки (синяя и зелёная)",
-    "branches": "ветки: граф коммитов с ответвлением (синяя, зелёная, золотая вершины)",
-    "stash": "отложенные изменения: золотой архивный ящик со стрелкой внутрь",
-    "tags": "теги: золотая бирка с отверстием",
-    "status": "рабочая копия: планшет с зелёной галочкой",
-    "log": "история коммитов: циферблат с золотым ободом",
-    "settings": "настройки: серая шестерёнка",
-    "gitbar": "фирменный глиф пункта «GitBar»: три узла графа коммитов"
+    "dump": { "phosphor": "file-arrow-down-fill", "color": "green", "purpose": "выгрузить исходники в файлы" },
+    "dumpext": { "phosphor": "puzzle-piece-fill", "color": "green", "purpose": "выгрузить расширение в файлы" },
+    "init": { "phosphor": "folder-plus-fill", "color": "blue", "purpose": "создать репозиторий в папке выгрузки" },
+    "clone": { "phosphor": "copy-fill", "color": "blue", "purpose": "клонировать репозиторий" },
+    "commit": { "phosphor": "git-commit-fill", "color": "green", "purpose": "коммит изменений" },
+    "push": { "phosphor": "arrow-circle-up-fill", "color": "sync", "purpose": "пуш в удалённый репозиторий" },
+    "pull": { "phosphor": "arrow-circle-down-fill", "color": "sync", "purpose": "забрать изменения" },
+    "fetch": { "phosphor": "arrows-clockwise-fill", "color": "teal", "purpose": "получить изменения" },
+    "branches": { "phosphor": "git-branch-fill", "color": "blue", "purpose": "ветки" },
+    "stash": { "phosphor": "archive-fill", "color": "gold", "purpose": "отложенные изменения" },
+    "tags": { "phosphor": "tag-fill", "color": "gold", "purpose": "теги" },
+    "status": { "phosphor": "list-checks-fill", "color": "green", "purpose": "рабочая копия" },
+    "log": { "phosphor": "clock-counter-clockwise-fill", "color": "brown", "purpose": "история коммитов" },
+    "settings": { "phosphor": "gear-fill", "color": "gray", "purpose": "настройки" },
+    "gitbar": { "phosphor": "git-fork-fill", "color": "blue", "purpose": "фирменный глиф пункта «GitBar»" }
   }
 }
