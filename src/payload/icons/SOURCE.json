@@ -1,63 +1,32 @@
 {
- "note": "PNG bytes are stored verbatim at off. mngcore/core83_root.res entries are from 8.3.27.1989; core85/moxel/backend_root.res entries are from 8.5.1.1529 (offsets are the same in 8.5.1.960/1236/1529).",
- "dump": {
-  "res": "core83_root.res",
-  "off": 146315,
-  "name": "i79"
- },
- "init": {
-  "res": "mngcore_root.res",
-  "off": 1971210,
-  "name": "GroupAdd.png"
- },
- "commit": {
-  "res": "core83_root.res",
-  "off": 370217,
-  "name": "i104"
- },
- "push": {
-  "res": "core83_root.res",
-  "off": 879424,
-  "name": "moveup.png"
- },
- "settings": {
-  "res": "mngcore_root.res",
-  "off": 2050734,
-  "name": "GroupService.png"
- },
- "log": {
-  "res": "mngcore_root.res",
-  "off": 491871,
-  "name": "ChangeHistory.png"
- },
- "pull": {
-  "res": "core85_root.res",
-  "off": 257889,
-  "name": "_arrowDown.png"
- },
- "fetch": {
-  "res": "core85_root.res",
-  "off": 363765,
-  "name": "_arrowRound.png"
- },
- "branches": {
-  "res": "moxel_root.res",
-  "off": 157979,
-  "name": "_dendrogram.png"
- },
- "stash": {
-  "res": "mngcore_root.res",
-  "off": 3164530,
-  "name": "_paperDoubleCopy.png"
- },
- "tags": {
-  "res": "core83_root.res",
-  "off": 70352,
-  "name": "AddToFavorites.png"
- },
- "status": {
-  "res": "backend_root.res",
-  "off": 21462675,
-  "name": "_documentCheck.png"
- }
+  "note": "Original artwork, NOT extracted from 1C resource bundles. Every GitBar glyph is drawn from scratch by tools/draw_icons.py (Pillow, 16x16 supersampled) in the Configurator's palette and beveled style. Copyright (c) the v8inject authors, MIT license (see LICENSE). Regenerate PNGs with `python tools/draw_icons.py`, then headers with `python tools/gen_icons.py`.",
+  "style": {
+    "grid": "16x16",
+    "outline": "#4A4234",
+    "paper": "#FDFDF6 -> #E2DBC9",
+    "folder": "#F6D17C -> #CD9C3E",
+    "blue": "#80B8F1 -> #346CB4",
+    "green": "#5EC56A -> #2A8A3C",
+    "gold": "#F7CF5A -> #C28C1A",
+    "gray": "#D0CBBD -> #908B7E",
+    "source": "tools/draw_icons.py",
+    "license": "MIT (same as the v8inject repository)"
+  },
+  "roles": {
+    "dump": "выгрузить исходники в файлы: лист с зелёной стрелкой вниз",
+    "dumpext": "выгрузить расширение в файлы: два листа с зелёной стрелкой вниз",
+    "init": "создать репозиторий в папке выгрузки: жёлтая папка с зелёным плюсом",
+    "clone": "клонировать репозиторий: две карточки-копии репозитория",
+    "commit": "коммит изменений: лист с зелёной галочкой",
+    "push": "пуш в удалённый репозиторий: синяя стрелка вверх из лотка",
+    "pull": "забрать изменения: синяя стрелка вниз в лоток",
+    "fetch": "получить изменения: две круговые стрелки (синяя и зелёная)",
+    "branches": "ветки: граф коммитов с ответвлением (синяя, зелёная, золотая вершины)",
+    "stash": "отложенные изменения: золотой архивный ящик со стрелкой внутрь",
+    "tags": "теги: золотая бирка с отверстием",
+    "status": "рабочая копия: планшет с зелёной галочкой",
+    "log": "история коммитов: циферблат с золотым ободом",
+    "settings": "настройки: серая шестерёнка",
+    "gitbar": "фирменный глиф пункта «GitBar»: три узла графа коммитов"
+  }
 }

@@ -155,13 +155,15 @@ void SetCompact(bool compact) {
 
 int BarW() { return g_bar.compact ? kCompactW : kBarW; }
 
-// Every glyph is a 1C toolbar picture, baked to premultiplied BGRA by
-// tools/gen_icons.py: hand-drawn GDI shapes never matched the platform's look,
-// and these do because they come from the same resource bundles.
+// Every glyph is original artwork drawn in the Configurator's palette by
+// tools/draw_icons.py and baked to premultiplied BGRA by tools/gen_icons.py:
+// 1C's own resource pictures must not be redistributed, so the shapes are ours.
 const unsigned char* IconFor(int id) {
     switch (id) {
     case kWinIdDump: return icons::kIconDump;
+    case kWinIdDumpExt: return icons::kIconDumpExt;
     case kWinIdInit: return icons::kIconInit;
+    case kWinIdClone: return icons::kIconClone;
     case kWinIdCommit: return icons::kIconCommit;
     case kWinIdPush: return icons::kIconPush;
     case kWinIdSettings: return icons::kIconSettings;
@@ -172,9 +174,6 @@ const unsigned char* IconFor(int id) {
     case kWinIdStash: return icons::kIconStash;
     case kWinIdTags: return icons::kIconTags;
     case kWinIdStatus: return icons::kIconStatus;
-    // Menu-only actions: no PNG of their own yet, so borrow the closest glyph.
-    case kWinIdClone: return icons::kIconBranches;   // the whole repo tree
-    case kWinIdDumpExt: return icons::kIconDump;     // same operation, extension
     }
     return nullptr;
 }
