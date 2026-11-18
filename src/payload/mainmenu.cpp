@@ -1,4 +1,4 @@
-﻿// Нативный пункт «GitBar» — отдельное подменю верхнего меню Конфигуратора
+// Нативный пункт «GitBar» — отдельное подменю верхнего меню Конфигуратора
 // (между «Сервис» и «Окна»).
 //
 // Платформа не даёт публичного API для добавления пунктов в главное меню, но
@@ -36,6 +36,8 @@
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/v8i_export.h"
+
+#include "icons_png.h"   // те же PNG-глифы 1С, что и у панели GitBar
 
 #include <windows.h>
 #include <commctrl.h>
@@ -165,6 +167,7 @@ struct MMState {
     bool stepFailed = false;        // шаг просит повтор (меню ещё не построено)
     bool registered = false;        // команды зарегистрированы (повтор нельзя)
     bool sourceAdded = false;       // источник панелей подключён (повтор нельзя)
+    bool iconsSet = false;          // URL картинок проставлены в описания (повтор нельзя)
     bool trapsSet = false;          // перехваты приёмника поставлены
     bool confirmed = false;         // платформа запросила updateState нашего popup
     const char* stage = "?";        // текущий шаг — логируется при падении
@@ -448,6 +451,248 @@ void MMSetCommandTextLong(uintptr_t svc, const GUID& group, unsigned num,
     const uintptr_t slots[4] = { b + 0x08, b + 0x20, b + 0x38, b + 0x50 };
     for (uintptr_t slot : slots)
         MMSetLong(slot, text);
+}
+
+// --- картинки нативных пунктов ---------------------------------------------
+
+// Платформа рисует пункт меню по описанию команды; картинку описание отдаёт
+// из ICmdDescription::image(): сначала поле-кэш descr+0x80, иначе — по URL
+// ресурса, лежащему в описании на descr+0x40 (объект core::URL: 24-байтная
+// v8string + вектор разбора + флаги). RegisterCommands картинку не передаёт,
+// поэтому после регистрации кладём в описание готовый URL, собранный ШТАТНЫМ
+// конструктором core::URL из v8string (так его поля разбора корректны).
+//
+// Схема URL — file:///: payload пишет PNG-глифы 1С (ровно те же, что на панели
+// GitBar) во временный каталог, и платформа загружает их сама. Меню выглядит
+// пиксель-в-пиксель как панель на любой версии платформы; v8res:// подошёл бы
+// только для глифов, которые есть в ресурсах этого билда (в 8.3.27 нет,
+// например, «круговой стрелки» fetch из 8.5). Каталог временный: файлы — это
+// картинки платформы, они не покидают машину и перезаписываются при старте.
+
+bool MMRead(const void* p, void* out, size_t len) {
+    if (!p || !IsReadable(p, len)) return false;
+    memcpy(out, p, len);
+    return true;
+}
+
+template <typename T>
+bool MMRead(const void* p, T& out) {
+    return MMRead(p, &out, sizeof(T));
+}
+
+// Адрес экспорта модуля по фрагментам декорированного имени: таблица
+// экспортов читается из памяти загруженного модуля (payload не зависит от
+// файлов на диске, RVA экспорта меняется от сборки к сборке).
+uintptr_t MMFindExport(const ModuleRange& m, const char* frag1, const char* frag2,
+                       const char* mustEnd) {
+    if (!m.base || m.size < 0x200) return 0;
+    const uintptr_t base = m.base;
+    uint32_t lfanew = 0;
+    if (!MMRead((const void*)(base + 0x3C), lfanew)) return 0;
+    const uintptr_t nt = base + lfanew;
+    uint32_t sig = 0;
+    if (!MMRead((const void*)nt, sig) || sig != 0x00004550) return 0;   // "PE\0\0"
+    uint16_t optSize = 0;
+    if (!MMRead((const void*)(nt + 4 + 16), optSize) || optSize < 96) return 0;
+    const uintptr_t opt = nt + 24;
+    uint16_t magic = 0;
+    if (!MMRead((const void*)opt, magic)) return 0;
+    const uintptr_t dd = opt + (magic == 0x20B ? 112 : 96);   // PE32+ / PE32
+    uint32_t expRva = 0, expSize = 0;
+    if (!MMRead((const void*)dd, expRva) || !MMRead((const void*)(dd + 4), expSize)) return 0;
+    if (!expRva || !expSize) return 0;
+    const uintptr_t ex = base + expRva;
+    uint32_t nNames = 0, fnRva = 0, namesRva = 0, ordRva = 0;
+    if (!MMRead((const void*)(ex + 0x18), nNames) ||
+        !MMRead((const void*)(ex + 0x1C), fnRva) ||
+        !MMRead((const void*)(ex + 0x20), namesRva) ||
+        !MMRead((const void*)(ex + 0x24), ordRva))
+        return 0;
+    if (nNames == 0 || nNames > 20000) return 0;
+    for (uint32_t i = 0; i < nNames; ++i) {
+        uint32_t nameRva = 0;
+        if (!MMRead((const void*)(base + namesRva + i * 4), nameRva) || !nameRva) continue;
+        // Имя читаем кусками по 64 байта: посимвольный IsReadable — это
+        // VirtualQuery на каждый символ, а экспортов в core83 десятки тысяч.
+        char name[192] = {};
+        bool terminated = false;
+        for (size_t got = 0; got < 191 && !terminated; got += 64) {
+            const size_t take = got + 64 <= 191 ? 64 : 191 - got;
+            if (!IsReadable((const void*)(base + nameRva + got), take)) break;
+            memcpy(name + got, (const void*)(base + nameRva + got), take);
+            terminated = memchr(name + got, 0, take) != nullptr;
+        }
+        if (!terminated) continue;
+        if (!strstr(name, frag1) || !strstr(name, frag2)) continue;
+        if (mustEnd) {
+            const size_t n = strlen(name), t = strlen(mustEnd);
+            if (n < t || strcmp(name + n - t, mustEnd) != 0) continue;
+        }
+        uint16_t ord = 0;
+        if (!MMRead((const void*)(base + ordRva + i * 2), ord)) return 0;
+        uint32_t fn = 0;
+        if (!MMRead((const void*)(base + fnRva + ord * 4), fn)) return 0;
+        return base + fn;
+    }
+    return 0;
+}
+
+// core::URL::URL(const v8string&, bool): в декорированном имени первый
+// параметр — ровно v8string (не basic_string/basic_string_view и не PEB_S),
+// поэтому ищем непрерывный фрагмент "…0URL@core@@<callconv>@<abi>V?$BasicString"
+// и хвост "ale@@_N@Z" (последний параметр — bool). Прочие перегрузки
+// конструктора этому шаблону не удовлетворяют.
+uintptr_t MMUrlCtor(const ModuleRange& core) {
+    const char* frag1 = sizeof(void*) == 8
+                            ? "0URL@core@@QEAA@AEBV?$BasicString"
+                            : "0URL@core@@QAE@ABV?$BasicString";
+    uintptr_t fn = MMFindExport(core, frag1, "ale@@_N@Z", nullptr);
+    if (fn) {
+        LogLine("mainmenu: core::URL найден по таблице экспортов (core83+0x%llX)",
+                (unsigned long long)(fn - core.base));
+        return fn;
+    }
+    // Запасной путь — зафиксированные RVA известных сборок 8.3.27 (на случай,
+    // если таблица экспортов в памяти недоступна/зачищена, как в 8.5).
+    const wchar_t* path = core.path.c_str();
+    if (wcsstr(path, L"\\8.3.27.2342\\"))
+        return sizeof(void*) == 8 ? core.base + 0x2D3840 : 0;
+    if (wcsstr(path, L"\\8.3.27.1989\\"))
+        return core.base + (sizeof(void*) == 8 ? 0x2D2A60 : 0x289FF0);
+    return 0;
+}
+
+bool MMDescr(uintptr_t svc, const GUID& group, unsigned num, uintptr_t* descrOut) {
+    uintptr_t svt = *(uintptr_t*)svc;
+    uintptr_t descr = 0;
+    MMCall2(*(uintptr_t*)(svt + kMMSlotCommandDescription * 8), svc,
+            (uintptr_t)&descr, MMNewCid(group, num));
+    if (!descr) return false;
+    *descrOut = descr;
+    return true;
+}
+
+// Записать PNG-глифы во временный каталог; вернуть путь в форме file://.
+bool MMIconsWriteFiles(std::wstring& urlDir) {
+    wchar_t tmp[MAX_PATH] = {};
+    const DWORD n = GetTempPathW(MAX_PATH, tmp);
+    if (!n || n >= MAX_PATH) return false;
+    std::wstring dir = tmp;
+    if (dir.empty() || dir.back() != L'\\') dir += L'\\';
+    dir += L"v8inject-icons";
+    if (!CreateDirectoryW(dir.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    for (int i = 0; i < icons::kPngCount; ++i) {
+        const icons::PngResource& png = icons::kPngs[i];
+        const std::wstring name(png.name, png.name + strlen(png.name));
+        const std::wstring path = dir + L"\\" + name + L".png";
+        // Второй Конфигуратор может писать те же файлы — не мешаем друг другу
+        // и считаем уже записанный файл нужного размера успехом.
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            WIN32_FILE_ATTRIBUTE_DATA fa{};
+            if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) &&
+                fa.nFileSizeHigh == 0 && fa.nFileSizeLow == png.size)
+                continue;
+            return false;
+        }
+        DWORD written = 0;
+        const bool ok = WriteFile(f, png.data, png.size, &written, nullptr) &&
+                        written == png.size;
+        CloseHandle(f);
+        if (!ok) return false;
+    }
+    // Короткое 8.3-имя — URL без пробелов и не-ASCII (профиль пользователя
+    // может быть кириллическим; file://-путь платформа разбирает как есть).
+    wchar_t shortPath[MAX_PATH] = {};
+    std::wstring use = dir;
+    if (GetShortPathNameW(dir.c_str(), shortPath, MAX_PATH) && shortPath[0])
+        use = shortPath;
+    urlDir = use;
+    for (wchar_t& c : urlDir)
+        if (c == L'\\') c = L'/';
+    return true;
+}
+
+// Положить URL картинки в описание команды: v8string → штатный core::URL.
+bool MMSetDescrUrl(uintptr_t svc, uintptr_t urlCtor, const GUID& group,
+                   unsigned num, const wchar_t* url) {
+    uintptr_t descr = 0;
+    if (!MMDescr(svc, group, num, &descr)) return false;
+    const uintptr_t b = descr - 0x70;
+    if (!IsReadable((void*)(b + 0xB0), 0x40)) return false;   // URL в описании
+    unsigned char str[24] = {};
+    MMSetLong((uintptr_t)str, url);
+    // Конструктор копирует строку; refCount=2 не даёт платформе освободить
+    // наш блок своим аллокатором (у payload и 1С разные CRT) — блок остаётся
+    // висеть до выхода из процесса (24 байта на пункт).
+    const uintptr_t data = *(uintptr_t*)str;
+    if (data && IsReadable((void*)data, 4)) *(unsigned*)data = 2;
+    bool ok = true;
+    __try {
+        MMCall2(urlCtor, b + 0xB0, (uintptr_t)str, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    return ok;
+}
+
+// Глиф каждого пункта нативного подменю — те же имена, что IconFor в
+// src/payload/gitbar.cpp: меню повторяет иконки панели.
+struct MMIconDef { unsigned num; const char* role; };
+const MMIconDef kMMIconDefs[] = {
+    {kMMPopupNum, "settings"},   // сам пункт «GitBar»
+    {11, "dump"},
+    {24, "dump"},
+    {12, "init"},
+    {23, "branches"},            // клонирование — «дерево репозитория»
+    {13, "commit"},
+    {14, "push"},
+    {17, "pull"},
+    {18, "fetch"},
+    {19, "branches"},
+    {20, "stash"},
+    {21, "tags"},
+    {22, "status"},
+    {16, "log"},
+    {2,  "settings"},
+};
+
+void MMStepIcons(void* arg) {
+    MMState* m = (MMState*)arg;
+    m->stepRan = true;
+    if (m->iconsSet) return;
+    m->iconsSet = true;   // одна попытка: от готовности меню не зависит
+    m->stage = "иконки меню";
+    ModuleRange core;
+    if (!FindModule(L"core83.dll", core)) return;
+    const uintptr_t urlCtor = MMUrlCtor(core);
+    if (!urlCtor) {
+        LogLine("mainmenu: конструктор core::URL не найден — пункты останутся без картинок");
+        return;
+    }
+    std::wstring urlDir;
+    if (!MMIconsWriteFiles(urlDir)) {
+        LogLine("mainmenu: не удалось записать PNG глифов во временный каталог — "
+                "пункты останутся без картинок");
+        return;
+    }
+    const GUID group = MMGuid(kMMGroupStr);
+    const int total = (int)(sizeof(kMMIconDefs) / sizeof(kMMIconDefs[0]));
+    int set = 0;
+    for (const MMIconDef& def : kMMIconDefs) {
+        wchar_t url[2 * MAX_PATH + 64] = {};
+        _snwprintf_s(url, sizeof(url) / sizeof(url[0]), _TRUNCATE,
+                     L"file:///%ls/%hs.png", urlDir.c_str(), def.role);
+        if (MMSetDescrUrl(m->svc, urlCtor, group, def.num, url)) ++set;
+    }
+    LogLine("mainmenu: иконки заданы в описаниях (%d/%d, каталог %ls, "
+            "core::URL=core83+0x%llX)",
+            set, total, urlDir.c_str(),
+            (unsigned long long)(urlCtor - core.base));
 }
 
 // --- перехваты на приёмнике -------------------------------------------------
@@ -1139,6 +1384,7 @@ void MMWorkerInner() {
         {"образцы пунктов",  MMStepTemplates},
         {"registerCommands", MMStepRegister},
         {"источник панелей", MMStepSource},
+        {"иконки меню",      MMStepIcons},
         {"перехваты",        MMStepTraps},
     };
     bool built = false;
