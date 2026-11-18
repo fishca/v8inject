@@ -82,6 +82,7 @@ Add-Type @'
 using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic;
 public class W2 {
   [DllImport(\"user32.dll\")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport(\"user32.dll\")] static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr l);
   [DllImport(\"user32.dll\")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport(\"user32.dll\")] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport(\"user32.dll\")] static extern bool IsWindowVisible(IntPtr h);
@@ -90,11 +91,17 @@ public class W2 {
   delegate bool EnumProc(IntPtr h, IntPtr l);
   public static string Find(uint target) {
     string res = \"\";
-    EnumWindows((h,l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == target) {
+    // On 8.3 the bar is a CHILD of the configurator frame (only 8.5 needs a
+    // top-level window), so EnumWindows alone never sees it there.
+    EnumProc check = (h, l) => {
       var c = new StringBuilder(256); GetClassName(h, c, 256);
       if (c.ToString() == \"V8iGitBar\") { RECT r; GetWindowRect(h, out r);
         res = String.Format(\"{0}x{1} vis={2}\", r.R-r.L, r.B-r.T, IsWindowVisible(h)); }
-    } return true; }, IntPtr.Zero);
+      return true;
+    };
+    EnumWindows((h,l) => { uint p; GetWindowThreadProcessId(h, out p);
+      if (p == target) { check(h, l); EnumChildWindows(h, check, l); }
+      return true; }, IntPtr.Zero);
     return res;
   }
 }
