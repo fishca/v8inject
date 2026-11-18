@@ -64,6 +64,22 @@ void UiDrawButton(HDC dc, const RECT& rc, const wchar_t* text, HFONT font,
 // menu text and for accents that must sit on the cream face.
 COLORREF Blend(COLORREF fg, COLORREF bg, int alpha);
 
+// Pale-blue rounded hover with a vertical gradient, as in 1C submenus. Shared
+// by the action popup and the main-menu overlay replicas.
+void DrawSubHover(HDC dc, const RECT& rc);
+
+// The bar's owner-drawn action popup (defined in gitbar.cpp). The main-menu
+// overlay opens the same list and routes its WM_MEASUREITEM / WM_DRAWITEM
+// through the same handlers.
+void ShowActionMenu(HWND owner);
+void ActionMenuMeasure(LPMEASUREITEMSTRUCT m);
+void ActionMenuDraw(LPDRAWITEMSTRUCT d);
+
+// >0 while one of the panel's modal dialogs pumps its own message loop; the
+// main-menu overlay hides then, it would float over the dialog otherwise.
+// Defined in gitbar.cpp.
+extern int g_modalDepth;
+
 // Ownerdraw buttons would otherwise stay flat grey: the subclass only tracks
 // hover (the press state arrives as ODS_SELECTED) and redraws on change.
 void ThemedButton(HWND btn, HFONT font);

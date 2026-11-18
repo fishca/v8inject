@@ -76,6 +76,7 @@ add_library(v8i_payload SHARED
     src/payload/commands/inspect_commands.cpp
     src/payload/gitbar/git_lists.cpp
     src/payload/gitbar/git_log.cpp
+    src/payload/gitbar/git_menu.cpp
     src/payload/gitbar/git_service.cpp
     src/payload/gitbar/git_settings.cpp
     src/payload/gitbar/git_ui.cpp
@@ -186,6 +187,7 @@ add_executable(v8i_tests
     src/payload/commands/inspect_commands.cpp
     src/payload/gitbar/git_lists.cpp
     src/payload/gitbar/git_log.cpp
+    src/payload/gitbar/git_menu.cpp
     src/payload/gitbar/git_service.cpp
     src/payload/gitbar/git_settings.cpp
     src/payload/gitbar/git_ui.cpp

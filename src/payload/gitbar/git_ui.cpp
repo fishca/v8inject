@@ -285,5 +285,26 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefDlgProcW(h, msg, wp, lp);
 }
 
+// Pale-blue rounded hover with a vertical gradient, as in 1C submenus.
+void DrawSubHover(HDC dc, const RECT& rc) {
+    HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, 7, 7);
+    SelectClipRgn(dc, rgn);
+    TRIVERTEX v[2] = {
+        { rc.left, rc.top, 0xE300, 0xF000, 0xFF00, 0 },
+        { rc.right, rc.bottom, 0xCC00, 0xE300, 0xFF00, 0 },
+    };
+    GRADIENT_RECT g{ 0, 1 };
+    GradientFill(dc, v, 2, &g, 1, GRADIENT_FILL_RECT_V);
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(rgn);
+    HPEN pen = CreatePen(PS_SOLID, 1, kMenuHoverBorder);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, rc.left, rc.top, rc.right + 1, rc.bottom + 1, 7, 7);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(pen);
+}
+
 }  // namespace gitbar
 }  // namespace v8i
