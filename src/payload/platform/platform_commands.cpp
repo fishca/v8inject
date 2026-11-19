@@ -2558,6 +2558,24 @@ std::string CmdCmd85ToJson(const std::wstring& args0) {
 
 std::string CmdInfoToJson(const std::wstring&) { return CmdInfoToJsonA(); }
 
+// A failed transmitCommand leaves the designer mid-modal. The platform disables
+// its main frame before it creates the command's dialog, so an exception inside
+// the command means the dialog never appears and nothing ever re-enables the
+// frame: the whole Configurator stops taking input while every thread keeps
+// pumping (8.3.27.2342 live: cmd 45 faults, the frame stays WS_DISABLED and
+// clicking the bar does nothing because a disabled parent swallows the input).
+// The failure is ours to clean up, and the frame is the same window class on
+// 8.3 and 8.5.
+static void RestoreFramesAfterFailedTransmit() {
+    for (const WindowEntry& w : EnumProcessWindows()) {
+        if (!w.hwnd || IsWindowEnabled(w.hwnd)) continue;
+        if (w.cls != L"V8TopLevelFrame" && w.cls.rfind(L"V8Window0", 0) != 0) continue;
+        EnableWindow(w.hwnd, TRUE);
+        LogLine("cmd: re-enabled frame 0x%llX that the platform disabled before the fault",
+                (unsigned long long)(uintptr_t)w.hwnd);
+    }
+}
+
 std::string CmdCommandToJson(const std::wstring& args0) {
     std::wstring args = args0;
     bool wantHas = false;
@@ -2869,6 +2887,10 @@ std::string CmdCommandToJson(const std::wstring& args0) {
 
     int rc = mr.rc;
     if (rc < 0) {
+        // The fault stopped the platform between "disable the owner" and "show
+        // the dialog": put the frame back before reporting, or the Configurator
+        // stays dead until someone re-enables it from outside.
+        RestoreFramesAfterFailedTransmit();
         _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"error\":\"transmit exception 0x%X\"",
                     (unsigned)mr.exc);
         return j + numBuf + "}";

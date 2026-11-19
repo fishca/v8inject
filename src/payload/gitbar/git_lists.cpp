@@ -90,7 +90,18 @@ static void ListDlgFill(ListDlg* d) {
     SendMessageW(d->list, LB_RESETCONTENT, 0, 0);
     for (const std::wstring& line : d->items)
         SendMessageW(d->list, LB_ADDSTRING, 0, (LPARAM)line.c_str());
-    if (!d->items.empty()) SendMessageW(d->list, LB_SETCURSEL, 0, 0);
+    // An empty list is ambiguous: a clean working copy and a git that failed to
+    // run look exactly the same. Say which one it is. The row is display-only —
+    // d->items stays the source the selection and the buttons read.
+    if (d->items.empty()) {
+        const wchar_t* hint = d->kind == 0 ? L"Изменений нет: рабочая копия совпадает с HEAD"
+                             : d->kind == 1 ? L"Веток не найдено"
+                             : d->kind == 2 ? L"Отложенных изменений нет"
+                                            : L"Тегов нет";
+        SendMessageW(d->list, LB_ADDSTRING, 0, (LPARAM)hint);
+    } else {
+        SendMessageW(d->list, LB_SETCURSEL, 0, 0);
+    }
 }
 
 // Selected item with the porcelain status prefix stripped (for file paths).
@@ -322,15 +333,21 @@ void ShowList(HWND owner, int kind) {
         if (!RegisterClassW(&wc)) return;
         cls = true;
     }
-    const wchar_t* title = kind == 0 ? L"Рабочая копия — v8inject"
-                         : kind == 1 ? L"Ветки — v8inject"
-                         : kind == 2 ? L"Stash — v8inject"
-                                     : L"Теги — v8inject";
+    // The title names the repository the list belongs to. It used to be a
+    // hardcoded "— v8inject" (the author's own project), which is wrong on
+    // every other machine and says nothing about which folder is being read.
+    const wchar_t* caption = kind == 0 ? L"Рабочая копия"
+                            : kind == 1 ? L"Ветки"
+                            : kind == 2 ? L"Stash"
+                                        : L"Теги";
+    const size_t slash = dir.find_last_of(L"\\/");
+    const std::wstring leaf = slash == std::wstring::npos ? dir : dir.substr(slash + 1);
+    const std::wstring title = std::wstring(caption) + L" — " + leaf;
     ListDlg* d = new ListDlg();
     d->dir = dir;
     d->kind = kind;
     d->font = CreateDlgFont();
-    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitList", title,
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"V8iGitList", title.c_str(),
                              WS_POPUP | WS_THICKFRAME | WS_VISIBLE,
                              CW_USEDEFAULT, CW_USEDEFAULT, 760, 480 + kCapH,
                              owner, nullptr, GetModuleHandleW(nullptr), nullptr);

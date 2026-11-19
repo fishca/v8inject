@@ -837,6 +837,12 @@ static BOOL CALLBACK FindNewPlatformWindow(HWND h, LPARAM lp) {
             L"Выгрузка расширения отменена: активным было окно конфигурации. "
             L"Откройте «Расширения конфигурации», выберите расширение и повторите.");
     }
+    // A dialog that opens behind the user's windows reads as "1C hung": the
+    // frame it disabled stops taking input and nothing on screen responds.
+    // Pull the dialog forward so the click visibly does something.
+    SetForegroundWindow(h);
+    BringWindowToTop(h);
+
     InterlockedExchange(&w->seen, 1);
     return FALSE;
 }
@@ -866,8 +872,18 @@ static DWORD GitBarDumpVia(unsigned num) {
     std::string r = CmdCommandToJson(cmd);
     LogLine("gitbar: cmd %u -> %s", num, r.c_str());
 
-    bool timedOut = r.find("did not answer") != std::string::npos;
-    if (!timedOut) {
+    // The marshal can answer and still fail: the platform faults inside the
+    // command (8.3.27.2342: transmit exception 0x C0000005 on cmd 45). Then no
+    // dialog will ever appear, and the "configuration is closed" fallback below
+    // would send a second command into a platform that is already stuck
+    // mid-modal — report the failure and leave the platform alone.
+    const bool timedOut = r.find("did not answer") != std::string::npos;
+    // "did not answer" arrives with an "error" field too, but it is the success
+    // case on 8.3: the command blocks the UI thread for as long as its modal
+    // dialog is open, so only a fault/marshal error while the thread answered
+    // counts as a failed dump.
+    const bool replyError = !timedOut && r.find("\"error\":") != std::string::npos;
+    if (!timedOut && !replyError) {
         for (int i = 0; i < 50 && !w.seen; ++i) Sleep(30);
     }
     if (watch) {
@@ -887,6 +903,24 @@ static DWORD GitBarDumpVia(unsigned num) {
             LogLine("gitbar: 205 opened the MAIN configuration dialog: the "
                     "«Расширения конфигурации» window was not active (dialog closed)");
         }
+    }
+
+    if (replyError) {
+        // Show why the button did nothing: "transmit exception 0x..." today,
+        // the marshal's own text whenever a different step fails.
+        std::string msg = "команда отклонена";
+        const size_t p = r.find("\"error\":\"");
+        if (p != std::string::npos) {
+            const size_t e = r.find('"', p + 9);
+            if (e != std::string::npos && e > p + 9) msg = r.substr(p + 9, e - p - 9);
+        }
+        LogLine("gitbar: cmd %u failed: %s", num, msg.c_str());
+        std::wstring tip = L"Выгрузка не удалась: ";
+        tip.append(msg.begin(), msg.end());
+        tip += L". Платформа не приняла команду — выгрузите через меню "
+               L"«Конфигурация → Выгрузить конфигурацию в файлы».";
+        v8i::GitBarTipFromWorker(tip.c_str());
+        return 0;
     }
 
     if (num == 45 && !timedOut && !w.seen) {
