@@ -1,6 +1,8 @@
 #include "v8inject/pe_utils.h"
 #include <winternl.h>
 
+#include <algorithm>
+
 #if defined(_MSC_VER)
 #  include <intrin.h>
 #endif
@@ -38,25 +40,70 @@ PPEB CurrentPeb() {
 #endif
 }
 
+// The loader list is mutated by every LoadLibrary/LoadLibraryEx in the host
+// process, and this walk does not hold the loader lock: a node can be
+// unlinked, and its entry/name buffer freed, halfway through the walk. A
+// VirtualQuery probe followed by a plain dereference still faults in that
+// window, so every read goes through ReadProcessMemory on the current
+// process: a bad address is reported as an error instead of raising an AV
+// inside the payload (which would take 1C down with it). The entry read
+// doubles as the link read: the forward pointer is a field of the entry.
+bool ReadSelf(const void* src, void* dst, size_t len) {
+    if (!src || !dst || !len) return false;
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), src, dst, len, &got)) return false;
+    return got == len;
+}
+
+// Bound for the PEB walk. A corrupt list can point to itself, and a healthy
+// Configurator loads far fewer modules than this.
+constexpr size_t kMaxModuleWalk = 4096;
+
+std::wstring LoaderString(const UNICODE_STRING& us) {
+    if (!us.Buffer || us.Length < sizeof(wchar_t)) return std::wstring();
+    const size_t chars = us.Length / sizeof(wchar_t);
+    std::wstring name(chars, L'\0');
+    if (!ReadSelf(us.Buffer, name.data(), chars * sizeof(wchar_t)))
+        return std::wstring();
+    return name;
+}
+
 }  // namespace
 
 std::vector<ModuleRange> EnumModules() {
     std::vector<ModuleRange> result;
 
     PPEB peb = CurrentPeb();
-    if (!peb || !peb->Ldr) return result;
+    if (!peb) return result;
 
-    auto ldr = (PEB_LDR_DATA*)peb->Ldr;
-    LIST_ENTRY* head = &ldr->InMemoryOrderModuleList;
-    for (LIST_ENTRY* e = head->Flink; e && e != head; e = e->Flink) {
-        auto ent = CONTAINING_RECORD(e, V8I_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    PEB_LDR_DATA* ldr = nullptr;
+    if (!ReadSelf(&peb->Ldr, &ldr, sizeof(ldr)) || !ldr) return result;
+
+    LIST_ENTRY head{};
+    if (!ReadSelf(&ldr->InMemoryOrderModuleList, &head, sizeof(head))) return result;
+
+    LIST_ENTRY* const listHead = &ldr->InMemoryOrderModuleList;
+    std::vector<LIST_ENTRY*> seen;
+    seen.reserve(128);
+
+    LIST_ENTRY* e = head.Flink;
+    for (size_t i = 0; i < kMaxModuleWalk && e && e != listHead; ++i) {
+        // A corrupt list must end the walk, not loop over the same node.
+        if (std::find(seen.begin(), seen.end(), e) != seen.end()) break;
+        seen.push_back(e);
+
+        V8I_LDR_DATA_TABLE_ENTRY ent{};
+        if (!ReadSelf(CONTAINING_RECORD(e, V8I_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks),
+                      &ent, sizeof(ent)))
+            break;
+
         ModuleRange mr;
-        mr.base = (uintptr_t)ent->DllBase;
-        mr.size = ent->SizeOfImage;
-        if (ent->FullDllName.Buffer && ent->FullDllName.Length)
-            mr.path.assign(ent->FullDllName.Buffer,
-                           ent->FullDllName.Length / sizeof(wchar_t));
+        mr.base = (uintptr_t)ent.DllBase;
+        mr.size = ent.SizeOfImage;
+        mr.path = LoaderString(ent.FullDllName);
         result.push_back(std::move(mr));
+
+        e = ent.InMemoryOrderLinks.Flink;
     }
     return result;
 }
