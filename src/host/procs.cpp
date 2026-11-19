@@ -50,10 +50,20 @@ bool IsSession0(DWORD pid) {
     return session == 0;
 }
 
-// The bitness of a running process. IsWow64Process2 (Windows 10 1709+) tells
-// the native machine of the image directly; the old IsWow64Process cannot:
-// on a 32-bit host it answers FALSE for every process, which would make all
-// of them look 64-bit and send the GUI after an x64 payload for an x86 target.
+// The bitness of a running process. IsWow64Process2 (Windows 10 1709+) answers
+// with the machine of the process image and the machine of the host, which is
+// what the decision needs; the old IsWow64Process cannot: on a 32-bit host it
+// answers FALSE for every process, and on a 64-bit host it says nothing about a
+// 64-bit process beyond "not WOW64".
+bool IsMachine64(USHORT processMachine, USHORT nativeMachine) {
+    // An IMAGE_FILE_MACHINE_UNKNOWN process machine means "not a WOW64
+    // process": the process runs the host's native image, so the host machine
+    // decides. Otherwise the process machine does (A57).
+    const USHORT machine =
+        processMachine == IMAGE_FILE_MACHINE_UNKNOWN ? nativeMachine : processMachine;
+    return machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64;
+}
+
 bool IsProcess64(DWORD pid) {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return false;
@@ -71,8 +81,7 @@ bool IsProcess64(DWORD pid) {
     USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
     USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
     if (isWow64Process2 && isWow64Process2(h, &processMachine, &nativeMachine)) {
-        is64 = nativeMachine == IMAGE_FILE_MACHINE_AMD64 ||
-               nativeMachine == IMAGE_FILE_MACHINE_ARM64;
+        is64 = IsMachine64(processMachine, nativeMachine);
     } else {
         BOOL wow64 = FALSE;
         if (IsWow64Process(h, &wow64)) {

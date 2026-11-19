@@ -3,6 +3,7 @@
 #include "v8inject/diag.h"
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <cstdarg>
 #include <cstring>
 
 namespace v8i {
@@ -20,6 +21,212 @@ void* AllocRemote(HANDLE hProc, const void* data, size_t bytes) {
     }
     return remote;
 }
+
+// Fills `*out` with a formatted explanation, when the caller asked for one.
+void SetDetail(std::wstring* out, const wchar_t* fmt, ...) {
+    if (!out) return;
+    wchar_t buf[512] = {};
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    *out = buf;
+}
+
+// The two readers behind ImageReadFn. The target's image is read through the
+// process handle; the host's own copy is already mapped, so a memcpy is all it
+// takes. Neither is allowed to read past the end of its image -- the walker
+// below bounds every offset with SizeOfImage, but the target reader checks the
+// mapped image as well: a stale or corrupt header must not turn the walk into
+// a read of unrelated memory of our own process.
+struct TargetImage {
+    HANDLE    hProc;
+    uintptr_t base;
+};
+
+bool ReadTargetImage(void* ctx, uint32_t rva, void* dst, size_t bytes) {
+    const TargetImage* t = static_cast<const TargetImage*>(ctx);
+    if (!t || !t->hProc) return false;
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(t->hProc, (const BYTE*)t->base + rva, dst, bytes, &got))
+        return false;
+    return got == bytes;
+}
+
+struct HostImage {
+    uintptr_t base;
+};
+
+bool ReadHostImage(void* ctx, uint32_t rva, void* dst, size_t bytes) {
+    const HostImage* h = static_cast<const HostImage*>(ctx);
+    if (!h || !h->base) return false;
+    memcpy(dst, (const BYTE*)h->base + rva, bytes);
+    return true;
+}
+
+constexpr uint32_t kMaxImageSize   = 512u * 1024u * 1024u;
+constexpr uint32_t kMaxExportNames = 1u << 16;
+constexpr size_t   kMaxExportName  = 64;
+
+bool ReadBounded(const ImageReadFn& image, uint32_t sizeOfImage,
+                 uint64_t rva, void* dst, size_t bytes) {
+    if (rva + bytes > sizeOfImage) return false;
+    return image.read(image.ctx, (uint32_t)rva, dst, bytes);
+}
+
+// Reads a NUL-terminated export name within the image and within `cap`.
+bool ReadExportName(const ImageReadFn& image, uint32_t sizeOfImage,
+                    uint32_t rva, char (&name)[kMaxExportName]) {
+    for (size_t i = 0; i < kMaxExportName; ++i) {
+        if (!ReadBounded(image, sizeOfImage, (uint64_t)rva + i, &name[i], 1)) return false;
+        if (name[i] == 0) return true;
+    }
+    name[kMaxExportName - 1] = 0;
+    return false;   // no terminator within the cap: not a name we want
+}
+
+}  // namespace
+
+// The walk itself. Kept pure over the reader so the unit tests can hand it
+// synthetic images and the host's own copy goes through the very same code as
+// the target's image: what one side accepts, the other accepts too.
+PayloadImage FindProbeExport(const ImageReadFn& image) {
+    PayloadImage out;
+    out.error = "the image could not be read";
+    if (!image.read) return out;
+
+    IMAGE_DOS_HEADER dos{};
+    if (!image.read(image.ctx, 0, &dos, sizeof(dos))) return out;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) {
+        out.error = "the image does not start with MZ";
+        return out;
+    }
+    if (dos.e_lfanew <= 0) {
+        out.error = "the DOS header has no NT signature offset";
+        return out;
+    }
+
+    const uint32_t ntRva = (uint32_t)dos.e_lfanew;
+    uint32_t signature = 0;
+    if (!image.read(image.ctx, ntRva, &signature, sizeof(signature))) {
+        out.error = "the NT signature is unreadable";
+        return out;
+    }
+    if (signature != IMAGE_NT_SIGNATURE) {
+        out.error = "the image has no PE signature";
+        return out;
+    }
+
+    IMAGE_FILE_HEADER file{};
+    if (!image.read(image.ctx, ntRva + 4, &file, sizeof(file))) {
+        out.error = "the file header is unreadable";
+        return out;
+    }
+    out.timeDateStamp = file.TimeDateStamp;
+
+    const uint32_t optRva = ntRva + 4 + (uint32_t)sizeof(IMAGE_FILE_HEADER);
+    uint16_t magic = 0;
+    if (!image.read(image.ctx, optRva, &magic, sizeof(magic))) {
+        out.error = "the optional header is unreadable";
+        return out;
+    }
+    if (magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC && magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        out.error = "the optional header is neither PE32 nor PE32+";
+        return out;
+    }
+
+    // SizeOfImage sits at the same offset in both optional header flavors; the
+    // data directory does not (96 bytes into PE32, 112 into PE32+).
+    uint32_t sizeOfImage = 0;
+    if (!image.read(image.ctx, optRva + 56, &sizeOfImage, sizeof(sizeOfImage))) {
+        out.error = "the image size is unreadable";
+        return out;
+    }
+    if (sizeOfImage < optRva + 64 || sizeOfImage > kMaxImageSize) {
+        out.error = "the image size is implausible";
+        return out;
+    }
+    // Reported even when the walk ends in a refusal: "which image did we look
+    // at" is what the log needs when the export is missing.
+    out.sizeOfImage = sizeOfImage;
+
+    const uint64_t dirRva = (uint64_t)optRva +
+                            (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC ? 112u : 96u);
+    IMAGE_DATA_DIRECTORY exports{};
+    if (!ReadBounded(image, sizeOfImage, dirRva, &exports, sizeof(exports))) {
+        out.error = "the export directory entry is unreadable";
+        return out;
+    }
+    if (!exports.VirtualAddress || exports.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) {
+        out.error = "the image has no export directory";
+        return out;
+    }
+
+    IMAGE_EXPORT_DIRECTORY dir{};
+    if (!ReadBounded(image, sizeOfImage, exports.VirtualAddress, &dir, sizeof(dir))) {
+        out.error = "the export directory is unreadable";
+        return out;
+    }
+    if (!dir.NumberOfNames || dir.NumberOfNames > kMaxExportNames ||
+        dir.NumberOfFunctions > kMaxExportNames) {
+        out.error = "the export table has an implausible number of entries";
+        return out;
+    }
+
+    for (uint32_t i = 0; i < dir.NumberOfNames; ++i) {
+        uint32_t nameRva = 0;
+        uint16_t ordinal = 0;
+        if (!ReadBounded(image, sizeOfImage, (uint64_t)dir.AddressOfNames + (uint64_t)i * 4,
+                         &nameRva, sizeof(nameRva)) ||
+            !ReadBounded(image, sizeOfImage, (uint64_t)dir.AddressOfNameOrdinals + (uint64_t)i * 2,
+                         &ordinal, sizeof(ordinal))) {
+            out.error = "the export name table is unreadable";
+            return out;
+        }
+        char name[kMaxExportName] = {};
+        // An unusable name is simply not the one we are looking for; the one we
+        // want has to be readable, and it is, or the walk ends in a refusal.
+        if (!ReadExportName(image, sizeOfImage, nameRva, name)) continue;
+        if (strcmp(name, "v8i_probe") != 0) continue;
+
+        if (ordinal >= dir.NumberOfFunctions) {
+            out.error = "the v8i_probe ordinal leaves the function table";
+            return out;
+        }
+        uint32_t probeRva = 0;
+        if (!ReadBounded(image, sizeOfImage, (uint64_t)dir.AddressOfFunctions + (uint64_t)ordinal * 4,
+                         &probeRva, sizeof(probeRva))) {
+            out.error = "the export function table is unreadable";
+            return out;
+        }
+        if (!probeRva || probeRva >= sizeOfImage) {
+            out.error = "the v8i_probe export points outside the image";
+            return out;
+        }
+        // Inside the export directory means the entry is a forwarder string
+        // ("OTHERDLL.func"), not code in this image.
+        if (probeRva >= exports.VirtualAddress &&
+            (uint64_t)probeRva < (uint64_t)exports.VirtualAddress + exports.Size) {
+            out.error = "the v8i_probe export is forwarded to another module";
+            return out;
+        }
+        out.ok = true;
+        out.sizeOfImage = sizeOfImage;
+        out.probeRva = probeRva;
+        out.error = "";
+        return out;
+    }
+    out.error = "the image does not export v8i_probe";
+    return out;
+}
+
+bool PayloadBuildMatches(const PayloadImage& target, const PayloadImage& file) {
+    if (!target.ok || !file.ok) return false;
+    return target.timeDateStamp == file.timeDateStamp &&
+           target.sizeOfImage == file.sizeOfImage;
+}
+
+namespace {
 
 // LoadLibraryW is resolved locally and rebased into the target, never used by
 // its local address. On one Windows boot the system DLLs sit at the same base
@@ -177,11 +384,13 @@ bool StartPayloadThread(DWORD pid,
                         HANDLE& hProcessOut,
                         HANDLE& hThreadOut,
                         int& stageOut,
-                        DWORD& win32ErrorOut) {
+                        DWORD& win32ErrorOut,
+                        std::wstring* detailOut) {
     hProcessOut = nullptr;
     hThreadOut = nullptr;
     stageOut = kStageOpenProcess;
     win32ErrorOut = 0;
+    if (detailOut) detailOut->clear();
     if (!sharedName) { win32ErrorOut = ERROR_INVALID_PARAMETER; return false; }
 
     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
@@ -198,8 +407,31 @@ bool StartPayloadThread(DWORD pid,
         return false;
     }
 
-    // Load the very same file here so the export RVA is known locally,
-    // then map it into the target's address space.
+    // Take the export RVA from the image the target actually holds (A42). The
+    // target may have answered with an OLD payload module it loaded earlier:
+    // LoadLibraryW keys on the path, so a rebuilt file under the same name is
+    // not mapped, and the RVA of v8i_probe in that resident image is not the
+    // RVA in the file the host just read. Rebasing a local address by the
+    // module delta was exactly that mistake.
+    TargetImage targetImage{ hProc, (uintptr_t)targetBase };
+    const PayloadImage target = FindProbeExport({ ReadTargetImage, &targetImage });
+    LogLine("payload image in the target: base=%p stamp=%08lX size=%lu probeRva=0x%08lX %s",
+            (void*)targetBase, (unsigned long)target.timeDateStamp,
+            (unsigned long)target.sizeOfImage, (unsigned long)target.probeRva,
+            target.ok ? "ok" : target.error);
+    if (!target.ok) {
+        stageOut = kStageTargetImage;
+        SetDetail(detailOut,
+                  L"the payload image resident in the target cannot be used: %hs. "
+                  L"A payload DLL cannot be replaced in a running process -- if the "
+                  L"target still runs an older build of v8inject, restart it",
+                  target.error);
+        CloseHandle(hProc);
+        return false;
+    }
+
+    // Load the very same file here: the build on disk is what the target should
+    // be running, and its stamp tells whether the resident image is that build.
     stageOut = kStageLocalLoad;
     HMODULE localBase = LoadLibraryW(payloadDll.c_str());
     if (!localBase) {
@@ -207,28 +439,42 @@ bool StartPayloadThread(DWORD pid,
         CloseHandle(hProc);
         return false;
     }
-    stageOut = kStageGetProcAddress;
-    FARPROC localProbe = GetProcAddress(localBase, "v8i_probe");
-    if (!localProbe) {
-        // x86 builds without the alias export: try the decorated form.
-        const char* alias = sizeof(void*) == 4 ? "_v8i_probe@4" : "v8i_probe";
-        localProbe = GetProcAddress(localBase, alias);
-        LogLine("GetProcAddress(v8i_probe) failed, tried '%s' -> %p",
-                alias, (void*)localProbe);
+    HostImage hostImage{ (uintptr_t)localBase };
+    const PayloadImage file = FindProbeExport({ ReadHostImage, &hostImage });
+    LogLine("payload image on disk: base=%p stamp=%08lX size=%lu probeRva=0x%08lX %s",
+            (void*)localBase, (unsigned long)file.timeDateStamp,
+            (unsigned long)file.sizeOfImage, (unsigned long)file.probeRva,
+            file.ok ? "ok" : file.error);
+    FreeLibrary(localBase);   // target keeps its own reference
+
+    if (!file.ok) {
+        stageOut = kStageGetProcAddress;
+        SetDetail(detailOut,
+                  L"the payload DLL does not export a usable v8i_probe: %hs",
+                  file.error);
+        CloseHandle(hProc);
+        return false;
     }
-    if (!localProbe) {
-        win32ErrorOut = GetLastError();
-        FreeLibrary(localBase);
+    if (!PayloadBuildMatches(target, file)) {
+        // Refuse instead of calling into a resident image of another build: the
+        // stamp is the build identity, and a different one means the target
+        // still holds the previous payload (A42).
+        stageOut = kStagePayloadMismatch;
+        SetDetail(detailOut,
+                  L"the target already runs a payload from another build "
+                  L"(resident stamp %08lX, size %lu; the DLL on disk: stamp %08lX, "
+                  L"size %lu). A loaded DLL cannot be replaced in place -- restart "
+                  L"the target application",
+                  (unsigned long)target.timeDateStamp, (unsigned long)target.sizeOfImage,
+                  (unsigned long)file.timeDateStamp, (unsigned long)file.sizeOfImage);
+        LogLine("refusing to start a payload thread in a target of another build");
         CloseHandle(hProc);
         return false;
     }
 
-    uintptr_t delta = (uintptr_t)targetBase - (uintptr_t)localBase;
-    uintptr_t remoteProbeAddr = (uintptr_t)localProbe + delta;
-    LogLine("targetBase=%p localBase=%p delta=%lld localProbe=%p -> remoteProbe=%p",
-            (void*)targetBase, (void*)localBase, (long long)(intptr_t)delta,
-            (void*)localProbe, (void*)remoteProbeAddr);
-    FreeLibrary(localBase);   // target keeps its own reference
+    const uintptr_t remoteProbeAddr = (uintptr_t)targetBase + target.probeRva;
+    LogLine("targetBase=%p probeRva=%08lX -> remoteProbe=%p",
+            (void*)targetBase, target.probeRva, (void*)remoteProbeAddr);
 
     // Nothing is passed to the payload: it derives the block name from its own
     // PID, so there is no cross-process string to marshal.

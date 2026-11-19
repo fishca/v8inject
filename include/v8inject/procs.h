@@ -21,6 +21,16 @@ std::vector<ProcessEntry> ListProcesses();
 // True when the image at `path` is a 64-bit PE file.
 bool IsPe64(const std::wstring& path);
 
+// True when these IsWow64Process2 answers describe a 64-bit process.
+//
+// `processMachine` is the machine of the process image and `nativeMachine` the
+// machine of the host OS; they differ for a WOW64 process (I386 image on an
+// AMD64 host), and a native 64-bit process reports IMAGE_FILE_MACHINE_UNKNOWN
+// as its process machine. Keying off `nativeMachine` alone announced every
+// process on 64-bit Windows as 64-bit, which sent an x64 payload at 32-bit
+// targets and made `modules` lie (A57/A18).
+bool IsMachine64(USHORT processMachine, USHORT nativeMachine);
+
 // True when the given process is 64-bit (falls back to a PE header probe).
 bool IsProcess64(DWORD pid);
 

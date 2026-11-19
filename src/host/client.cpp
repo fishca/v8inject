@@ -346,9 +346,18 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
     if (!OpenBlock(pid, logDir)) return false;
 
     // Copy the payload into the target and start v8i_probe on its own thread.
+    // The injector explains refusals that are not plain Win32 errors (a stale
+    // payload image in the target, an image without the export) -- A42.
+    std::wstring startupDetail;
     if (!StartPayloadThread(pid, payloadDll, sharedName_,
-                            hProc_, hThread_, lastStage_, lastWin32_)) {
-        SetErrorText(L"start-up failed at stage %d (win32=%lu)", lastStage_, lastWin32_);
+                            hProc_, hThread_, lastStage_, lastWin32_,
+                            &startupDetail)) {
+        if (!startupDetail.empty()) {
+            wcsncpy_s(lastError_, startupDetail.c_str(), _TRUNCATE);
+        } else {
+            SetErrorText(L"start-up failed at stage %d (win32=%lu)", lastStage_, lastWin32_);
+        }
+        LogLine("start-up refused: %ls", lastError_);
         ReleaseHandles();
         return false;
     }

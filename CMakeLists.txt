@@ -177,11 +177,13 @@ add_executable(v8i_tests
     tests/unit_dispatcher.cpp
     tests/unit_diag.cpp
     tests/unit_injector.cpp
+    tests/unit_procs.cpp
     # The host side of the protocol lives in the host: the test plays the
     # payload, so it needs the real Client. The injector comes with it (the
     # client calls it), but the test never injects anything.
     src/host/client.cpp
     src/host/injector.cpp
+    src/host/procs.cpp
     # The payload sources are compiled in as well: the dispatcher test runs
     # the real command loop of the payload against a block of the test's own.
     # dllmain.cpp stays out - it belongs to the DLL.
