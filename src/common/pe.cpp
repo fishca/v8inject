@@ -7,35 +7,63 @@ namespace v8i {
 
 namespace {
 
+// True when rva + delta neither wraps around 2^32 nor leaves the image.
+// `rva + 2`/`rva + 4` used to overflow for an RVA near 4 GiB: the wrapped
+// small value passed the bound check and the read went to an unrelated
+// address. Always compare by subtraction.
+bool RvaFits(uint32_t rva, uint32_t delta, uint32_t sizeOfImage) {
+    return rva <= sizeOfImage && sizeOfImage - rva >= delta;
+}
+
+// How many bytes from `p` (at most `cap`) belong to one committed region of
+// readable memory. The region edge comes from VirtualQuery: probing only the
+// start of the string is not enough, because the readable run can end in the
+// middle of the image (the image is not one big readable region).
+size_t ReadableRun(const void* p, size_t cap) {
+    if (!p || !cap) return 0;
+    if (!IsReadable(p, 1)) return 0;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return 0;
+    const uintptr_t start = (uintptr_t)p;
+    const uintptr_t regionBase = (uintptr_t)mbi.BaseAddress;
+    if (start < regionBase || start - regionBase >= mbi.RegionSize) return 0;
+    const size_t avail = mbi.RegionSize - (start - regionBase);
+    return avail < cap ? avail : cap;
+}
+
 // Reads a NUL-terminated ASCII string out of a mapped image, bounded by the
-// image size and by `maxLen`. Every access is guarded: import and export tables
-// can point anywhere, and an unguarded read there kills the host process.
+// image size, by `maxLen` and by the readable region the string starts in.
+// Every access is guarded: import and export tables can point anywhere, and an
+// unguarded read there kills the host process.
 std::string SafeAscii(uintptr_t base, uint32_t sizeOfImage, uint32_t rva, size_t maxLen) {
     std::string out;
     if (!base || rva >= sizeOfImage) return out;
-    uint32_t limit = (uint32_t)((sizeOfImage - rva) < maxLen ? (sizeOfImage - rva) : maxLen);
-    if (!IsReadable((const void*)(base + rva), 1)) return out;
+    const uint32_t remaining = sizeOfImage - rva;
+    const size_t limit = remaining < maxLen ? remaining : maxLen;
 
     const char* p = (const char*)(base + rva);
-    for (size_t i = 0; i < limit; ++i) {
-        // Cheap page-crossing guard: only probe when moving into a new byte that
-        // may be past the readable run.
-        if ((i & 0xFF) == 0 && !IsReadable(p + i, 1)) break;
-        char c = p[i];
-        if (!c) break;
-        out.push_back(c);
+    size_t done = 0;
+    while (done < limit) {
+        const size_t chunk = ReadableRun(p + done, limit - done);
+        if (!chunk) break;
+        for (size_t i = 0; i < chunk; ++i) {
+            const char c = p[done + i];
+            if (!c) return out;
+            out.push_back(c);
+        }
+        done += chunk;
     }
     return out;
 }
 
 uint16_t SafeU16(uintptr_t base, uint32_t sizeOfImage, uint32_t rva) {
-    if (rva + 2 > sizeOfImage) return 0;
+    if (!RvaFits(rva, 2, sizeOfImage)) return 0;
     if (!IsReadable((const void*)(base + rva), 2)) return 0;
     return *(const uint16_t*)(base + rva);
 }
 
 uint32_t SafeU32(uintptr_t base, uint32_t sizeOfImage, uint32_t rva) {
-    if (rva + 4 > sizeOfImage) return 0;
+    if (!RvaFits(rva, 4, sizeOfImage)) return 0;
     if (!IsReadable((const void*)(base + rva), 4)) return 0;
     return *(const uint32_t*)(base + rva);
 }
@@ -159,18 +187,28 @@ PeImage ParsePe(uintptr_t base) {
                 const uint32_t ordsRva  = exp->AddressOfNameOrdinals;
 
                 for (DWORD i = 0; i < exp->NumberOfNames && i < 8192; ++i) {
-                    uint32_t namePtrRva = SafeU32(base, sizeOfImage, namesRva + i * 4);
+                    // The table offsets are added to hostile RVAs: a plain
+                    // `namesRva + i * 4` wraps near 4 GiB and reads a random
+                    // in-image address, so every sum is checked first.
+                    const uint32_t namesDelta = (uint32_t)i * 4u;
+                    if (!RvaFits(namesRva, namesDelta, sizeOfImage)) break;
+                    uint32_t namePtrRva = SafeU32(base, sizeOfImage, namesRva + namesDelta);
                     if (!namePtrRva) continue;
 
                     PeExport e;
                     e.name = SafeAscii(base, sizeOfImage, namePtrRva, 512);
                     if (e.name.empty()) continue;
 
-                    uint16_t idx = SafeU16(base, sizeOfImage, ordsRva + (uint32_t)i * 2);
-                    e.rva = SafeU32(base, sizeOfImage, funcsRva + (uint32_t)idx * 4);
+                    const uint32_t ordsDelta = (uint32_t)i * 2u;
+                    if (!RvaFits(ordsRva, ordsDelta, sizeOfImage)) break;
+                    uint16_t idx = SafeU16(base, sizeOfImage, ordsRva + ordsDelta);
+
+                    const uint32_t funcsDelta = (uint32_t)idx * 4u;
+                    if (!RvaFits(funcsRva, funcsDelta, sizeOfImage)) continue;
+                    e.rva = SafeU32(base, sizeOfImage, funcsRva + funcsDelta);
                     e.ordinal = (uint32_t)(exp->Base + idx);
                     // An export pointing inside the export directory is a forwarder.
-                    if (e.rva >= expRva && e.rva < expRva + dir.Size) {
+                    if (e.rva >= expRva && e.rva - expRva < dir.Size) {
                         e.forwarded = true;
                         e.forwarder = SafeAscii(base, sizeOfImage, e.rva, 256);
                     }
@@ -186,12 +224,19 @@ PeImage ParsePe(uintptr_t base) {
     if (numDirs > IMAGE_DIRECTORY_ENTRY_IMPORT) {
         const IMAGE_DATA_DIRECTORY& imp = dirs[IMAGE_DIRECTORY_ENTRY_IMPORT];
         if (imp.VirtualAddress && imp.Size && imp.VirtualAddress < sizeOfImage) {
-            const uint32_t dirEnd = imp.VirtualAddress + imp.Size;
+            const uint32_t descSize = (uint32_t)sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            // imp.Size is added to an RVA from the header: clamp instead of
+            // letting the 32-bit sum wrap around to a small `dirEnd`.
+            const uint32_t dirEnd = imp.Size > sizeOfImage - imp.VirtualAddress
+                                        ? sizeOfImage
+                                        : imp.VirtualAddress + imp.Size;
             for (int d = 0; d < 1024; ++d) {
-                uint32_t descRva = imp.VirtualAddress + (uint32_t)(d * sizeof(IMAGE_IMPORT_DESCRIPTOR));
-                if (descRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > sizeOfImage) break;
-                if (descRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > dirEnd) break;
-                if (!IsReadable((const void*)(base + descRva), sizeof(IMAGE_IMPORT_DESCRIPTOR))) break;
+                const uint32_t descDelta = (uint32_t)d * descSize;
+                if (!RvaFits(imp.VirtualAddress, descDelta, sizeOfImage)) break;
+                const uint32_t descRva = imp.VirtualAddress + descDelta;
+                if (!RvaFits(descRva, descSize, sizeOfImage)) break;
+                if (descRva + descSize > dirEnd) break;
+                if (!IsReadable((const void*)(base + descRva), descSize)) break;
 
                 auto* desc = (const IMAGE_IMPORT_DESCRIPTOR*)(base + descRva);
                 if (!desc->Name && !desc->FirstThunk) break;   // terminator
@@ -210,8 +255,10 @@ PeImage ParsePe(uintptr_t base) {
                 constexpr size_t thunkSize = sizeof(void*) == 8 ? sizeof(IMAGE_THUNK_DATA64)
                                                                 : sizeof(IMAGE_THUNK_DATA32);
                 for (int i = 0; i < 8192; ++i) {
-                    uint32_t curThunkRva = thunkRva + (uint32_t)(i * thunkSize);
-                    if (curThunkRva + thunkSize > sizeOfImage) break;
+                    const uint32_t thunkDelta = (uint32_t)(i * thunkSize);
+                    if (!RvaFits(thunkRva, thunkDelta, sizeOfImage)) break;
+                    const uint32_t curThunkRva = thunkRva + thunkDelta;
+                    if (!RvaFits(curThunkRva, (uint32_t)thunkSize, sizeOfImage)) break;
                     if (!IsReadable((const void*)(base + curThunkRva), thunkSize)) break;
 
                     uint64_t value = 0;
@@ -222,9 +269,11 @@ PeImage ParsePe(uintptr_t base) {
                     }
                     if (!value) break;
 
+                    if (!RvaFits(desc->FirstThunk, thunkDelta, sizeOfImage)) break;
+
                     PeImport pi;
                     pi.dll = dllName;
-                    pi.iatRva = desc->FirstThunk + (uint32_t)(i * thunkSize);
+                    pi.iatRva = desc->FirstThunk + thunkDelta;
 
                     bool byOrdinal = false;
                     if constexpr (sizeof(void*) == 8) {
@@ -235,8 +284,12 @@ PeImage ParsePe(uintptr_t base) {
                     if (byOrdinal) {
                         pi.ordinal = (uint16_t)(value & 0xFFFF);
                     } else {
-                        uint32_t nameRva = (uint32_t)value;
-                        if (nameRva + 2 >= sizeOfImage) continue;
+                        const uint32_t nameRva = (uint32_t)value;
+                        // The name starts two bytes past the hint. Check by
+                        // subtraction: `nameRva + 2` wraps for a hint near
+                        // 4 GiB and then reads an unrelated in-image byte.
+                        if (nameRva >= sizeOfImage || sizeOfImage - nameRva <= 2)
+                            continue;
                         pi.ordinal = SafeU16(base, sizeOfImage, nameRva);
                         pi.name = SafeAscii(base, sizeOfImage, nameRva + 2, 256);
                     }
