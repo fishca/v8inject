@@ -58,42 +58,105 @@ void PutResponse(const std::string& json) {
     InterlockedExchange((volatile LONG*)&g_io->ready, kStateResponse);
 }
 
-// SEH helper: __try cannot live in a function that needs C++ unwinding,
-// so the guarded call is isolated in a POD-only function.
-HRESULT ScanGuarded(ITypeInfo* ti, TypeInfoReport* rep) {
-    HRESULT hr = E_UNEXPECTED;
-    __try {
-        hr = ScanTypeInfo(ti, *rep);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hr = E_UNEXPECTED;
+// A41: the address comes from the command line, so it may point at anything at
+// all. Calling QueryInterface on such a "COM object" is a call through an
+// arbitrary qword inside the 1C process; the cheap and honest gate is that the
+// qword (the vtable) lies in the executable part of a mapped image. A string,
+// a request buffer or a heap node is rejected before any target code runs.
+static bool LooksLikeComObject(const void* p, uintptr_t* vtable) {
+    if (!p || !IsReadable(p, sizeof(uintptr_t))) return false;
+    uintptr_t vt = 0;
+    memcpy(&vt, p, sizeof(vt));
+    if (!vt) return false;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery((const void*)vt, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE) return false;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!(mbi.Protect & exec)) return false;
+    *vtable = vt;
+    return true;
+}
+
+enum class ScanStatus {
+    ok,
+    badUsage,
+    noModule,
+    notReadable,
+    notComObject,
+    noTypeInfo,
+    crashed,
+};
+
+static const wchar_t* ScanStatusText(ScanStatus st) {
+    switch (st) {
+    case ScanStatus::badUsage:     return L"usage: scan <module> <addrHex>";
+    case ScanStatus::noModule:     return L"module not found";
+    case ScanStatus::notReadable:  return L"address is not readable";
+    case ScanStatus::notComObject: return L"address does not look like a COM object";
+    case ScanStatus::noTypeInfo:   return L"no ITypeInfo at the address";
+    case ScanStatus::crashed:      return L"scan crashed inside the target";
+    case ScanStatus::ok:           break;
     }
-    return hr;
+    return L"scan failed";
 }
 
 // "scan <moduleName> <addrHex>"
-bool RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
+static ScanStatus RunScanImpl(const wchar_t* cmd, TypeInfoReport& rep) {
     wchar_t moduleName[64] = {};
     unsigned long long addr = 0;
     int matched = swscanf_s(cmd, L"scan %63s %llx", moduleName,
                             (unsigned)_countof(moduleName), &addr);
-    if (matched != 2) return false;
+    if (matched != 2) return ScanStatus::badUsage;
 
     ModuleRange mr;
-    if (!FindModule(moduleName, mr)) return false;
+    if (!FindModule(moduleName, mr)) return ScanStatus::noModule;
 
     rep.moduleName = moduleName;
     rep.moduleBase = mr.base;
 
-    void* p = (void*)(uintptr_t)addr;
-    if (!IsReadable(p, sizeof(void*))) return false;
+    const void* p = (const void*)(uintptr_t)addr;
+    if (!IsReadable(p, sizeof(uintptr_t))) return ScanStatus::notReadable;
+    uintptr_t vt = 0;
+    if (!LooksLikeComObject(p, &vt)) return ScanStatus::notComObject;
 
-    IUnknown* unk = (IUnknown*)p;
+    // From here on the call runs code of the target process: the SEH frame
+    // around the whole scan turns any fault into a JSON error.
     ITypeInfo* ti = nullptr;
-    if (FAILED(GetTypeInfoFromUnknown(unk, &ti)) || !ti) return false;
-
-    HRESULT hr = ScanGuarded(ti, &rep);
+    HRESULT hr = GetTypeInfoFromUnknown((IUnknown*)p, &ti);
+    if (FAILED(hr) || !ti) return ScanStatus::noTypeInfo;
+    hr = ScanTypeInfo(ti, rep);
     ti->Release();
-    return SUCCEEDED(hr);
+    return SUCCEEDED(hr) ? ScanStatus::ok : ScanStatus::noTypeInfo;
+}
+
+// POD-only frame around the whole scan: the parsers and the module walk touch
+// memory of a foreign process as well, and one AV anywhere in them must still
+// come back as a JSON error. (C2712: no C++ object that needs unwinding may
+// live in the frame that owns __try, hence the pointer-only struct.)
+struct ScanCall {
+    const wchar_t* cmd;
+    TypeInfoReport* rep;
+    ScanStatus* status;
+};
+
+static int RunScanUnderSeh(ScanCall* call) {
+    __try {
+        *call->status = RunScanImpl(call->cmd, *call->rep);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *call->status = ScanStatus::crashed;
+        return 0;
+    }
+}
+
+static ScanStatus RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
+    ScanStatus st = ScanStatus::ok;
+    ScanCall call{ cmd, &rep, &st };
+    RunScanUnderSeh(&call);
+    return st;
 }
 
 // MSVC C2712: __try cannot live in a function that needs C++ unwinding, so the
@@ -433,8 +496,14 @@ int v8i::V8iRunCommandLoop(SharedIo* io) {
         }
 
         TypeInfoReport rep;
-        if (!RunScan(g_io->request, rep)) {
-            PutResponse("{\"status\":\"error\",\"message\":\"scan failed\"}");
+        const ScanStatus st = RunScan(g_io->request, rep);
+        if (st != ScanStatus::ok) {
+            char buf[256] = {};
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "{\"status\":\"error\",\"command\":\"scan\",\"message\":\"%ls\"}",
+                        ScanStatusText(st));
+            PutResponse(buf);
+            LogLine("scan rejected: %ls", ScanStatusText(st));
             continue;
         }
         PutResponse(ToJson(rep));

@@ -180,6 +180,48 @@ V8I_TEST(Dispatcher_EveryAnswerIsValidJson) {
     }
 }
 
+V8I_TEST(Dispatcher_ScanRejectsBadAddresses) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    // A41: "scan" takes an address from the command line and calls a vtable
+    // there. Every rejection below must come back as a JSON error while the
+    // dispatcher - and in a real process, 1C - stays alive.
+    wchar_t self[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    const wchar_t* leaf = wcsrchr(self, L'\\');
+    leaf = leaf ? leaf + 1 : self;
+
+    std::wstring cmd = L"scan ";
+    cmd += leaf;
+
+    std::string reply;
+
+    // 1) Not mapped at all: the first pages of the address space are free.
+    REQUIRE(d.Ask((cmd + L" 1000").c_str(), reply));
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+    CHECK(reply.find("not readable") != std::string::npos);
+
+    // 2) Readable, but not a COM object: a static zeroed buffer. Its first
+    //    qword is not a pointer at all, let alone a vtable in an image.
+    static const char kPlainData[64] = {};
+    wchar_t addr[64] = {};
+    _snwprintf_s(addr, _countof(addr), _TRUNCATE, L" 0x%llX",
+                 (unsigned long long)(uintptr_t)kPlainData);
+    REQUIRE(d.Ask((cmd + addr).c_str(), reply));
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+    CHECK(reply.find("COM object") != std::string::npos);
+
+    // 3) An unknown module is an error as well.
+    REQUIRE(d.Ask(L"scan nosuchmodule.dll 1000", reply));
+    CHECK(reply.find("module not found") != std::string::npos);
+
+    // Every answer was valid JSON, and the loop survived all three.
+    CHECK(JsonValid(reply));
+    REQUIRE(d.Ask(L"version", reply));
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+}
+
 V8I_TEST(Dispatcher_UnknownCommandIsAnError) {
     Dispatcher d;
     REQUIRE(d.Start());
