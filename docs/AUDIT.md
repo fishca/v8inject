@@ -980,3 +980,57 @@ proc; отказ от подкласса при `old == V8iSubclass85` и защ
 другой сборки нельзя заменить на месте, поэтому при несовпадении протокола
 хост требует перезапуска цели — пересборка DLL при живом процессе это A42
 (пакет 3).
+
+#### Пакет 3 — инжект: закрыт
+
+| # | Что сделано | Коммит |
+|---|---|---|
+| A42 | RVA `v8i_probe` читается из того образа, который **лежит в цели**: `ReadProcessMemory` по базе модуля (DOS/NT-заголовки, каталог экспорта, таблицы имён/ординалов/функций), адрес потока = база цели + RVA из её таблицы. Локальная копия загружается только чтобы получить идентичность сборки, дельта баз больше не применяется. Проход один и тот же для цели и для файла (`FindProbeExport` + `ImageReadFn`), каждый оффсет ограничен `SizeOfImage`, все чтения цели — через `ReadProcessMemory`. При несовпадении `TimeDateStamp`/`SizeOfImage` — отказ «в цели payload другой сборки, перезапустите приложение» (`kStagePayloadMismatch`), при нечитаемом/чужом образе — `kStageTargetImage`; текст отказа доходит до `Client::LastError()` (новый параметр `detailOut`) | `743899e` |
+| A57 | Решение вынесено в `IsMachine64(processMachine, nativeMachine)` и смотрит на машину **процесса**; `IMAGE_FILE_MACHINE_UNKNOWN` (нативный 64-битный процесс) — единственный случай, когда берётся машина хоста. `IsProcess64` использует его вместо `nativeMachine`, поэтому на 64-битной Windows 32-битный процесс больше не считается 64-битным (A18) | `743899e` |
+
+Приёмка пакета: сборка x64 и x86 `/W4 /WX` без предупреждений C++; `ctest`
+4/4 на обеих разрядностях (в изоляции); `unit` — 71 тест / 908 проверок на
+x64, 69 / 874 на x86 (было 60 / 856 и 59 / 827).
+
+- `Injector_FindsTheExportInTheImageItIsGiven` — PE32 и PE32+ образы
+  разбираются, RVA/штамп/размер возвращаются из образа;
+- `Injector_TakesTheProbeRvaFromEachImageSeparately` — две сборки с разными
+  RVA: ответ для каждой — её собственный RVA (на старом коде второй адрес
+  считался переносом первого) и `PayloadBuildMatches` их различает;
+- `Injector_RefusesAStaleImageWithTheSameExport` — другой штамп или размер
+  образа = другая сборка, отказ;
+- `Injector_RefusesAnImageWithoutTheExport`,
+  `Injector_RefusesAnImageWithoutAnExportDirectory`, `Injector_RefusesGarbageImages`,
+  `Injector_RefusesATableThatPointsOutsideTheImage` — отказы с причиной: нет
+  экспорта, нет каталога, не MZ/не PE/не PE32|PE32+, ordinal вне таблицы,
+  forwarder, RVA вне образа, неправдоподобное число имён, нечитаемая таблица;
+- `Injector_WalksARealExportTable` — проход по реальной таблице экспорта
+  `kernel32.dll` (тысячи имён) завершается отказом «нет `v8i_probe`», а не
+  падением;
+- `Procs_TheHostMachineDoesNotDecideTheProcessBitness` — все комбинации машин,
+  включая WOW64 (I386/AMD64), нативный 64-битный (UNKNOWN/AMD64), x64 на ARM64;
+- `Procs_TheRunningProcessHasTheBitnessOfThisBuild` — **на x86-сборке падает на
+  старом коде** (он отвечал «64», потому что хост 64-битный);
+- `Procs_AWow64ProcessIsNot64Bit` — живой `SysWOW64\cmd.exe`: `processMachine
+  = 0x014C`, `nativeMachine = 0x8664`, `IsProcess64` = false.
+
+Живая проверка A42 (стенд без 1С, `v8i_hook_target`): две сессии подряд к
+одному процессу проходят (`version` отвечает `api:1`); затем загруженная копия
+переименована, payload перелинкован на тот же путь и `probe` отказан:
+`the target already runs a payload from another build (resident stamp
+6AFED2A9, size 5386240; the DLL on disk: stamp 6AFED6D6, size 5386240)`,
+`stage: 10`, код возврата 4, процесс жив. В логе хоста видны обе идентичности:
+`payload image in the target: base=…CAFE0000 stamp=6AFED2A9 … probeRva=0x000560C0`
+и `payload image on disk: base=…CD670000 stamp=6AFED6D6 …` — на старом коде
+дельта `targetBase − localBase` была отрицательной и поток в 1С стартовал по
+адресу внутри чужого образа.
+
+Живая проверка A57: `SysWOW64\cmd.exe` → `v8inject modules` печатает
+`target x64 : no` (x86-сборка CLI — тоже `no`), нативный 64-битный `cmd.exe` →
+`yes`; `IsWow64Process2` для них даёт `0x014C/0x8664` и `0x0000/0x8664`
+соответственно.
+
+Остаточное: при несовпадении сборок сессию к живому процессу открыть нельзя —
+нужен перезапуск цели (заменить загруженную DLL на месте нельзя; это и есть
+причина отказа); переиспользование образа той же сборки работает, потому что
+адрес теперь берётся из таблицы экспорта самого образа.
