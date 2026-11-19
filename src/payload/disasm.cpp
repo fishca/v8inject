@@ -54,6 +54,28 @@ std::string HexOf(const uint8_t* p, size_t n) {
     return out;
 }
 
+// How many of the first `want` bytes at `addr` are readable, without a fault.
+// A84: the old code asked whether ONE byte was readable and then copied up to
+// sixteen, which is a fault waiting for an instruction that starts near the end
+// of a mapping. The answer is capped by the end of the region, so a caller
+// decodes what is there instead of reading the next, possibly unmapped, page.
+size_t ReadableRunAt(uintptr_t addr, size_t want) {
+    if (!want) return 0;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    const DWORD prot = mbi.Protect & 0xFF;
+    const bool readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                           prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                           prot == PAGE_EXECUTE_READWRITE ||
+                           prot == PAGE_EXECUTE_WRITECOPY);
+    if (!readable || (mbi.Protect & PAGE_GUARD)) return 0;
+    const uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    if (end <= addr) return 0;
+    const size_t avail = (size_t)(end - addr);
+    return avail < want ? avail : want;
+}
+
 }  // namespace
 
 size_t DecodeOne(uintptr_t address, Insn* out, bool is64) {
@@ -87,11 +109,12 @@ std::vector<Insn> Disassemble(uintptr_t start, size_t size, size_t maxInsns,
     uintptr_t end = start + size;
     while (cur < end && out.size() < maxInsns) {
         // Copy through a scratch buffer: reading the target's code directly into
-        // Capstone is fine, but guarding the page first avoids a fault on the
-        // last page of a section.
+        // Capstone is fine, but the copy has to stay inside memory that is
+        // actually readable (A84).
         uint8_t scratch[16] = {};
         size_t want = (size_t)std::min<uintptr_t>(sizeof(scratch), end - cur);
-        if (!IsReadable((const void*)cur, 1)) break;
+        want = ReadableRunAt(cur, want);
+        if (!want) break;
         memcpy(scratch, (const void*)cur, want);
 
         cs_insn* insn = nullptr;
@@ -145,13 +168,20 @@ XrefResult FindXrefsVerbose(uintptr_t start, uintptr_t end, uintptr_t target,
             // Only the first byte must be readable. Requiring the whole chunk
             // to be readable rejects the tail of every region, which is most of
             // the last page — that stalled the sweep at its very first step.
+            // The region's protection still has to allow reading: PAGE_EXECUTE
+            // (no read) is executable but `memcpy` from it faults, which is
+            // what A84 caught.
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi))) {
                 r.stopReason = "VirtualQuery failed";
                 break;
             }
-            if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) ||
-                (mbi.Protect & PAGE_GUARD)) {
+            const DWORD prot = mbi.Protect & 0xFF;
+            const bool readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                                   prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                                   prot == PAGE_EXECUTE_READWRITE ||
+                                   prot == PAGE_EXECUTE_WRITECOPY);
+            if (mbi.State != MEM_COMMIT || !readable || (mbi.Protect & PAGE_GUARD)) {
                 uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
                 if (next <= cur) { r.stopReason = "bad region, cannot advance"; break; }
                 cur = next;
@@ -254,6 +284,15 @@ CopyInsn DecodeForCopy(uintptr_t address, bool is64) {
         out.branchTarget = (uintptr_t)x.operands[0].imm;
         out.immOffset = x.encoding.imm_offset;
         out.immSize = x.encoding.imm_size;
+
+        // A91: the hook engine rewrites this immediate in place as a 4-byte
+        // displacement, or re-emits the instruction as rel32 when it was rel8.
+        // A branch whose displacement is 2 bytes -- `66 E9` on x86, the 16-bit
+        // operand-size form -- is neither: writing four bytes into a two-byte
+        // field overwrites the instruction that follows it in the trampoline.
+        if (out.immSize != 1 && out.immSize != 4) {
+            out.unsupportedBranch = true;
+        }
 
         // loop / loope / loopne / jcxz / jecxz / jrcxz only exist with an 8-bit
         // displacement, so there is no wider encoding to widen them into.

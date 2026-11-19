@@ -203,6 +203,12 @@ add_executable(v8i_tests
     # and its worker thread (A61, A80), the agent's process bookkeeping and Run
     # key (A62, A82), the GitBar settings write (A64) and the DPI scaling (A81).
     tests/unit_hosts.cpp
+    # The detour engine and its disassembler: duplicate-hook rejection and the
+    # byte check before a restore (A71), the trace ring's 64-bit counters and
+    # generation-safe clear (A90), the reply budget (A70), the prologue decoder
+    # (A75, A91) and the readable-range checks (A84). The engine is compiled
+    # into this binary, so the tests install real hooks on their own stubs.
+    tests/unit_hook.cpp
     src/cli/watch_state.cpp
     src/host/agent_state.cpp
     src/host/autostart.cpp

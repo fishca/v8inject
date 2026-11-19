@@ -56,4 +56,10 @@ std::string HooksCommandToJson(const std::wstring& args);
 // trace [--count N] [--since N] [--clear]
 std::string TraceCommandToJson(const std::wstring& args);
 
+// The byte budget of one trace reply (docs/AUDIT.md A70). A reply that would
+// grow past it is cut with "truncated":true instead of being assembled whole
+// and then refused by the shared block as "response too large". Exposed so the
+// test can check the invariant on a real --count 1024 answer.
+size_t TraceReplyBudget();
+
 }  // namespace v8i

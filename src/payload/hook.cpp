@@ -47,13 +47,23 @@ constexpr size_t kMaxStolen = 24;
 constexpr int kMaxHooks = 64;
 constexpr int kMaxPlan = 16;      // instructions in one stolen prologue
 
-// One page-sized block per hook: stub at 0, indirect slot at 32, trampoline at
-// 64. Everything the hook needs sits in a single allocation near the target.
+// One block per hook: stub at 0, indirect slot at 32, trampoline at 64.
+// Everything the hook needs sits in a single allocation near the target. The
+// request is 256 bytes, but a block is always a whole VirtualAlloc'ed page
+// (4 KiB) -- the comment here used to call 256 bytes "a page-sized block",
+// which made the cost of a retired hook look 16x smaller than it is (A74).
 constexpr size_t kBlockSize = 256;
 constexpr size_t kSlotOffset = 32;
 constexpr size_t kTrampOffset = 64;
 
 constexpr size_t kTraceCapacity = 1024;
+
+// Budget for one trace reply. The shared block holds kResponseBytes (512 KiB)
+// and a reply that does not fit is refused whole, so 1024 records with full
+// caller chains would turn a working --count 1024 into "response too large".
+// The reply is therefore cut here, with "truncated":true in the answer (A70).
+// 448 KiB leaves room for the envelope and the last record.
+constexpr size_t kTraceBudget = 448 * 1024;
 
 // Caller frames recorded per trace slot. This is the budget of the frame walk
 // and of the JSON report: one number, so the walk can never outrun the record.
@@ -72,13 +82,21 @@ extern "C" void V8iThunkX86();
 //
 // Written from arbitrary threads inside the target process, so it is a seqlock
 // per slot: the writer bumps seq to an odd value, fills the record, bumps it
-// back to even. A reader that sees an odd or changed seq skips the slot instead
-// of blocking anyone. A lost record is acceptable; a stalled hooked function is
-// not.
+// back to even. A reader takes a whole copy between the two reads of seq and
+// throws it away when they differ, instead of blocking anyone. A lost record is
+// acceptable; a stalled hooked function is not.
+//
+// Both counters are 64-bit and monotonic (A90): the old `LONG` head wrapped at
+// 2^31 records, after which the whole ring looked empty, and `trace --clear`
+// used to zero the head and every seq -- while a writer was mid-record that set
+// a slot's generation back a full wrap, so the slot could be read as valid one
+// generation late. Clearing now only moves `base` forward; writers are never
+// disturbed and old records are simply out of range.
 // ---------------------------------------------------------------------------
 
 struct TraceSlot {
-    volatile LONG seq;
+    volatile LONG64 seq;      // odd while a writer is filling the slot
+    uint64_t  idx;            // absolute record number this slot holds
     uint32_t  id;
     uint32_t  tid;
     uint64_t  tick;
@@ -93,8 +111,21 @@ struct TraceSlot {
     int       frameCount;
 };
 
+// One record, copied out of a slot between two reads of its seq.
+struct TraceRecord {
+    uint64_t  idx;
+    uint32_t  id;
+    uint32_t  tid;
+    uint64_t  tick;
+    uintptr_t retAddr;
+    uintptr_t args[4];
+    uintptr_t frame[kMaxFrames];
+    int       frameCount;
+};
+
 TraceSlot      g_slots[kTraceCapacity];
-volatile LONG  g_head = 0;        // records ever written, also the next index
+volatile LONG64 g_head = 0;       // records ever written, also the next index
+volatile LONG64 g_base = 0;       // first record a reader may still see
 
 struct HookCtx {
     void*     trampoline = nullptr;   // offset 0: the thunks read [ctx]
@@ -104,9 +135,10 @@ struct HookCtx {
     size_t    stolen = 0;
     uint32_t  id = 0;
     volatile LONG logged = 0;   // disk-logged hits (capped to avoid flooding)
-    bool      active = false;
+    volatile LONG active = 0;    // read by V8iHookEnter on arbitrary threads
     HookObserver obs = nullptr;   // optional per-hook observer
     uint8_t   original[kMaxStolen + 8] = {};
+    uint8_t   patch[kPatchLen] = {};   // what we wrote, to verify before restore
     char      name[64] = {};
     volatile LONG calls = 0;
 };
@@ -118,7 +150,29 @@ struct HookCtx {
 SRWLOCK               g_lock = SRWLOCK_INIT;
 HookCtx*              g_hooks[kMaxHooks];
 int                   g_hookCount = 0;
-uint32_t              g_nextId = 1;
+volatile LONG         g_nextId = 1;   // ids are taken before the bytes change
+
+// Blocks handed out to hooks. They are never freed (a thread may still be
+// inside a trampoline when the detour is removed), so this list is append-only
+// and can be read by the fault logger without a lock: it exists to answer one
+// question -- is this fault inside code the engine owns -- and a stale entry is
+// harmless because the memory is still mapped.
+constexpr int kMaxBlockRanges = 512;
+struct BlockRange {
+    uintptr_t lo = 0;
+    uintptr_t hi = 0;
+};
+BlockRange            g_blockRanges[kMaxBlockRanges];
+volatile LONG         g_blockRangeCount = 0;
+
+// A74: retirement accounting. Every removed hook keeps its block (4 KiB) and
+// its HookCtx for the rest of the process lifetime, which is the price of not
+// freeing memory a thread may be executing. Cheap for a session that installs a
+// handful of hooks, unbounded for a script that installs and removes in a loop
+// -- so both counters are reported by the `hooks` command and logged on every
+// removal instead of being silently paid.
+volatile LONG         g_retiredBlocks = 0;
+volatile LONG64       g_retiredBytes = 0;
 
 struct LockGuard {
     LockGuard() { AcquireSRWLockExclusive(&g_lock); }
@@ -185,18 +239,33 @@ struct Tokenizer {
 // 3. A thread already executing the trampoline when a hook is removed is
 //    safe: the trampoline block is deliberately never freed (HookRemove).
 // 4. The heap lock: nothing allocates between Suspend and ResumeAll -- the
-//    fixed handles_ array exists for exactly that reason.
+//    fixed handles_ array exists for exactly that reason, and the failure
+//    reasons below are return codes rather than std::string (A72): building a
+//    >15-character error text allocates, and it used to happen *before*
+//    ResumeAll, while every other thread was still frozen holding whatever
+//    lock the allocator needed.
 class Suspender {
 public:
+    enum class Result {
+        ok,
+        snapshotFailed,
+        threadInPrologue,
+        tooManyThreads,
+    };
+
     ~Suspender() { ResumeAll(); }
 
-    bool Suspend(uintptr_t lo, uintptr_t hi, std::string& error) {
+    Result Suspend(uintptr_t lo, uintptr_t hi) {
         DWORD self = GetCurrentThreadId();
         DWORD pid = GetCurrentProcessId();
 
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE) { error = "thread snapshot failed"; return false; }
+        if (snap == INVALID_HANDLE_VALUE) {
+            ResumeAll();
+            return Result::snapshotFailed;
+        }
 
+        Result result = Result::ok;
         THREADENTRY32 te{};
         te.dwSize = sizeof(te);
         if (Thread32First(snap, &te)) {
@@ -216,10 +285,8 @@ public:
                     if (ip >= lo && ip < hi) {
                         ResumeThread(h);
                         CloseHandle(h);
-                        CloseHandle(snap);
-                        error = "a thread is executing the prologue; try again";
-                        ResumeAll();
-                        return false;
+                        result = Result::threadInPrologue;
+                        break;
                     }
                 }
                 if (count_ >= kMaxThreads) {
@@ -227,16 +294,18 @@ public:
                     // rather than patch with a thread left suspended.
                     ResumeThread(h);
                     CloseHandle(h);
-                    CloseHandle(snap);
-                    ResumeAll();
-                    error = "too many threads to suspend safely";
-                    return false;
+                    result = Result::tooManyThreads;
+                    break;
                 }
                 handles_[count_++] = h;
             } while (Thread32Next(snap, &te));
         }
         CloseHandle(snap);
-        return true;
+
+        // Every thread we suspended goes back before the caller builds an
+        // error text: see point 4 above (A72).
+        if (result != Result::ok) ResumeAll();
+        return result;
     }
 
     void ResumeAll() {
@@ -254,6 +323,18 @@ private:
     HANDLE handles_[kMaxThreads] = {};
     int    count_ = 0;
 };
+
+// Why a patch was refused, as a message. Called only after every thread is
+// running again, so the allocation it does is safe.
+const char* SuspendReason(Suspender::Result r) {
+    switch (r) {
+    case Suspender::Result::ok:               return "";
+    case Suspender::Result::snapshotFailed:   return "thread snapshot failed";
+    case Suspender::Result::threadInPrologue: return "a thread is executing the prologue; try again";
+    case Suspender::Result::tooManyThreads:   return "too many threads to suspend safely";
+    }
+    return "thread suspension failed";
+}
 
 // Nothing inside this window may allocate or log: the other threads are paused,
 // and one of them may hold the heap lock.
@@ -322,14 +403,25 @@ size_t BuildStub(uint8_t* block, void* ctx) {
 #endif
 }
 
-// Bytes that take control from the stub back to the first untouched instruction.
+// Bytes that take control from the trampoline back to the first untouched
+// instruction. Returns 0 when the jump cannot be encoded (the caller then drops
+// the hook instead of installing one that would jump to the wrong place).
 size_t BuildTrampolineTail(uint8_t* at, uintptr_t resume) {
 #if defined(_M_X64)
-    at[0] = 0x48; at[1] = 0xB8;
-    uint64_t r = (uint64_t)resume;
-    memcpy(at + 2, &r, 8);
-    at[10] = 0xFF; at[11] = 0xE0;                 // jmp rax
-    return 12;
+    // A relative jump, not `mov rax, imm64 / jmp rax`: the register form
+    // destroys rax, which the stolen prologue may still be carrying. MSVC
+    // compiles `if (a == 0) return 11; return 22;` to
+    //   mov eax, 22 ; mov edx, 11 ; cmove eax, edx ; ret
+    // so the return value is *in rax* when the trampoline takes over; the old
+    // tail made the hooked function return the low half of the jump target
+    // instead. The block is allocated within +-1 GB of the target (AllocNear)
+    // and `resume` is a few bytes past it, so a rel32 always reaches.
+    const int64_t rel = (int64_t)resume - (int64_t)(at + 5);
+    if (rel < INT32_MIN || rel > INT32_MAX) return 0;
+    at[0] = 0xE9;
+    int32_t r = (int32_t)rel;
+    memcpy(at + 1, &r, 4);
+    return 5;
 #else
     at[0] = 0xE9;
     int32_t rel = (int32_t)((intptr_t)resume - (intptr_t)(at + 5));
@@ -368,12 +460,13 @@ namespace {
 #if defined(_M_X64)
 
 // The stack frame hook_thunk_x64.asm builds between its `call V8iHookEnter` and
-// the hooked function's entry point: the thunk reserves 0x90 bytes and the stub
-// pushes the caller's rax. This is a layout contract with the .asm file, so the
-// walk validates it instead of trusting it: if the two no longer agree with the
-// real stack (a thunk that saves more registers, say), the return-address check
-// below fails and the chain is reported empty rather than walked over garbage.
-constexpr uintptr_t kX64ThunkFrame = 0x90;
+// the hooked function's entry point: the thunk reserves 0x100 bytes (it also
+// saves xmm0-5 for A59) and the stub pushes the caller's rax. This is a layout
+// contract with the .asm file, so the walk validates it instead of trusting it:
+// if the two no longer agree with the real stack (a thunk that saves more
+// registers, say), the return-address check below fails and the chain is
+// reported empty rather than walked over garbage.
+constexpr uintptr_t kX64ThunkFrame = 0x100;
 constexpr uintptr_t kX64StubPush   = sizeof(uintptr_t);
 
 // Fills out[] with the return addresses of the frames above the hooked
@@ -469,6 +562,11 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
                              uintptr_t a3) {
     HookCtx* c = (HookCtx*)ctx;
     if (!c) return;
+    // A hook can be removed while a thread is on its way through the stub: the
+    // bytes are restored, but this call is already inside the engine. It must
+    // not record anything then -- an in-flight call would show up in a trace
+    // taken after `unhook all` (A71).
+    if (InterlockedCompareExchange(&c->active, 0, 0) == 0) return;
 
     // The observer runs first: it is the reason some hooks exist at all (the
     // 8.5 early subscription watches for the designer's first window), and it
@@ -477,10 +575,11 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
 
     InterlockedIncrement(&c->calls);
 
-    LONG idx = InterlockedIncrement(&g_head) - 1;
-    TraceSlot& s = g_slots[(uint32_t)idx % kTraceCapacity];
+    const LONG64 idx = InterlockedIncrement64(&g_head) - 1;
+    TraceSlot& s = g_slots[(uint64_t)idx % kTraceCapacity];
 
-    InterlockedIncrement(&s.seq);                 // odd: write in progress
+    InterlockedIncrement64(&s.seq);               // odd: write in progress
+    s.idx = (uint64_t)idx;
     s.id = c->id;
     s.tid = GetCurrentThreadId();
     s.tick = GetTickCount64();
@@ -505,7 +604,7 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
     n = WalkFramesX86(entryEb, s.frame, kMaxFrames);
 #endif
     s.frameCount = n;
-    InterlockedIncrement(&s.seq);                 // even: record complete
+    InterlockedIncrement64(&s.seq);               // even: record complete
 
     // Disk trace: the target process may die inside the hooked function (a
     // crash there leaves the in-memory ring unreadable), so persist the first
@@ -526,9 +625,32 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
 // A crash inside a hooked function is invisible to the host: the process simply
 // disappears and the log stops mid-command. A vectored handler that only
 // records the context turns that into a line the log can explain.
+//
+// A73: the handler sees every exception of the host process, and a real 1C
+// probes SEH paths routinely (and raises AVs on purpose). Logging each one
+// filled the log and slowed the host down. Two limits now apply: a fault that
+// lands inside code the engine owns is always logged (it is the signal this
+// handler exists for), everything else is capped at a fixed number of entries
+// and then summarised once.
 // ---------------------------------------------------------------------------
 
 namespace {
+
+constexpr LONG kMaxForeignFaults = 32;   // logged, then suppressed
+constexpr LONG kMaxOwnFaults     = 16;   // faults inside our own blocks
+
+// True when `p` lies inside a block the engine allocated. Reads only immutable
+// numbers: blocks are never freed, so a stale entry is still a mapped range and
+// conservative in the right direction.
+bool InOwnedBlock(uintptr_t p) {
+    if (!p) return false;
+    LONG n = InterlockedCompareExchange(&g_blockRangeCount, 0, 0);
+    if (n > kMaxBlockRanges) n = kMaxBlockRanges;
+    for (LONG i = 0; i < n; ++i) {
+        if (p >= g_blockRanges[i].lo && p < g_blockRanges[i].hi) return true;
+    }
+    return false;
+}
 
 LONG CALLBACK FaultLogger(EXCEPTION_POINTERS* ep) {
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -541,16 +663,35 @@ LONG CALLBACK FaultLogger(EXCEPTION_POINTERS* ep) {
 
     uintptr_t av = 0;
     if (r->NumberParameters >= 2) av = (uintptr_t)r->ExceptionInformation[1];
+    const uintptr_t at = (uintptr_t)r->ExceptionAddress;
+
+    static volatile LONG foreign = 0;
+    static volatile LONG own = 0;
+    const bool ours = InOwnedBlock(at) || InOwnedBlock(av);
+    if (ours) {
+        if (InterlockedIncrement(&own) > kMaxOwnFaults) return EXCEPTION_CONTINUE_SEARCH;
+    } else {
+        const LONG n = InterlockedIncrement(&foreign);
+        if (n > kMaxForeignFaults) {
+            // One line, once: the host's own SEH traffic is not our business,
+            // but a reader of the log should know it was dropped.
+            if (n == kMaxForeignFaults + 1) {
+                LogLine("fault logging: %ld more host faults suppressed (no hook involved)",
+                        kMaxForeignFaults);
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
 
     CONTEXT* c = ep->ContextRecord;
 #if defined(_M_X64)
-    LogLine("fault code=0x%08lX at rip=%p av=%p rax=%p rcx=%p rdx=%p rsp=%p rbp=%p",
-            r->ExceptionCode, r->ExceptionAddress, (void*)av, (void*)c->Rax, (void*)c->Rcx,
-            (void*)c->Rdx, (void*)c->Rsp, (void*)c->Rbp);
+    LogLine("fault%s code=0x%08lX at rip=%p av=%p rax=%p rcx=%p rdx=%p rsp=%p rbp=%p",
+            ours ? " (in hook code)" : "", r->ExceptionCode, r->ExceptionAddress, (void*)av,
+            (void*)c->Rax, (void*)c->Rcx, (void*)c->Rdx, (void*)c->Rsp, (void*)c->Rbp);
 #else
-    LogLine("fault code=0x%08lX at eip=%p av=%p eax=%08lX ecx=%08lX edx=%08lX esp=%08lX ebp=%08lX",
-            r->ExceptionCode, r->ExceptionAddress, (void*)av, c->Eax, c->Ecx, c->Edx,
-            c->Esp, c->Ebp);
+    LogLine("fault%s code=0x%08lX at eip=%p av=%p eax=%08lX ecx=%08lX edx=%08lX esp=%08lX ebp=%08lX",
+            ours ? " (in hook code)" : "", r->ExceptionCode, r->ExceptionAddress, (void*)av,
+            c->Eax, c->Ecx, c->Edx, c->Esp, c->Ebp);
 #endif
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -572,6 +713,33 @@ uint32_t HookInstall(uintptr_t target, const char* name, std::string& error) {
     return HookInstallObserved(target, name, nullptr, error);
 }
 
+namespace {
+
+// A71: two hooks may not overlap. The second one used to be installed on top
+// of the first -- its "original" bytes were the first hook's jump, so `unhook
+// all` restored the true prologue for the first and the patched bytes for the
+// second, and the target stayed patched for the rest of the process.
+// Caller holds g_lock.
+const HookCtx* FindOverlappingLocked(uintptr_t target, size_t len) {
+    for (int i = 0; i < g_hookCount; ++i) {
+        const HookCtx* h = g_hooks[i];
+        const uintptr_t lo = h->target;
+        const uintptr_t hi = h->target + (h->stolen ? h->stolen : kPatchLen);
+        if (target < hi && lo < target + len) return h;
+    }
+    return nullptr;
+}
+
+// Remembers a block so the fault logger can recognise a fault inside the engine.
+void RecordBlockRange(void* block) {
+    const LONG i = InterlockedIncrement(&g_blockRangeCount) - 1;
+    if (i >= kMaxBlockRanges) return;
+    g_blockRanges[i].lo = (uintptr_t)block;
+    g_blockRanges[i].hi = (uintptr_t)block + kBlockSize;
+}
+
+}  // namespace
+
 uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver obs,
                              std::string& error) {
     if (!target) { error = "null target"; return 0; }
@@ -581,6 +749,20 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
     if (!VirtualQuery((void*)target, &mbi, sizeof(mbi))) { error = "VirtualQuery failed"; return 0; }
     if (mbi.State != MEM_COMMIT) { error = "target is not committed memory"; return 0; }
     if (!((mbi.Protect & 0xFF) & 0xF0)) { error = "target is not executable"; return 0; }
+
+    // Cheap first pass, before any allocation: the same address twice is the
+    // common mistake (a script that hooks the same export in two commands).
+    {
+        LockGuard guard;
+        if (const HookCtx* h = FindOverlappingLocked(target, kPatchLen)) {
+            char b[160];
+            _snprintf_s(b, sizeof(b), _TRUNCATE,
+                        "target is already hooked (id %u at 0x%llX, %zu bytes)",
+                        h->id, (unsigned long long)h->target, h->stolen);
+            error = b;
+            return 0;
+        }
+    }
 
     // Steal whole instructions: a jump written into the middle of one would
     // leave the remainder as garbage that the trampoline then executes. Each
@@ -645,6 +827,20 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
         stolen += ci.size;
     }
     memcpy(original, (const void*)target, stolen);
+
+    // Second pass with the real stolen length: the target may start just before
+    // an existing hook, so the five-byte check above is not enough.
+    {
+        LockGuard guard;
+        if (const HookCtx* h = FindOverlappingLocked(target, stolen)) {
+            char b[160];
+            _snprintf_s(b, sizeof(b), _TRUNCATE,
+                        "target is already hooked (id %u at 0x%llX, %zu bytes)",
+                        h->id, (unsigned long long)h->target, h->stolen);
+            error = b;
+            return 0;
+        }
+    }
 
     // Lay the trampoline out first: widening an instruction shifts everything
     // that follows it, so no displacement can be computed before this pass.
@@ -760,7 +956,9 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
             }
         }
     }
-    BuildTrampolineTail(tramp + trampLen, target + stolen);
+    if (!BuildTrampolineTail(tramp + trampLen, target + stolen)) {
+        return fail("the trampoline's jump back does not fit a 32-bit displacement");
+    }
     FlushInstructionCache(GetCurrentProcess(), tramp, trampLen + 16);
 
     // The patch itself: a rel32 jump to the stub, on both architectures.
@@ -770,18 +968,28 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
         int32_t rel = (int32_t)((intptr_t)ctx->stub - (intptr_t)(target + 5));
         memcpy(patch + 1, &rel, 4);
     }
+    memcpy(ctx->patch, patch, kPatchLen);
+
+    // Id and `active` are set before the bytes change: the first call that goes
+    // through the new jump must be recorded (and seen by the observer), and a
+    // thread that reaches the thunk between the write and the registry insert
+    // would otherwise find the hook inactive.
+    ctx->id = (uint32_t)InterlockedIncrement(&g_nextId);
+    InterlockedExchange(&ctx->active, 1);
 
     {
         Suspender sus;
-        std::string why;
-        if (!sus.Suspend(target, target + stolen, why)) {
+        const Suspender::Result sr = sus.Suspend(target, target + stolen);
+        if (sr != Suspender::Result::ok) {
+            InterlockedExchange(&ctx->active, 0);
             VirtualFree(block, 0, MEM_RELEASE);
             delete ctx;
-            error = why;
+            error = SuspendReason(sr);
             return 0;
         }
         if (!PatchBytes(target, patch, kPatchLen)) {
             sus.ResumeAll();
+            InterlockedExchange(&ctx->active, 0);
             VirtualFree(block, 0, MEM_RELEASE);
             delete ctx;
             error = "cannot change the protection of the target page";
@@ -792,10 +1000,9 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
 
     {
         LockGuard guard;
-        ctx->id = g_nextId++;
-        ctx->active = true;
         g_hooks[g_hookCount++] = ctx;
     }
+    RecordBlockRange(block);
 
     LogLine("hook %u installed: %p -> stub %p trampoline %p stolen %zu",
             ctx->id, (void*)target, (void*)ctx->stub, ctx->trampoline, stolen);
@@ -815,19 +1022,42 @@ bool HookRemove(uint32_t id) {
     }
     if (!ctx) return false;
 
+    // Stop recording first: a call that is already on its way through the
+    // thunk must not show up in a trace taken after `unhook' (A71). Any
+    // failure below puts the flag back -- the hook is still live then.
+    InterlockedExchange(&ctx->active, 0);
+
     {
         Suspender sus;
-        std::string why;
-        if (!sus.Suspend(ctx->target, ctx->target + ctx->stolen, why)) {
+        const Suspender::Result sr = sus.Suspend(ctx->target, ctx->target + ctx->stolen);
+        if (sr != Suspender::Result::ok) {
             // The restore was refused (a thread is executing the prologue).
             // Dropping the hook from the registry while its detour is still
             // patched would hide a live hook: keep it registered and report
             // the refusal -- the caller can try again (plan_roadmap Ф1.4).
-            LogLine("hook %u not removed: %s", id, why.c_str());
+            InterlockedExchange(&ctx->active, 1);
+            LogLine("hook %u not removed: %s", id, SuspendReason(sr));
             return false;
         }
+
+        // A71: restore only bytes that are still ours. Something else -- another
+        // packer, a manual patch, a hooker that ignored our rejection -- may
+        // have rewritten the prologue since; copying our saved bytes over it
+        // would destroy whatever is there now.
+        uint8_t now[kMaxStolen] = {};
+        memcpy(now, (const void*)ctx->target, ctx->stolen);
+        if (memcmp(now, ctx->patch, kPatchLen) != 0) {
+            sus.ResumeAll();
+            InterlockedExchange(&ctx->active, 1);
+            LogLine("hook %u not removed: the bytes at %p are no longer the patch "
+                    "(now %02X %02X %02X %02X %02X)",
+                    id, (void*)ctx->target, now[0], now[1], now[2], now[3], now[4]);
+            return false;
+        }
+
         if (!PatchBytes(ctx->target, ctx->original, ctx->stolen)) {
             sus.ResumeAll();
+            InterlockedExchange(&ctx->active, 1);
             LogLine("hook %u not removed: cannot restore the original bytes", id);
             return false;
         }
@@ -843,12 +1073,17 @@ bool HookRemove(uint32_t id) {
             }
         }
     }
-    ctx->active = false;
 
     // The block is deliberately not freed: a thread that was already inside the
     // trampoline when the patch was reverted would jump into released memory.
-    // 256 bytes per removed hook is a cheap price for that race.
-    LogLine("hook %u removed: %p", id, (void*)ctx->target);
+    // The real cost of that decision is a 4 KiB page plus the context per
+    // removed hook, kept for the rest of the process lifetime -- counted and
+    // logged here instead of being silently paid (A74).
+    const LONG retired = InterlockedIncrement(&g_retiredBlocks);
+    const LONG64 bytes = InterlockedExchangeAdd64(&g_retiredBytes, (LONG64)kBlockSize + sizeof(HookCtx)) +
+                         (LONG64)kBlockSize + sizeof(HookCtx);
+    LogLine("hook %u removed: %p (retired blocks: %ld, %.1f KiB)",
+            id, (void*)ctx->target, retired, (double)bytes / 1024.0);
     return true;
 }
 
@@ -1013,14 +1248,37 @@ std::string UnhookCommandToJson(const std::wstring& args) {
     std::wstring what = t.Next();
     if (what.empty()) return "{\"status\":\"error\",\"message\":\"usage: unhook <id|all>\"}";
 
+    auto countHooks = [] {
+        LockGuard guard;
+        return (size_t)g_hookCount;
+    };
+
     if (what == L"all") {
         size_t n = HookRemoveAll();
-        return "{\"status\":\"ok\",\"removed\":" + std::to_string(n) + "}";
+        const size_t left = countHooks();
+        std::string j = "{\"status\":\"ok\",\"removed\":" + std::to_string(n);
+        // A71: a removal can be refused (a thread sits in the prologue, or the
+        // bytes are no longer ours). Saying only "removed: 3" would hide a hook
+        // that is still patched.
+        if (left) j += ",\"failed\":" + std::to_string(left);
+        j += "}";
+        return j;
     }
     uint32_t id = (uint32_t)_wtoi(what.c_str());
     if (!id) return "{\"status\":\"error\",\"message\":\"hook id must be a number or 'all'\"}";
+
+    const bool had = [&] {
+        LockGuard guard;
+        for (int i = 0; i < g_hookCount; ++i) {
+            if (g_hooks[i]->id == id) return true;
+        }
+        return false;
+    }();
+    if (!had) return "{\"status\":\"error\",\"message\":\"no hook with id " + std::to_string(id) + "\"}";
+
     if (!HookRemove(id)) {
-        return "{\"status\":\"error\",\"message\":\"no hook with id " + std::to_string(id) + "\"}";
+        return "{\"status\":\"error\",\"message\":\"hook " + std::to_string(id) +
+               " is still installed: the removal was refused, see the payload log\"}";
     }
     return "{\"status\":\"ok\",\"removed\":1}";
 }
@@ -1040,78 +1298,121 @@ std::string HooksCommandToJson(const std::wstring&) {
         j += ",\"calls\":" + std::to_string((long)c->calls);
         j += "}";
     }
-    j += "]}";
+    j += "]";
+    // A74: blocks of removed hooks are never freed, so the cost of a hook/unhook
+    // loop is visible here instead of being an invisible leak.
+    j += ",\"retired\":" + std::to_string((long)g_retiredBlocks);
+    j += ",\"retiredKiB\":" +
+         std::to_string((long long)(InterlockedCompareExchange64(&g_retiredBytes, 0, 0) / 1024));
+    j += "}";
     return j;
 }
 
 std::string TraceCommandToJson(const std::wstring& args) {
     size_t want = 20;
-    LONG since = 0;
+    LONG64 since = 0;
     bool clear = false;
 
     Tokenizer t(args);
     for (;;) {
         std::wstring tok = t.Next();
         if (tok.empty()) break;
-        if (tok == L"--count")      want = (size_t)_wtoi(t.Next().c_str());
-        else if (tok == L"--since") since = (LONG)_wtoi(t.Next().c_str());
+        if (tok == L"--count")      want = (size_t)_wcstoi64(t.Next().c_str(), nullptr, 10);
+        else if (tok == L"--since") since = _wcstoi64(t.Next().c_str(), nullptr, 10);
         else if (tok == L"--clear") clear = true;
     }
     if (want == 0 || want > kTraceCapacity) want = kTraceCapacity;
+    if (since < 0) since = 0;
 
-    LONG head = InterlockedCompareExchange(&g_head, 0, 0);
-    LONG first = head > (LONG)kTraceCapacity ? head - (LONG)kTraceCapacity : 0;
-    if (since > first) first = since;
-    LONG start = (head - first) > (LONG)want ? head - (LONG)want : first;
+    const LONG64 head = InterlockedCompareExchange64(&g_head, 0, 0);
+    const LONG64 base = InterlockedCompareExchange64(&g_base, 0, 0);
+    LONG64 first = head > (LONG64)kTraceCapacity ? head - (LONG64)kTraceCapacity : 0;
+    if (base > first) first = base;
+    if (since < first) since = first;
+    LONG64 start = (head - since) > (LONG64)want ? head - (LONG64)want : since;
     if (start < first) start = first;
+    if (start > head) start = head;
 
-    std::string j = "{\"status\":\"ok\",\"head\":" + std::to_string((long)head);
-    j += ",\"capacity\":" + std::to_string((long)kTraceCapacity);
-    j += ",\"since\":" + std::to_string((long)start);
-    j += ",\"records\":[";
+    char headBuf[192];
+    _snprintf_s(headBuf, sizeof(headBuf), _TRUNCATE,
+                "{\"status\":\"ok\",\"head\":%lld,\"capacity\":%zu,\"since\":%lld,\"records\":[",
+                (long long)head, kTraceCapacity, (long long)start);
+    std::string j = headBuf;
 
     size_t emitted = 0;
-    for (LONG idx = start; idx < head; ++idx) {
-        TraceSlot& s = g_slots[(uint32_t)idx % kTraceCapacity];
-        // Generation check: a slot is only valid for the wrap it was written in,
-        // and seq is even exactly when no write is in flight.
-        LONG expect = (LONG)(2 * ((uint64_t)idx / kTraceCapacity + 1));
-        LONG s1 = s.seq;
-        if (s1 != expect) continue;
+    bool truncated = false;
+    LONG64 stoppedAt = start;
+    for (LONG64 idx = start; idx < head; ++idx) {
+        TraceSlot& s = g_slots[(uint64_t)idx % kTraceCapacity];
 
-        uint32_t id = s.id;
-        uint32_t tid = s.tid;
-        uint64_t tick = s.tick;
-        uintptr_t ret = s.retAddr;
-        uintptr_t a0 = s.args[0], a1 = s.args[1], a2 = s.args[2], a3 = s.args[3];
-        if (s.seq != s1) continue;
+        // A90: take a whole copy between two reads of seq and throw it away if
+        // they differ. The old reader copied the fields first and read
+        // frameCount afterwards, so a record could pair one call's arguments
+        // with another call's frames. seq is even exactly when no write is in
+        // flight, and the absolute index in the slot catches a slot that was
+        // overwritten despite an even seq.
+        const LONG64 s1 = s.seq;
+        if (s1 & 1) continue;
+        TraceRecord r;
+        r.idx = s.idx;
+        r.id = s.id;
+        r.tid = s.tid;
+        r.tick = s.tick;
+        r.retAddr = s.retAddr;
+        for (int a = 0; a < 4; ++a) r.args[a] = s.args[a];
+        for (int f = 0; f < kMaxFrames; ++f) r.frame[f] = s.frame[f];
+        r.frameCount = s.frameCount;
+        if (s.seq != s1 || r.idx != (uint64_t)idx) continue;
 
-        if (emitted++) j += ",";
-        j += "{\"seq\":" + std::to_string((long)idx);
-        j += ",\"hook\":" + std::to_string(id);
-        j += ",\"tid\":" + std::to_string(tid);
-        j += ",\"tick\":" + std::to_string((unsigned long long)tick);
-        j += ",\"ret\":\"" + HexStr(ret) + "\"";
-        j += ",\"args\":[\"" + HexStr(a0) + "\",\"" + HexStr(a1) + "\",\"" +
-             HexStr(a2) + "\",\"" + HexStr(a3) + "\"]";
-        j += ",\"stack\":[";
-        int fc = s.frameCount;
+        // Built separately so the budget is checked before anything is
+        // appended: a half-written record would be an invalid document.
+        std::string rec;
+        rec.reserve(256);
+        rec += "{\"seq\":" + std::to_string((long long)idx);
+        rec += ",\"hook\":" + std::to_string(r.id);
+        rec += ",\"tid\":" + std::to_string(r.tid);
+        rec += ",\"tick\":" + std::to_string((unsigned long long)r.tick);
+        rec += ",\"ret\":\"" + HexStr(r.retAddr) + "\"";
+        rec += ",\"args\":[\"" + HexStr(r.args[0]) + "\",\"" + HexStr(r.args[1]) + "\",\"" +
+               HexStr(r.args[2]) + "\",\"" + HexStr(r.args[3]) + "\"]";
+        rec += ",\"stack\":[";
+        int fc = r.frameCount;
+        if (fc < 0) fc = 0;
         if (fc > kMaxFrames) fc = kMaxFrames;
         for (int fi = 0; fi < fc; ++fi) {
-            if (fi) j += ",";
-            j += "\"" + HexStr(s.frame[fi]) + "\"";
+            if (fi) rec += ",";
+            rec += "\"" + HexStr(r.frame[fi]) + "\"";
         }
-        j += "]}";
+        rec += "]}";
+
+        if (j.size() + rec.size() + 64 > kTraceBudget) { truncated = true; break; }
+        if (emitted++) j += ",";
+        j += rec;
+        stoppedAt = idx + 1;
     }
-    j += "]}";
+
+    j += "]";
+    if (truncated) {
+        // A70: the reply is cut here, inside the budget, and says so. The old
+        // answer was assembled whole and then refused by the shared block as
+        // "response too large", so `trace --count 1024` on a real 1C returned
+        // nothing at all.
+        j += ",\"truncated\":true,\"dropped\":";
+        j += std::to_string((long long)(head - stoppedAt));
+    }
+    j += "}";
 
     if (clear) {
-        for (size_t i = 0; i < kTraceCapacity; ++i)
-            InterlockedExchange(&g_slots[i].seq, 0);
-        InterlockedExchange(&g_head, 0);
-        LogLine("trace cleared");
+        // A90: move the start marker instead of zeroing the ring. Writers keep
+        // their slots and their seq values, so a record that was in flight
+        // during the clear is not mistaken for one from a full wrap earlier.
+        const LONG64 now = InterlockedCompareExchange64(&g_head, 0, 0);
+        InterlockedExchange64(&g_base, now);
+        LogLine("trace cleared up to %lld", (long long)now);
     }
     return j;
 }
+
+size_t TraceReplyBudget() { return kTraceBudget; }
 
 }  // namespace v8i

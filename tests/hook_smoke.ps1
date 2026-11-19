@@ -3,6 +3,14 @@
 # Starts the disposable target, injects the payload, hooks a function whose
 # arguments are known, checks the recorded arguments, then unhooks and confirms
 # the target keeps running and nothing is recorded any more.
+#
+# Package 9 of the stabilisation plan added three targets to the list:
+#   * a function with double arguments and a __thiscall member function, whose
+#     arguments travel in xmm/ecx and used to be destroyed by the thunk (A59);
+#   * a hand-written prologue with a rip-relative operand, so the relocation
+#     formula is exercised on bytes that are not compiler-generated (A75).
+# It also checks the two protective behaviours: a second hook on the same target
+# is refused (A71), and the cost of removed hooks is visible (A74).
 
 param(
     [Parameter(Mandatory = $true)][string]$BinDir
@@ -38,46 +46,65 @@ $tick = $null
 $branchy = $null
 $tailAddr = $null
 $stubAddr = $null
+$ripAddr = $null
+$dblAddr = $null
+$thisAddr = $null
 for ($i = 0; $i -lt 100 -and -not $tick; $i++) {
     Start-Sleep -Milliseconds 100
     if (Test-Path $outFile) {
         $text = Get-Content $outFile -Raw
-        if ($text -match 'tick=(0x[0-9A-Fa-f]+) branchy=(0x[0-9A-Fa-f]+) tail=(0x[0-9A-Fa-f]+) stub=(0x[0-9A-Fa-f]+)') {
+        if ($text -match 'tick=(0x[0-9A-Fa-f]+) branchy=(0x[0-9A-Fa-f]+) tail=(0x[0-9A-Fa-f]+) stub=(0x[0-9A-Fa-f]+) rip=(0x[0-9A-Fa-f]+) dbl=(0x[0-9A-Fa-f]+) thisptr=(0x[0-9A-Fa-f]+)') {
             $tick = $Matches[1]
             $branchy = $Matches[2]
             $tailAddr = $Matches[3]
             $stubAddr = $Matches[4]
+            $ripAddr = $Matches[5]
+            $dblAddr = $Matches[6]
+            $thisAddr = $Matches[7]
         }
     }
 }
 if (-not $tick) { Fail "target did not report its function addresses" }
 Write-Host "LINE: $text"
-Write-Host "target pid=$($script:proc.Id) tick=$tick branchy=$branchy tail=$tailAddr stub=$stubAddr"
+Write-Host "target pid=$($script:proc.Id) tick=$tick branchy=$branchy tail=$tailAddr stub=$stubAddr rip=$ripAddr dbl=$dblAddr thisptr=$thisAddr"
 
 # An empty address would turn "hook $addr" into a bare "hook", which the payload
 # rejects as an unknown command -- name the missing one instead.
 foreach ($pair in @(@('tick', $tick), @('branchy', $branchy),
-                    @('tail', $tailAddr), @('stub', $stubAddr))) {
+                    @('tail', $tailAddr), @('stub', $stubAddr),
+                    @('dbl', $dblAddr), @('thisptr', $thisAddr))) {
     if (-not $pair[1]) {
         Fail ("target line has no " + $pair[0] + " address: " + $text)
     }
 }
 
+# One hook per relocation/ABI case, in install order (the id is the reply order).
+$targets = @(
+    @('tick', $tick, 'plain prologue'),
+    @('branchy', $branchy, 'branching prologue'),
+    @('tail', $tailAddr, 'tail-call prologue'),
+    @('stub', $stubAddr, 'rel8/rel32 stub'),
+    @('double', $dblAddr, 'double arguments (A59)'),
+    @('thiscall', $thisAddr, 'thiscall this-pointer (A59)')
+)
+# x86 has no rip-relative form; the target reports 0 there.
+if ($ripAddr -and $ripAddr -notmatch '^0x0+$') {
+    $targets += ,@('rip', $ripAddr, 'rip-relative prologue (A75)')
+}
+$hookCount = $targets.Count
+$hookCmds = ($targets | ForEach-Object { 'hook ' + $_[1] }) -join "`n"
+
 # The whole scenario runs inside one attach session: hooks persist there, and
 # `sleep` is handled by the host between commands. A hook installed by a
 # separate one-shot invocation would be removed again when that session closes.
-#
-# Three hooks, one per relocation case: a plain prologue, a prologue with a
-# conditional branch, and a prologue that is a single tail-call jmp.
 $script = @"
+$hookCmds
 hook $tick
-hook $branchy
-hook $tailAddr
-hook $stubAddr
 hooks
 sleep 500
-trace --count 9
+trace --count 200
 unhook all
+hooks
 trace --clear
 sleep 400
 trace --count 3
@@ -90,19 +117,34 @@ $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $out = $script | & $exe attach 'v8i_hook_target.exe' 2>&1 | Out-String
 Write-Host $out.Trim()
 
-if ($out -notmatch '"id":1,') { Fail "hook 1 not installed: $out" }
-if ($out -notmatch '"id":2,') { Fail "hook 2 not installed (branchy prologue): $out" }
-if ($out -notmatch '"id":3,') { Fail "hook 3 not installed (tail-call prologue): $out" }
-if ($out -notmatch '"id":4,') { Fail "hook 4 not installed (rel8/rel32 stub): $out" }
-if ($out -notmatch '"count":4,') { Fail "hooks list does not report four hooks: $out" }
+# The ids come from the payload's counter, which need not start at 1: the
+# payload installs a hook of its own during start-up, so the first id of an
+# attach session depends on the target. Take them from the replies in order.
+$ids = @([regex]::Matches($out, '"status":"ok","id":(\d+),') |
+         ForEach-Object { [int]$_.Groups[1].Value })
+if ($ids.Count -ne $hookCount) {
+    Fail ("expected " + $hookCount + " installed hooks, got replies for: " + ($ids -join ','))
+}
+for ($i = 1; $i -lt $ids.Count; $i++) {
+    if ($ids[$i] -ne $ids[0] + $i) {
+        Fail ("hook ids are not consecutive: " + ($ids -join ','))
+    }
+}
+
+# A71: the same target twice must be refused, not stacked. The second attempt is
+# the one that follows the list, so its reply is easy to spot.
+if ($out -notmatch 'already hooked') { Fail "a duplicate hook was not refused: $out" }
+if ($out -notmatch ('"count":' + $hookCount + ',')) {
+    Fail ("hooks list does not report $hookCount hooks: " + $out)
+}
 
 # The first trace: at least a few calls in 500 ms (20 ms per loop iteration).
 $m = [regex]::Match($out, '("head":(\d+),)')
 if (-not $m.Success -or [int]$m.Groups[2].Value -lt 5) {
     Fail "too few call records: $out"
 }
-foreach ($id in 1..4) {
-    if ($out -notmatch ('"hook":' + $id)) { Fail "no records for hook $id`: $out" }
+for ($i = 0; $i -lt $ids.Count; $i++) {
+    if ($out -notmatch ('"hook":' + $ids[$i])) { Fail "no records for hook $($ids[$i])`: $out" }
 }
 if ($out -notmatch '"args":\["0x1111"') { Fail "first argument not captured: $out" }
 if ($out -notmatch '"0x2222"')          { Fail "second argument not captured: $out" }
@@ -112,12 +154,25 @@ if ($out -notmatch '"0x4444"')          { Fail "fourth argument not captured: $o
 # ("stack":[]) or -- when the value pointed at the last bytes of a mapping --
 # faulted in the target. A non-empty chain is the observable part of the fix.
 if ($out -notmatch '"stack":\["0x')     { Fail "caller chain is empty: $out" }
-if ($out -notmatch '"removed":4')       { Fail "unhook failed: $out" }
+if ($out -notmatch ('"removed":' + $hookCount))   { Fail "unhook failed: $out" }
 
-# After the unhook the function runs natively again; the trace that starts with
-# --clear must stay at zero instead of growing by one every 20 ms.
-$tail = $out.Substring($out.LastIndexOf('{'))
-if ($tail -notmatch '"head":0') { Fail "still recording after unhook: $out" }
+# A74: removed hooks keep their code block on purpose. The count has to be
+# reported, and has to match what was removed -- a silent leak is what the audit
+# called out.
+if ($out -notmatch ('"retired":' + $hookCount + ',')) {
+    Fail "removed blocks are not accounted for: $out"
+}
+
+# After the unhook the function runs natively again. A90: --clear no longer
+# zeroes the ring, it moves the start marker, so the trace that follows must
+# report the same head and no records at all -- that is "nothing more was
+# recorded", which the old `head == 0` check could not distinguish from a reset.
+$heads = @([regex]::Matches($out, '"head":(\d+)') | ForEach-Object { [int]$_.Groups[1].Value })
+if ($heads.Count -lt 2) { Fail "trace replies are missing: $out" }
+$clearHead = $heads[$heads.Count - 2]
+$finalHead = $heads[$heads.Count - 1]
+if ($finalHead -ne $clearHead) { Fail "still recording after unhook: $out" }
+if ($out -notmatch '"records":\[\]\}') { Fail "records after unhook: $out" }
 
 if ($script:proc.HasExited) {
     $log = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
