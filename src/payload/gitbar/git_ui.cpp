@@ -306,5 +306,25 @@ void DrawSubHover(HDC dc, const RECT& rc) {
     DeleteObject(pen);
 }
 
+int PumpModalLoop(HWND dlg, bool dialogKeys) {
+    MSG msg;
+    for (;;) {
+        if (!IsWindow(dlg)) return 0;
+        if (!GetMessageW(&msg, nullptr, 0, 0)) {
+            // WM_QUIT: the window the bar lives in is being torn down. Put the
+            // quit back into the queue for the bar's own loop -- this loop only
+            // exists inside it (A55).
+            const int code = (int)msg.wParam;
+            PostQuitMessage(code);
+            return code;
+        }
+        // IsDialogMessageW gives Tab / Enter (default button) / Esc for free; it
+        // dispatches itself, so a consumed message must not be dispatched again.
+        if (dialogKeys && IsDialogMessageW(dlg, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 }  // namespace gitbar
 }  // namespace v8i

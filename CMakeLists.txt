@@ -185,6 +185,10 @@ add_executable(v8i_tests
     # The memory scanners walk the real address space of this process: the test
     # places a real object and a real window and asks them to be found (A49).
     tests/unit_memscan.cpp
+    # The GitBar keeps data safe in four ways the tests check on the real
+    # implementation: porcelain paths, quit propagation, the repository gate and
+    # the git runner's deadline/cap (A54, A55, A58, A76, A77).
+    tests/unit_gitbar.cpp
     # The host side of the protocol lives in the host: the test plays the
     # payload, so it needs the real Client. The injector comes with it (the
     # client calls it), but the test never injects anything.

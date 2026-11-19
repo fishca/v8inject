@@ -60,6 +60,20 @@ static void SplitLines(const std::wstring& s, std::vector<std::wstring>& out) {
     }
 }
 
+// Porcelain v1 lines are "XY PATH": both status columns are always present (the
+// second one is the unstaged column), then exactly one space, then the path.
+// Cutting at the first space instead took " M path" -- a file changed but not
+// staged, the normal state of a dump -- apart at index 0 and handed "M path" to
+// git add/reset/checkout, which answered "pathspec did not match any files"
+// (A54). The path is not trimmed: leading/trailing spaces can belong to a name.
+std::wstring PorcelainPath(const std::wstring& line) {
+    if (line.size() < 4 || line[2] != L' ') return L"";
+    std::wstring path = line.substr(3);
+    const size_t arrow = path.find(L" -> ");   // "R  old -> new": git takes the new one
+    if (arrow != std::wstring::npos) path = path.substr(arrow + 4);
+    return path;
+}
+
 static void ListDlgFill(ListDlg* d) {
     std::wstring out;
     switch (d->kind) {
@@ -84,17 +98,7 @@ static std::wstring ListDlgSel(ListDlg* d) {
     int sel = (int)SendMessageW(d->list, LB_GETCURSEL, 0, 0);
     if (sel < 0 || sel >= (int)d->items.size()) return L"";
     std::wstring line = d->items[sel];
-    if (d->kind == 0) {
-        // " M path", "?? path", "R  old -> new"
-        size_t sp = line.find(L' ');
-        if (sp != std::wstring::npos) {
-            std::wstring path = TrimWs(line.substr(sp + 1));
-            size_t arrow = path.find(L" -> ");
-            if (arrow != std::wstring::npos) path = path.substr(arrow + 4);
-            return path;
-        }
-        return L"";
-    }
+    if (d->kind == 0) return PorcelainPath(line);
     if (d->kind == 1) {
         std::wstring b = TrimWs(line);
         if (b.rfind(L"* ", 0) == 0) b = TrimWs(b.substr(2));
@@ -120,45 +124,57 @@ bool ConfirmDestructive(HWND h, const wchar_t* what, const std::wstring& sel) {
                         MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
 }
 
+// One writing command of the list. A stopped git (deadline or output cap) says so
+// in words; before, it looked like a silent success because only the text was
+// inspected (A76).
+static void ListDlgReport(HWND h, const GitResult& r) {
+    if (!r.started) return;   // nothing ran (a branch that only asks a question)
+    if (!r.Finished()) {
+        MessageBoxW(h, GitFailureText(r, kGitTimeoutMs).c_str(), L"Git", MB_ICONWARNING);
+        return;
+    }
+    const std::wstring out = TrimWs(r.out);
+    if (!out.empty() && out.find(L"fatal") != std::wstring::npos)
+        MessageBoxW(h, out.c_str(), L"Git", MB_ICONWARNING);
+}
+
 static void ListDlgAct(ListDlg* d, int btn) {
     std::wstring sel = ListDlgSel(d);
-    std::wstring out;
     if (sel.empty()) return;
+    GitResult r;
     switch (d->kind) {
     case 0:  // working copy
-        if (btn == 0) out = RunGit({ L"-C", d->dir, L"add", L"--", sel });
-        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"reset", L"HEAD", L"--", sel });
+        if (btn == 0) r = RunGitEx({ L"-C", d->dir, L"add", L"--", sel });
+        else if (btn == 1) r = RunGitEx({ L"-C", d->dir, L"reset", L"HEAD", L"--", sel });
         else if (btn == 2) {
             if (!ConfirmDestructive(d->h, L"Отменить изменения в файле (правки будут потеряны):", sel))
                 return;
-            out = RunGit({ L"-C", d->dir, L"checkout", L"--", sel });
+            r = RunGitEx({ L"-C", d->dir, L"checkout", L"--", sel });
         }
         break;
     case 1:  // branches
-        if (btn == 0) out = RunGit({ L"-C", d->dir, L"checkout", sel });
+        if (btn == 0) r = RunGitEx({ L"-C", d->dir, L"checkout", sel });
         else if (btn == 1) {
             if (!ConfirmDestructive(d->h, L"Удалить ветку:", sel)) return;
-            out = RunGit({ L"-C", d->dir, L"branch", L"-d", sel });
+            r = RunGitEx({ L"-C", d->dir, L"branch", L"-d", sel });
         }
         break;
     case 2:  // stashes
-        if (btn == 0) out = RunGit({ L"-C", d->dir, L"stash", L"pop", sel });
+        if (btn == 0) r = RunGitEx({ L"-C", d->dir, L"stash", L"pop", sel });
         else if (btn == 1) {
             if (!ConfirmDestructive(d->h, L"Удалить отложенные изменения:", sel)) return;
-            out = RunGit({ L"-C", d->dir, L"stash", L"drop", sel });
+            r = RunGitEx({ L"-C", d->dir, L"stash", L"drop", sel });
         }
         break;
     default:  // tags
         if (btn == 0) {
             if (!ConfirmDestructive(d->h, L"Удалить тег:", sel)) return;
-            out = RunGit({ L"-C", d->dir, L"tag", L"-d", sel });
+            r = RunGitEx({ L"-C", d->dir, L"tag", L"-d", sel });
         }
-        else if (btn == 1) out = RunGit({ L"-C", d->dir, L"push", L"origin", sel });
+        else if (btn == 1) r = RunGitEx({ L"-C", d->dir, L"push", L"origin", sel });
         break;
     }
-    out = TrimWs(out);
-    if (!out.empty() && out.find(L"fatal") != std::wstring::npos)
-        MessageBoxW(d->h, out.c_str(), L"Git", MB_ICONWARNING);
+    ListDlgReport(d->h, r);
     ListDlgFill(d);
     BarReposition(false);
 }
@@ -197,8 +213,10 @@ static LRESULT CALLBACK ListDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (d->kind == 0) {
                 if (idx == 3) { RunCommitAction(); ListDlgFill(d); }
                 else if (idx == 4) {
-                    std::wstring out = RunGit({ L"-C", d->dir, L"commit", L"--amend", L"--no-edit" });
-                    MessageBoxW(h, TrimWs(out).c_str(), L"Amend", MB_ICONINFORMATION);
+                    const GitResult r = RunGitEx({ L"-C", d->dir, L"commit", L"--amend", L"--no-edit" });
+                    const std::wstring out = r.Finished() ? TrimWs(r.out)
+                                                          : GitFailureText(r, kGitTimeoutMs);
+                    MessageBoxW(h, out.c_str(), L"Amend", MB_ICONINFORMATION);
                     ListDlgFill(d);
                 } else ListDlgAct(d, idx);
             } else {
@@ -365,12 +383,8 @@ void ShowList(HWND owner, int kind) {
     SetForegroundWindow(h);
     SetFocus(d->list);
 
-    MSG msg;
     ModalEnter();
-    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+    PumpModalLoop(h, false);
     if (IsWindow(h)) DestroyWindow(h);
     if (d->font) DeleteObject(d->font);
     delete d;

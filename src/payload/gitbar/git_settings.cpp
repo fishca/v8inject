@@ -392,14 +392,8 @@ void ShowSettings(HWND owner) {
     SetForegroundWindow(dlg);
     SetFocus(dlg);
 
-    MSG msg;
     ModalEnter();
-    for (;;) {
-        if (!IsWindow(dlg)) break;
-        if (!GetMessageW(&msg, nullptr, 0, 0)) break;   // WM_QUIT
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+    PumpModalLoop(dlg, false);
     if (IsWindow(dlg)) DestroyWindow(dlg);
     DeleteObject(ctx.font);
     ModalLeave(true);

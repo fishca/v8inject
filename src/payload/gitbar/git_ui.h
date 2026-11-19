@@ -104,6 +104,14 @@ LRESULT CALLBACK PromptDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
 void ModalEnter();
 void ModalLeave(bool forceDock);
 
+// Pumps this thread's messages until `dlg` is gone or WM_QUIT arrives. The quit
+// is re-posted, so the bar's own loop still sees it and the thread ends: the
+// hand-rolled loops used to `break` on WM_QUIT and swallow it, which left the
+// bar thread alive with a dead window -- `gitbar hide` during a dialog made the
+// panel impossible to show again and kept the "GitBar" menu overlay alive
+// (A55). Returns the re-posted quit code, 0 when the dialog simply closed.
+int PumpModalLoop(HWND dlg, bool dialogKeys = false);
+
 // Brings the bar back above the configurator frame after an action redraws a
 // dialog (the list windows call it after every git operation).
 void BarReposition(bool forceDock);

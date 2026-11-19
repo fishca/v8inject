@@ -280,6 +280,7 @@ void Paint(HWND hwnd) {
 // it; keeps it raised above the frame's own toolbar children, which 1C
 // re-creates and would otherwise paint over us.
 void Reposition(bool forceDock) {
+    if (!g_bar.hwnd) { MenuReposition(nullptr); return; }   // thread is winding down
     HWND frame = GetParent(g_bar.hwnd);
     if (!frame) { frame = FindFrame(); if (frame) SetParent(g_bar.hwnd, frame); }
     if (!frame) { MenuReposition(nullptr); return; }
@@ -414,19 +415,12 @@ bool PromptText(HWND owner, const wchar_t* title, const wchar_t* label,
 
     // IsDialogMessageW gives Tab / Enter (default button) / Esc for free; it
     // posts nothing into this loop, it drives the dialog proc above directly.
-    MSG msg;
     // The menu overlay of the designer hides itself while a modal dialog of
     // the panel is up: the overlay is a separate top-level window and would
     // otherwise float above the dialog.
     ++g_modalDepth;
     MenuReposition(nullptr);
-    for (;;) {
-        if (!IsWindow(dlg)) break;
-        if (!GetMessageW(&msg, nullptr, 0, 0)) break;   // WM_QUIT: the bar is going away
-        if (IsDialogMessageW(dlg, &msg)) continue;
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+    PumpModalLoop(dlg, true);
     --g_modalDepth;
     if (IsWindow(dlg)) DestroyWindow(dlg);
     if (ctx.font) DeleteObject(ctx.font);
@@ -448,14 +442,17 @@ bool AskCommitMessage(std::wstring* msg) {
     return true;
 }
 
-// git add -A + git commit -F <utf8 file>. Returns git's output.
-std::wstring DoCommit(const std::wstring& dir, const std::wstring& msg) {
-    RunGit({ L"-C", dir, L"add", L"-A" });
+// git add -A + git commit -F <utf8 file>. The add's result is returned when it
+// did not finish cleanly: staging what a stopped `add` managed to collect and
+// then committing it would publish a half-updated dump (A76).
+GitResult DoCommit(const std::wstring& dir, const std::wstring& msg) {
+    const GitResult add = RunGitEx({ L"-C", dir, L"add", L"-A" });
+    if (!add.Finished() || add.exitCode != 0) return add;
     std::wstring file = TempMsgPath();
     if (WriteUtf8File(file, msg)) {
-        return RunGit({ L"-C", dir, L"commit", L"-F", file });
+        return RunGitEx({ L"-C", dir, L"commit", L"-F", file });
     }
-    return RunGit({ L"-C", dir, L"commit", L"-m", msg });
+    return RunGitEx({ L"-C", dir, L"commit", L"-m", msg });
 }
 
 std::wstring LocalBranch(const std::wstring& dir) {
@@ -496,22 +493,33 @@ std::wstring PullTarget(const std::wstring& dir) {
 
 // Pull that also works right after git init (no upstream yet) and against a
 // repository with an unrelated history — GitHub's initial README commit.
-std::wstring PullOrigin(const std::wstring& dir, bool allowUnrelated) {
-    std::wstring target = PullTarget(dir);
+// A stopped pull keeps its flags, so the caller can say "timeout" instead of
+// showing an empty answer as "уже актуально" (A76).
+GitResult PullOrigin(const std::wstring& dir, bool allowUnrelated) {
+    const std::wstring target = PullTarget(dir);
 
     if (!allowUnrelated) {
-        std::wstring out = TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit" }));
-        if (out.find(L"no tracking information") == std::wstring::npos &&
-            out.find(L"no configured push destination") == std::wstring::npos) {
-            return out;
-        }
-        if (target.empty()) return out;
-        out = TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit", L"origin", target }));
-        if (out.find(L"unrelated histories") == std::wstring::npos) return out;
+        GitResult r = RunGitEx({ L"-C", dir, L"pull", L"--no-edit" });
+        if (!r.Finished()) return r;
+        std::wstring out = TrimWs(r.out);
+        const bool noUpstream = out.find(L"no tracking information") != std::wstring::npos ||
+                                out.find(L"no configured push destination") != std::wstring::npos;
+        if (!noUpstream) { r.out = out; return r; }
+        if (target.empty()) { r.out = out; return r; }
+        r = RunGitEx({ L"-C", dir, L"pull", L"--no-edit", L"origin", target });
+        if (!r.Finished()) return r;
+        out = TrimWs(r.out);
+        if (out.find(L"unrelated histories") == std::wstring::npos) { r.out = out; return r; }
     }
-    if (target.empty()) return L"не удалось определить ветку origin";
-    return TrimWs(RunGit({ L"-C", dir, L"pull", L"--no-edit",
-                           L"--allow-unrelated-histories", L"origin", target }));
+    if (target.empty()) {
+        GitResult r;
+        r.error = L"не удалось определить ветку origin";
+        return r;
+    }
+    GitResult r = RunGitEx({ L"-C", dir, L"pull", L"--no-edit",
+                             L"--allow-unrelated-histories", L"origin", target });
+    if (r.Finished()) r.out = TrimWs(r.out);
+    return r;
 }
 
 bool DirHasEntries(const std::wstring& dir) {
@@ -597,12 +605,11 @@ void RunClone() {
     }
 
     ShowTip(L"git clone…");
-    std::wstring out = RunGit({ L"clone", remote, dir }, 600000);
-    LogGit(L"clone", TrimForTip(out, 400));
-    std::wstring gitDir = dir;
-    if (gitDir.empty() || gitDir.back() != L'\\') gitDir += L'\\';
-    if (GetFileAttributesW((gitDir + L".git").c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::wstring tip = TrimForTip(out, 200);
+    const GitResult clone = RunGitEx({ L"clone", remote, dir }, 600000);
+    LogGit(L"clone", TrimForTip(clone.out, 400));
+    if (!clone.Finished()) { ShowTip(GitFailureText(clone, 600000)); return; }
+    if (!HasDotGit(dir)) {
+        std::wstring tip = TrimForTip(clone.out, 200);
         ShowTip(tip.empty() ? L"clone: ошибка" : tip);
         return;
     }
@@ -621,6 +628,31 @@ void RunClone() {
     }
 }
 
+// git init + the configured origin. Shared by the "Init" cell and by the
+// repository gate, which offers init when the dump folder has no repository at
+// all (A58).
+void InitRepo(const std::wstring& dir) {
+    ShowTip(L"git init…");
+    const GitResult init = RunGitEx({ L"-C", dir, L"init" });
+    LogGit(L"init", TrimForTip(init.out, 400));
+    if (!init.Finished()) { ShowTip(GitFailureText(init, kGitTimeoutMs)); return; }
+
+    // An 'origin' makes the push button usable right after init; a stale one
+    // is corrected instead of failing with "remote origin already exists".
+    std::wstring remote = GitIniGet(L"remote");
+    if (!remote.empty()) {
+        const GitResult add = RunGitEx({ L"-C", dir, L"remote", L"add", L"origin", remote });
+        if (add.out.find(L"already exists") != std::wstring::npos) {
+            RunGitEx({ L"-C", dir, L"remote", L"set-url", L"origin", remote });
+        }
+        LogGit(L"remote origin", remote);
+    }
+
+    std::wstring tip = TrimForTip(init.out);
+    if (tip.empty()) tip = L"git init: готово";
+    ShowTip(tip);
+}
+
 void RunInit() {
     std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) { ShowTip(L"нет папки выгрузки (Настройки)"); return; }
@@ -629,37 +661,43 @@ void RunInit() {
         ShowTip(L"папка выгрузки не найдена: " + dir);
         return;
     }
+    InitRepo(dir);
+}
 
-    ShowTip(L"git init…");
-    std::wstring out = RunGit({ L"-C", dir, L"init" });
-    LogGit(L"init", TrimForTip(out, 400));
-
-    // An 'origin' makes the push button usable right after init; a stale one
-    // is corrected instead of failing with "remote origin already exists".
-    std::wstring remote = GitIniGet(L"remote");
-    if (!remote.empty()) {
-        std::wstring add = RunGit({ L"-C", dir, L"remote", L"add", L"origin", remote });
-        if (add.find(L"already exists") != std::wstring::npos) {
-            RunGit({ L"-C", dir, L"remote", L"set-url", L"origin", remote });
+// A58: nothing that writes may touch the dump folder before git is asked whether
+// the folder owns its repository. `git -C dir add -A`/commit/push walk up to the
+// enclosing repository, so "E:\work\proj\dump" inside somebody else's working
+// copy used to commit and push that project's files without a word.
+bool EnsureDumpRepo(HWND owner, const std::wstring& dir, const wchar_t* title) {
+    RepoRootCheck kind = RepoRootCheck::NoRepo;
+    std::wstring why;
+    if (DumpRepoRootOk(dir, &kind, &why)) return true;
+    if (kind == RepoRootCheck::NoRepo) {
+        std::wstring msg = why + L"\n\nСоздать git-репозиторий в этой папке?";
+        if (MessageBoxW(owner, msg.c_str(), title,
+                        MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+            ShowTip(L"нужен git-репозиторий в папке выгрузки");
+            return false;
         }
-        LogGit(L"remote origin", remote);
+        InitRepo(dir);
+        if (DumpRepoRootOk(dir, &kind, &why)) return true;
     }
-
-    std::wstring tip = TrimForTip(out);
-    if (tip.empty()) tip = L"git init: готово";
-    ShowTip(tip);
+    MessageBoxW(owner, why.c_str(), title, MB_ICONWARNING);
+    return false;
 }
 
 void RunCommit() {
     std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) { ShowTip(L"нет папки выгрузки (Настройки)"); return; }
+    if (!EnsureDumpRepo(g_bar.hwnd, dir, L"GitBar — коммит")) return;
     std::wstring msg;
     if (!AskCommitMessage(&msg)) return;
 
     ShowTip(L"git add/commit…");
-    std::wstring out = DoCommit(dir, msg);
-    LogGit(L"commit", TrimForTip(out, 400));
-    std::wstring tip = TrimForTip(out);
+    const GitResult r = DoCommit(dir, msg);
+    LogGit(L"commit", TrimForTip(r.out, 400));
+    if (!r.Finished()) { ShowTip(GitFailureText(r, kGitTimeoutMs)); return; }
+    std::wstring tip = TrimForTip(r.out);
     if (tip.empty()) tip = L"коммит: готово";
     ShowTip(tip);
 }
@@ -667,6 +705,7 @@ void RunCommit() {
 void RunPush() {
     std::wstring dir = GitIniGet(L"dumpdir");
     if (dir.empty()) { ShowTip(L"нет папки выгрузки (Настройки)"); return; }
+    if (!EnsureDumpRepo(g_bar.hwnd, dir, L"GitBar — пуш")) return;
 
     // git push takes no message of its own, so a dirty tree is where the
     // comment belongs: offer to commit it with the same prompt, then push.
@@ -678,22 +717,32 @@ void RunPush() {
                         L"GitBar — пуш", MB_YESNO | MB_ICONQUESTION) == IDYES) {
             std::wstring msg;
             if (AskCommitMessage(&msg)) {
-                std::wstring c = DoCommit(dir, msg);
-                LogGit(L"commit before push", TrimForTip(c, 400));
+                const GitResult c = DoCommit(dir, msg);
+                LogGit(L"commit before push", TrimForTip(c.out, 400));
+                if (!c.Finished()) {
+                    // Pushing here would publish the partially staged tree the
+                    // stopped commit left behind: stop the whole operation.
+                    ShowTip(GitFailureText(c, kGitTimeoutMs));
+                    return;
+                }
             }
         }
     }
 
     ShowTip(L"git push…");
-    std::wstring out = RunGit({ L"-C", dir, L"push" });
+    GitResult push = RunGitEx({ L"-C", dir, L"push" });
+    if (!push.Finished()) { ShowTip(GitFailureText(push, kGitTimeoutMs)); return; }
+    std::wstring out = push.out;
     if (out.find(L"no upstream") != std::wstring::npos ||
         out.find(L"no configured push destination") != std::wstring::npos) {
         // First push: land on the branch the remote already has (main/master),
         // otherwise a README's branch and the dump would become two heads.
         std::wstring target = PullTarget(dir);
-        out = target.empty()
-                  ? RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" })
-                  : RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD:" + target });
+        push = target.empty()
+                   ? RunGitEx({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" })
+                   : RunGitEx({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD:" + target });
+        if (!push.Finished()) { ShowTip(GitFailureText(push, kGitTimeoutMs)); return; }
+        out = push.out;
     }
     // The merge above records origin/main as the upstream of the local master.
     // push.default=simple refuses such a pair because the branch names differ,
@@ -701,8 +750,11 @@ void RunPush() {
     if (out.find(L"upstream branch of your current branch does not match") !=
         std::wstring::npos) {
         std::wstring target = PullTarget(dir);
-        if (!target.empty())
-            out = RunGit({ L"-C", dir, L"push", L"origin", L"HEAD:" + target });
+        if (!target.empty()) {
+            push = RunGitEx({ L"-C", dir, L"push", L"origin", L"HEAD:" + target });
+            if (!push.Finished()) { ShowTip(GitFailureText(push, kGitTimeoutMs)); return; }
+            out = push.out;
+        }
     }
 
     // A repo created on GitHub with a README already has a commit, so the very
@@ -717,16 +769,20 @@ void RunPush() {
                     L"Слить истории (git pull --allow-unrelated-histories) и повторить push?",
                     L"GitBar — пуш", MB_YESNO | MB_ICONQUESTION) == IDYES) {
         ShowTip(L"git pull --allow-unrelated-histories…");
-        std::wstring merge = PullOrigin(dir, true);
-        LogGit(L"pull before push", TrimForTip(merge, 400));
-        if (merge.find(L"CONFLICT") != std::wstring::npos ||
-            merge.find(L"Automatic merge failed") != std::wstring::npos) {
-            out = merge;   // the conflict is what the user needs to see
+        const GitResult merge = PullOrigin(dir, true);
+        LogGit(L"pull before push", TrimForTip(merge.out, 400));
+        if (!merge.Finished()) {
+            out = GitFailureText(merge, kGitTimeoutMs);
+        } else if (merge.out.find(L"CONFLICT") != std::wstring::npos ||
+                   merge.out.find(L"Automatic merge failed") != std::wstring::npos) {
+            out = merge.out;   // the conflict is what the user needs to see
         } else {
             std::wstring target = PullTarget(dir);
-            out = target.empty()
-                      ? RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" })
-                      : RunGit({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD:" + target });
+            push = target.empty()
+                       ? RunGitEx({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD" })
+                       : RunGitEx({ L"-C", dir, L"push", L"-u", L"origin", L"HEAD:" + target });
+            if (!push.Finished()) { ShowTip(GitFailureText(push, kGitTimeoutMs)); return; }
+            out = push.out;
         }
     }
     LogGit(L"push", TrimForTip(out, 400));
@@ -742,10 +798,15 @@ void RunPull() {
                     L"Git pull", MB_ICONINFORMATION);
         return;
     }
+    if (!EnsureDumpRepo(g_bar.hwnd, dir, L"Git pull")) return;
     ShowTip(L"git pull…");
-    std::wstring out = PullOrigin(dir, false);
-    MessageBoxW(g_bar.hwnd, out.empty() ? L"Уже актуально." : out.c_str(),
-                L"Git pull", MB_ICONINFORMATION);
+    const GitResult r = PullOrigin(dir, false);
+    // An empty answer from a finished pull means there was nothing to pull; from
+    // a stopped one it means the deadline hit (A76).
+    const std::wstring text = r.Finished()
+                                  ? (r.out.empty() ? std::wstring(L"Уже актуально.") : r.out)
+                                  : GitFailureText(r, kGitTimeoutMs);
+    MessageBoxW(g_bar.hwnd, text.c_str(), L"Git pull", MB_ICONINFORMATION);
     Reposition(false);
 }
 
@@ -756,8 +817,10 @@ void RunFetch() {
                     L"Git fetch", MB_ICONINFORMATION);
         return;
     }
+    if (!EnsureDumpRepo(g_bar.hwnd, dir, L"Git fetch")) return;
     ShowTip(L"git fetch…");
-    std::wstring out = TrimWs(RunGit({ L"-C", dir, L"fetch", L"--all", L"--prune" }));
+    const GitResult r = RunGitEx({ L"-C", dir, L"fetch", L"--all", L"--prune" });
+    const std::wstring out = r.Finished() ? TrimWs(r.out) : GitFailureText(r, kGitTimeoutMs);
     MessageBoxW(g_bar.hwnd, out.empty() ? L"Обновлено (без изменений)." : out.c_str(),
                 L"Git fetch", MB_ICONINFORMATION);
     Reposition(false);
@@ -1077,6 +1140,9 @@ LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyWindow(g_bar.tooltip);
             g_bar.tooltip = nullptr;
         }
+        // The window is gone from this point: a command that arrives while the
+        // thread is still winding down must not be told "already shown" (A55).
+        if (g_bar.hwnd == hwnd) g_bar.hwnd = nullptr;
         PostQuitMessage(0);
         return 0;
     }
@@ -1213,25 +1279,53 @@ void RunCommitAction() {
 
 }  // namespace gitbar
 
+// A destroyed window leaves g_bar.hwnd cleared by WM_DESTROY, but the thread may
+// still be unwinding (a dialog of the panel was open when the close arrived).
+// Without this wait the next show would start a second bar thread next to the
+// first and leak the handle (A55).
+static bool BarThreadJoined(DWORD waitMs) {
+    if (!g_bar.thread) {
+        g_bar.hwnd = nullptr;
+        return true;
+    }
+    if (WaitForSingleObject(g_bar.thread, waitMs) != WAIT_OBJECT_0) return false;
+    CloseHandle(g_bar.thread);
+    g_bar.thread = nullptr;
+    g_bar.threadId = 0;
+    g_bar.hwnd = nullptr;   // the thread clears it too; do not trust the race
+    return true;
+}
+
+// g_bar.hwnd is only a cache of "the bar exists": after `gitbar hide` the handle
+// stays non-null for as long as the thread lives. Everything that asks whether a
+// panel is on screen must check the window, not the field (A55).
+static bool BarWindowAlive() {
+    return g_bar.hwnd != nullptr && IsWindow(g_bar.hwnd) != FALSE;
+}
+
 std::string GitBarCommandToJson(const std::wstring& args) {
     std::wstring a = args;
     while (!a.empty() && a.front() == L' ') a.erase(a.begin());
 
     if (a == L"hide") {
-        if (g_bar.hwnd) {
-            PostMessageW(g_bar.hwnd, WM_CLOSE, 0, 0);
-            if (g_bar.thread) {
-                WaitForSingleObject(g_bar.thread, 3000);
-                CloseHandle(g_bar.thread);
-            }
-            g_bar.thread = nullptr;
-            g_bar.threadId = 0;
+        const bool shown = BarWindowAlive();
+        if (shown) PostMessageW(g_bar.hwnd, WM_CLOSE, 0, 0);
+        // A bar thread that is inside a dialog gets the WM_CLOSE there; the
+        // window's WM_DESTROY posts WM_QUIT and the nested loop re-posts it, so
+        // the thread ends instead of losing the quit (A55).
+        if (!BarThreadJoined(5000)) {
+            return "{\"status\":\"error\",\"visible\":false,"
+                   "\"message\":\"toolbar thread did not stop in 5 s\"}";
         }
+        if (!shown) return "{\"status\":\"ok\",\"visible\":false,\"note\":\"not shown\"}";
         return "{\"status\":\"ok\",\"visible\":false}";
     }
 
-    if (g_bar.hwnd) {
+    if (BarWindowAlive()) {
         return "{\"status\":\"ok\",\"visible\":true,\"note\":\"already shown\"}";
+    }
+    if (!BarThreadJoined(5000)) {
+        return "{\"status\":\"error\",\"message\":\"previous toolbar thread is still running\"}";
     }
 
     g_bar.thread = CreateThread(nullptr, 0, BarThread, nullptr, 0, &g_bar.threadId);
@@ -1242,7 +1336,7 @@ std::string GitBarCommandToJson(const std::wstring& args) {
     char buf[128];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "{\"status\":\"ok\",\"visible\":%s,\"thread\":\"0x%llX\"}",
-                g_bar.hwnd ? "true" : "false", (unsigned long long)g_bar.threadId);
+                BarWindowAlive() ? "true" : "false", (unsigned long long)g_bar.threadId);
     return buf;
 }
 
@@ -1265,10 +1359,10 @@ const wchar_t* V8iGitBarIniPath() {
 // ожидания потока панели: UI-поток в transmit не должен блокироваться).
 void V8iGitBarMenuAction(unsigned num) {
     if (num == 2) {
-        if (!g_bar.hwnd || !IsWindowVisible(g_bar.hwnd)) GitBarCommandToJson(L"");
-        if (g_bar.hwnd) PostMessageW(g_bar.hwnd, WM_APP + 0x2F14, 0, 0);
+        if (!BarWindowAlive() || !IsWindowVisible(g_bar.hwnd)) GitBarCommandToJson(L"");
+        if (BarWindowAlive()) PostMessageW(g_bar.hwnd, WM_APP + 0x2F14, 0, 0);
     } else if (num == 3) {
-        if (g_bar.hwnd && IsWindowVisible(g_bar.hwnd))
+        if (BarWindowAlive() && IsWindowVisible(g_bar.hwnd))
             PostMessageW(g_bar.hwnd, WM_CLOSE, 0, 0);
         else
             GitBarCommandToJson(L"");
@@ -1276,8 +1370,8 @@ void V8iGitBarMenuAction(unsigned num) {
         // Действия нативного меню (mainmenu.cpp, номер = kWinId + 10):
         // исполняются в цикле бара (DoAction) отложенным сообщением —
         // модальные диалоги нельзя открывать внутри transmitCommand.
-        if (!g_bar.hwnd) GitBarCommandToJson(L"");
-        if (g_bar.hwnd) PostMessageW(g_bar.hwnd, WM_APP + 0x2F15, num - 10, 0);
+        if (!BarWindowAlive()) GitBarCommandToJson(L"");
+        if (BarWindowAlive()) PostMessageW(g_bar.hwnd, WM_APP + 0x2F15, num - 10, 0);
     }
 }
 

@@ -4,6 +4,21 @@
 #include <cstdio>
 #include <string>
 
+// A child mode of the test binary itself: it writes to stdout forever, as fast
+// as the pipe takes it. GitBar_RunProcessChecksTheDeadlineBeforeThePipe uses it --
+// cmd.exe cannot produce output fast enough to keep the pipe from ever going
+// empty, and an empty pipe is exactly what the old deadline check waited for
+// (docs/AUDIT.md A76).
+static int Flood() {
+    std::string block(64 * 1024, 'x');
+    block.back() = '\n';
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    for (;;) {
+        DWORD written = 0;
+        if (!WriteFile(out, block.data(), (DWORD)block.size(), &written, nullptr)) return 1;
+    }
+}
+
 // The unit tests have no framework around them: the runner prints the result
 // and returns the number of failed tests as the exit code.
 //
@@ -12,7 +27,9 @@
 // output alone shows only the exit code. The name differs from the payload's
 // own log (the payload writes next to its module and would pick the same file
 // name otherwise).
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--flood") return Flood();
+
     wchar_t self[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     size_t n = wcslen(self);

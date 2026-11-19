@@ -59,6 +59,11 @@ struct LogCtx {
     int visible = 1;
     std::wstring dir;
     std::vector<DiffLine> diff;
+    // A77: the patch of the selected commit is capped and kept by hash, so
+    // moving the selection over the same row again costs nothing and a huge
+    // commit is never pulled through the pipe a second time.
+    PatchCache* cache = nullptr;
+    std::wstring diffHash;     // commit the current `diff` was parsed for
     int diffTop = 0;       // first visible diff line
     int diffLines = 0;     // total diff lines (for the scroll hint)
     HFONT mono = nullptr;
@@ -1004,22 +1009,58 @@ void LogScrollTo(LogCtx* c, int top) {
 void LogSelect(LogCtx* c, int idx) {
     if (idx < 0) idx = 0;
     if (idx > (int)c->rows.size() - 1) idx = (int)c->rows.size() - 1;
+    const bool sameRow = (idx == c->sel) && !c->diffHash.empty();
     c->sel = idx;
     if (c->sel < c->top) LogScrollTo(c, c->sel);
     if (c->sel >= c->top + c->visible) LogScrollTo(c, c->sel - c->visible + 1);
     const LogRow& r = c->rows[c->sel];
+    if (sameRow && r.hash == c->diffHash) return;   // already parsed for this row
     c->diff.clear();
     c->diffTop = 0;
     c->diffLines = 0;
-    if (!r.hash.empty()) {
-        // Patch for the diff pane: stat first (one line per file), then the
-        // unified diff itself. ParseDiff turns it into rows with line numbers.
-        std::wstring patch = RunGit({ L"-c", L"core.quotepath=false",
-                                      L"-C", c->dir, L"show", L"--format=",
-                                      L"--stat", L"--patch", L"--no-color", r.hash });
-        ParseDiff(patch, c->diff);
-        c->diffLines = (int)c->diff.size();
+    c->diffHash = r.hash;
+    if (r.hash.empty()) {
+        InvalidateRect(c->hwnd, nullptr, FALSE);
+        return;
     }
+
+    // Patch for the diff pane: stat first (one line per file), then the unified
+    // diff itself. ParseDiff turns it into rows with line numbers.
+    //
+    // A77: "git show --stat --patch" used to run synchronously on every row with
+    // no size limit, so the first big commit could push hundreds of MB through
+    // the 1C process and be parsed three times over. The patch is now capped
+    // (the child is stopped at the limit, docs/AUDIT.md A76) and kept in a small
+    // cache by commit hash, so revisiting a commit does not run git at all.
+    std::wstring note;
+    std::wstring patch;
+    if (!c->cache || !c->cache->Get(r.hash, &patch)) {
+        const GitResult g = RunGitEx({ L"-c", L"core.quotepath=false",
+                                       L"-C", c->dir, L"show", L"--format=",
+                                       L"--stat", L"--patch", L"--no-color", r.hash },
+                                     kGitPatchTimeoutMs, kGitPatchCap);
+        patch = g.out;
+        if (g.timedOut) {
+            note = L"… git show не ответил за 20 с — дифф показан не полностью";
+        } else if (g.truncated) {
+            wchar_t b[96];
+            _snwprintf_s(b, _countof(b), _TRUNCATE,
+                         L"… дифф обрезан: показаны первые %lu КБ (лимит GitBar)",
+                         (unsigned long)(kGitPatchCap >> 10));
+            note = b;
+        }
+        // A capped patch is deterministic (same cap, same commit), so it is
+        // cached as well; a timed-out one is not and must be retried.
+        if (g.started && !g.timedOut && c->cache) c->cache->Put(r.hash, patch);
+    }
+    ParseDiff(patch, c->diff);
+    if (!note.empty()) {
+        DiffLine d;
+        d.kind = DiffLine::Note;
+        d.text = note;
+        c->diff.push_back(d);
+    }
+    c->diffLines = (int)c->diff.size();
     InvalidateRect(c->hwnd, nullptr, FALSE);
 }
 
@@ -1233,6 +1274,10 @@ void ShowGitLog(HWND owner) {
     }
     LogCtx* c = new LogCtx();
     c->dir = dir;
+    // Shared by every opening of the window and bounded by its own budget, so a
+    // commit read once is not pulled through the pipe again (A77).
+    static PatchCache cache;
+    c->cache = &cache;
     if (!LoadLog(dir, c->rows, &c->maxLanes)) {
         delete c;
         MessageBoxW(owner, L"Не удалось прочитать историю (git log вернул пусто).",
@@ -1263,17 +1308,8 @@ void ShowGitLog(HWND owner) {
     SetForegroundWindow(h);
     LogSelect(c, 0);
 
-    MSG msg;
     ModalEnter();
-    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0)) {
-        if (msg.hwnd == h || IsChild(h, msg.hwnd)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        } else {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
+    PumpModalLoop(h, false);
     if (IsWindow(h)) DestroyWindow(h);
     if (c->mono) DeleteObject(c->mono);
     if (c->ui) DeleteObject(c->ui);
