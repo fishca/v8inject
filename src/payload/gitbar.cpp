@@ -155,10 +155,10 @@ void SetCompact(bool compact) {
 
 int BarW() { return g_bar.compact ? kCompactW : kBarW; }
 
-// Every glyph is a Phosphor Icons picture (Fill, MIT), recoloured in the
-// Configurator's palette by tools/render_icons.cjs and baked to premultiplied
-// BGRA by tools/gen_icons.py: 1C's own resource pictures must not be
-// redistributed, and the open set gives a consistent professional look.
+// Every glyph is a picture from the qtv8reader metadata icon set (the open
+// MIT metadata-icons set recoloured in a 1C-like palette), selected for each
+// GitBar action by tools/select_icons.py and baked to premultiplied BGRA by
+// tools/gen_icons.py: 1C's own resource pictures must not be redistributed.
 const unsigned char* IconFor(int id) {
     switch (id) {
     case kWinIdDump: return icons::kIconDump;

@@ -102,7 +102,7 @@ GitBar (см. §7).**
 ## 7. Фаза R5: картинки пунктов нативного меню — ВЫПОЛНЕНА (2026-11-18)
 
 Пункты подменю «GitBar» теперь несут те же 16×16 глифы, что и панель GitBar
-(открытый набор Phosphor Icons, MIT, см. §7a). Реверс (live 8.3.27.2342 x64):
+(набор qtv8reader metadata-icons, MIT, см. §7a). Реверс (live 8.3.27.2342 x64):
 
 1. `ICmdDescription::image()` (слот 5) сначала отдаёт поле-кэш `descr+0x80`;
    если оно пусто — достаёт `core::URL` из `descr+0x40` (24-байтная v8string +
@@ -129,31 +129,34 @@ GitBar (см. §7).**
    push, pull, fetch, stash, теги, рабочая копия, история, настройки.
    Release x64/x86 собираются, CTest 4/4 на обеих архитектурах.
 
-## 7a. Иконки: открытый набор Phosphor Icons вместо картинок из ресурсов 1С (2026-11-19)
+## 7a. Иконки: набор qtv8reader (metadata-icons, MIT) вместо картинок из ресурсов 1С (2026-11-19)
 
 Изначально 12 глифов панели были вырезаны из ресурсов платформы
 (`core83_root.res`, `mngcore_root.res`, `core85_root.res`, …). Такие картинки
 — часть продукта 1С, и распространять их в архивах проекта неправильно.
-Иконки заменены на открытый набор, перекрашенный в палитру Конфигуратора:
+Иконки заменены на открытый набор из соседнего проекта qtv8reader:
 
-- глифы — **Phosphor Icons** (стиль Fill, MIT, `@phosphor-icons/core` 2.1.1,
-  https://phosphoricons.com); SVG-исходники 15 ролей лежат в
-  `src/payload/icons/phosphor/`, текст лицензии и таблица соответствия —
-  `phosphor/LICENSE.txt` и `phosphor/ATTRIBUTION.md`;
-- `tools/render_icons.cjs` (node + sharp, dev-only) перекрашивает SVG
-  вертикальным градиентом «светлый → тёмный» в палитру Конфигуратора
-  (зелёный/синий/бирюзовый/золотой/коричневый/серый) и рендерит 16×16 PNG;
-  `python tools/gen_icons.py` затем собирает `icons.h` (premultiplied BGRA) и
-  `icons_png.h` (для `file:///`-URL нативного меню) — панель и подменю
-  используют одни и те же файлы;
-- набор пересмотрен по назначению пунктов: «Выгрузить расширение» — пазл
-  (расширение), «Клонировать» — копия, сам «GitBar» — git-fork; «Коммит» —
-  git-узел, «Ветки» — git-branch, «Получить» — круговые стрелки, «Отложенные»
-  — архивный ящик, «Теги» — бирка, «История» — часы с поворотом, «Рабочая
-  копия» — чек-лист, «Настройки» — шестерёнка; цвета сгруппированы по смыслу;
-- назначение, источник и цвет каждой роли зафиксированы в
-  `src/payload/icons/SOURCE.json`; MIT-лицензия Phosphor требует сохранять
-  уведомление об авторских правах — оно лежит в `phosphor/LICENSE.txt` и
+- 16-пиксельные PNG взяты из `fishca/qtv8reader`,
+  `resources/icons/metadata`: это открытый набор **metadata-icons**
+  (`zerobig/vscode-1c-metadata-viewer`, MIT, Copyright (c) 2023 zerobig and
+  contributors), перекрашенный qtv8reader в палитру 1С; исходники 15 выбранных
+  глифов, текст лицензии и таблица «роль → файл» лежат в
+  `src/payload/icons/qtv8reader/` (`LICENSE-METADATA-ICONS.txt`,
+  `ATTRIBUTION.md`);
+- `tools/select_icons.py` раскладывает выбранные файлы по ролям
+  (`src/payload/icons/<role>.png`), `python tools/gen_icons.py` собирает
+  `icons.h` (premultiplied BGRA) и `icons_png.h` (для `file:///`-URL нативного
+  меню) — панель и подменю используют одни и те же файлы;
+- глифы типов метаданных подобраны под смысл действий: `document` — выгрузка
+  исходников, `dataProcessor` — расширение, `constant` — создание репозитория,
+  `externalDataSource` — клонирование, `accountingFlag` — коммит,
+  `exchangePlan` — push, `businessProcess` — pull, `ws` — fetch,
+  `group` — ветки, `settingsStorage` — stash, `filterCriteria` — теги,
+  `extDimensionAccountingFlag` — рабочая копия, `scheduledJob` — история,
+  `sessionParameter` — настройки, `subsystem` — сам пункт «GitBar»;
+- назначение и источник каждой роли зафиксированы в
+  `src/payload/icons/SOURCE.json`; MIT-лицензия требует сохранять уведомление
+  об авторских правах — оно лежит в `qtv8reader/LICENSE-METADATA-ICONS.txt` и
   продублировано в README/RELEASE.md.
 
 ## 8. Известные риски

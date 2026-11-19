@@ -462,8 +462,8 @@ void MMSetCommandTextLong(uintptr_t svc, const GUID& group, unsigned num,
 // поэтому после регистрации кладём в описание готовый URL, собранный ШТАТНЫМ
 // конструктором core::URL из v8string (так его поля разбора корректны).
 //
-// Схема URL — file:///: payload пишет PNG-глифы (Phosphor Icons, MIT,
-// перекрашены в палитру Конфигуратора: tools/render_icons.cjs) во временный
+// Схема URL — file:///: payload пишет PNG-глифы (набор qtv8reader
+// metadata-icons, MIT, разложен по ролям tools/select_icons.py) во временный
 // каталог, и платформа загружает их сама.
 // Меню выглядит пиксель-в-пиксель как панель на любой версии платформы.
 // v8res:// здесь не годится: во-первых, картинки из ресурсов 1С нельзя

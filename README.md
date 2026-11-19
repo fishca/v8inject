@@ -117,10 +117,12 @@ v8inject log [--clear]                                # лог хоста
 
 Панель живёт **внутри процесса 1С**: это дочернее окно окна конфигуратора,
 пристыкованное справа в ряду тулбара, поэтому выглядит как штатный тулбар —
-включая иконки: они взяты из открытого набора Phosphor Icons (MIT),
-перекрашены в палитру Конфигуратора и отрендерены в 16×16
-(`src/payload/icons/phosphor/`, `tools/render_icons.cjs`). Это не картинки
-из ресурсов 1С, поэтому их можно свободно распространять в составе проекта.
+включая иконки: они взяты из соседнего проекта qtv8reader (каталог
+`resources/icons/metadata`) — это открытый MIT-набор `metadata-icons`
+(zerobig/vscode-1c-metadata-viewer), перекрашенный в палитру Конфигуратора;
+в GitBar глифы выбраны под смысл пунктов (`src/payload/icons/qtv8reader/`,
+`tools/select_icons.py`). Это не картинки из ресурсов 1С, поэтому их можно
+свободно распространять в составе проекта.
 При наведении на кнопку показывается подсказка с действием и git-командой.
 Подробно — [docs/GITBAR.md](docs/GITBAR.md).
 
@@ -274,6 +276,8 @@ MIT — см. [LICENSE](LICENSE).
   (University of Illinois/NCSA Open Source License). Тексты лицензий
   заведены рядом с исходниками: `third_party/capstone/LICENSE.TXT`
   и `third_party/capstone/LICENSE_LLVM.TXT`.
-- Иконки GitBar — Phosphor Icons (Fill), MIT, Copyright (c) 2023 Phosphor
-  Icons. SVG-исходники и текст лицензии: `src/payload/icons/phosphor/`
-  (`LICENSE.txt`, `ATTRIBUTION.md`).
+- Иконки GitBar — из qtv8reader (`fishca/qtv8reader`), набор metadata-icons
+  (MIT, Copyright (c) 2023 zerobig and contributors,
+  `zerobig/vscode-1c-metadata-viewer`), перекрашенный qtv8reader в палитру 1С.
+  Исходники и текст лицензии: `src/payload/icons/qtv8reader/`
+  (`LICENSE-METADATA-ICONS.txt`, `ATTRIBUTION.md`).

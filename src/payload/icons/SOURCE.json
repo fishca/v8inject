@@ -1,44 +1,34 @@
 {
-  "note": "Icons are NOT taken from 1C resource bundles. The 16x16 PNGs are rendered from the open Phosphor Icons set (Fill style), recoloured into the Configurator's palette. Phosphor Icons is MIT-licensed; the copyright notice is in phosphor/LICENSE.txt and notice is kept in README/RELEASE.md.",
+  "note": "Icons are NOT taken from 1C resource bundles. The 16x16 PNGs are selected from the qtv8reader project (fishca/qtv8reader, resources/icons/metadata), which uses the open MIT-licensed metadata-icons set (zerobig/vscode-1c-metadata-viewer) recoloured in a 1C-like palette. Metadata-type glyphs are mapped to GitBar actions by meaning; see qtv8reader/ATTRIBUTION.md for the role table.",
   "source": {
-    "set": "Phosphor Icons (Fill)",
-    "url": "https://phosphoricons.com",
-    "package": "@phosphor-icons/core 2.1.1",
+    "project": "qtv8reader (fishca/qtv8reader)",
+    "path": "resources/icons/metadata",
+    "upstream": "zerobig/vscode-1c-metadata-viewer",
     "license": "MIT",
-    "license_file": "phosphor/LICENSE.txt",
-    "attribution": "phosphor/ATTRIBUTION.md"
+    "copyright": "Copyright (c) 2023 zerobig and contributors",
+    "license_file": "qtv8reader/LICENSE-METADATA-ICONS.txt",
+    "attribution": "qtv8reader/ATTRIBUTION.md"
   },
   "pipeline": {
-    "svg_sources": "src/payload/icons/phosphor/<role>.svg",
-    "render": "node tools/render_icons.cjs (sharp; dev-only, needs `npm install --no-save sharp`)",
-    "png": "src/payload/icons/<role>.png (16x16 RGBA)",
+    "selected_sources": "src/payload/icons/qtv8reader/<name>_16.png",
+    "select": "python tools/select_icons.py -> src/payload/icons/<role>.png",
     "headers": "python tools/gen_icons.py -> icons.h (premultiplied BGRA) + icons_png.h (file:/// URLs for the native menu)"
   },
-  "palette": {
-    "note": "vertical gradient light-to-dark, sampled from the Configurator chrome",
-    "green": ["#6FD07C", "#2E8B47"],
-    "blue": ["#7FA8E8", "#2F5CA8"],
-    "sync": ["#7FB6EC", "#255F9E"],
-    "teal": ["#68C9C0", "#1F7A73"],
-    "gold": ["#E8C46A", "#9A6E12"],
-    "brown": ["#D9A75C", "#8A5518"],
-    "gray": ["#C9C3B4", "#6E685B"]
-  },
   "roles": {
-    "dump": { "phosphor": "file-arrow-down-fill", "color": "green", "purpose": "выгрузить исходники в файлы" },
-    "dumpext": { "phosphor": "puzzle-piece-fill", "color": "green", "purpose": "выгрузить расширение в файлы" },
-    "init": { "phosphor": "folder-plus-fill", "color": "blue", "purpose": "создать репозиторий в папке выгрузки" },
-    "clone": { "phosphor": "copy-fill", "color": "blue", "purpose": "клонировать репозиторий" },
-    "commit": { "phosphor": "git-commit-fill", "color": "green", "purpose": "коммит изменений" },
-    "push": { "phosphor": "arrow-circle-up-fill", "color": "sync", "purpose": "пуш в удалённый репозиторий" },
-    "pull": { "phosphor": "arrow-circle-down-fill", "color": "sync", "purpose": "забрать изменения" },
-    "fetch": { "phosphor": "arrows-clockwise-fill", "color": "teal", "purpose": "получить изменения" },
-    "branches": { "phosphor": "git-branch-fill", "color": "blue", "purpose": "ветки" },
-    "stash": { "phosphor": "archive-fill", "color": "gold", "purpose": "отложенные изменения" },
-    "tags": { "phosphor": "tag-fill", "color": "gold", "purpose": "теги" },
-    "status": { "phosphor": "list-checks-fill", "color": "green", "purpose": "рабочая копия" },
-    "log": { "phosphor": "clock-counter-clockwise-fill", "color": "brown", "purpose": "история коммитов" },
-    "settings": { "phosphor": "gear-fill", "color": "gray", "purpose": "настройки" },
-    "gitbar": { "phosphor": "git-fork-fill", "color": "blue", "purpose": "фирменный глиф пункта «GitBar»" }
+    "dump": { "source": "document_16.png", "purpose": "выгрузить исходники в файлы" },
+    "dumpext": { "source": "dataProcessor_16.png", "purpose": "выгрузить расширение в файлы" },
+    "init": { "source": "constant_16.png", "purpose": "создать репозиторий в папке выгрузки" },
+    "clone": { "source": "externalDataSource_16.png", "purpose": "клонировать репозиторий" },
+    "commit": { "source": "accountingFlag_16.png", "purpose": "коммит изменений" },
+    "push": { "source": "exchangePlan_16.png", "purpose": "пуш в удалённый репозиторий" },
+    "pull": { "source": "businessProcess_16.png", "purpose": "забрать изменения" },
+    "fetch": { "source": "ws_16.png", "purpose": "получить изменения" },
+    "branches": { "source": "group_16.png", "purpose": "ветки" },
+    "stash": { "source": "settingsStorage_16.png", "purpose": "отложенные изменения" },
+    "tags": { "source": "filterCriteria_16.png", "purpose": "теги" },
+    "status": { "source": "extDimensionAccountingFlag_16.png", "purpose": "рабочая копия" },
+    "log": { "source": "scheduledJob_16.png", "purpose": "история коммитов" },
+    "settings": { "source": "sessionParameter_16.png", "purpose": "настройки" },
+    "gitbar": { "source": "subsystem_16.png", "purpose": "фирменный глиф пункта «GitBar»" }
   }
 }
