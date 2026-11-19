@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -578,3 +579,138 @@ V8I_TEST(Dispatcher_TooLargeReplyIsAnErrorNotACutDocument) {
     CHECK(reply.find("\"limit\":") != std::string::npos);
 }
 
+
+// ---------------------------------------------------------------------------
+// A49/A83: the object scanners of the payload on this build
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A real C++ object with a vtable from this image: both scanners classify a
+// vtable pointer by asking "does it land inside a module", so the probe has to
+// be genuinely virtual. The handle at the end is what `byhwnd` searches for.
+class ScanProbe {
+public:
+    virtual ~ScanProbe() = default;
+    virtual int One() { return 1; }
+    virtual int Two() { return 2; }
+    virtual int Three() { return 3; }
+    virtual int Four() { return 4; }
+    HWND hwnd = nullptr;
+};
+
+uintptr_t FirstPointerOf(const void* obj) {
+    uintptr_t v = 0;
+    memcpy(&v, obj, sizeof(v));
+    return v;
+}
+
+std::string HexAddress(uintptr_t v) {
+    char buf[32];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%llX", (unsigned long long)v);
+    return buf;
+}
+
+}  // namespace
+
+V8I_TEST(Dispatcher_ScannerCountsRejectNegative) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    std::string reply;
+
+    // A83: "-1" used to be cast to size_t and became SIZE_MAX, so `find --max
+    // -1` collected hits until the address space ran out. It is a usage error
+    // now, and the answer names the flag.
+    REQUIRE(d.Ask(L"find QZXJKNOSUCHPATTERN --max -1", reply, 30000));
+    ExpectJson("find --max -1", reply);
+    REQUIRE(reply.find("\"status\":\"error\"") != std::string::npos);
+    CHECK(reply.find("--max") != std::string::npos);
+
+    // The same parser serves the scanner commands; each refuses a count that is
+    // not a plain number before it starts walking memory.
+    REQUIRE(d.Ask(L"memmap --count -1", reply, 10000));
+    ExpectJson("memmap --count -1", reply);
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+
+    REQUIRE(d.Ask(L"heapobjects --count -1", reply, 10000));
+    ExpectJson("heapobjects --count -1", reply);
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+
+    REQUIRE(d.Ask(L"findvalue 0x7F4D2E0B --count -1", reply, 30000));
+    ExpectJson("findvalue --count -1", reply);
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+
+    // `--offset -1` used to make the backward walk of byhwnd iterate to
+    // SIZE_MAX: refusing it before the scan is the only safe answer.
+    REQUIRE(d.Ask(L"byhwnd 1 --offset -1", reply, 10000));
+    ExpectJson("byhwnd --offset -1", reply);
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+
+    // A count past the per-command cap is refused as well, not silently
+    // clamped: the caller has to know that the reply would not be what it asked.
+    REQUIRE(d.Ask(L"find QZXJKNOSUCHPATTERN --max 999999", reply, 10000));
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+    REQUIRE(d.Ask(L"byhwnd 1 --offset 0x2000", reply, 10000));
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+
+    // The dispatcher survives all of it.
+    REQUIRE(d.Ask(L"version", reply));
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+}
+
+V8I_TEST(Dispatcher_HeapObjectsFindsObjectsOnThisBuild) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    // The probe stays alive while the command runs: heapobjects scans this very
+    // process, and the object carries a vtable of the test image.
+    auto probe = std::make_unique<ScanProbe>();
+    const uintptr_t probeAddr = (uintptr_t)probe.get();
+    CHECK(probeAddr != 0);
+    CHECK(FirstPointerOf(probe.get()) != 0);
+
+    std::string reply;
+    REQUIRE(d.Ask(L"heapobjects --count 100000", reply, 60000));
+    ExpectJson("heapobjects", reply);
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+
+    // The x64 bug answered "objects":0 / "classes":0 for every module: the
+    // 32-bit read of a 64-bit vtable pointer could never fall inside the image.
+    CHECK(reply.find("\"objects\":0") == std::string::npos);
+    CHECK(reply.find("\"classes\":0") == std::string::npos);
+}
+
+V8I_TEST(Dispatcher_ByHwndFindsTheOwnerOnThisBuild) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    HWND frame = CreateMenuFrame(L"V8i byhwnd probe", nullptr);
+    REQUIRE(frame != nullptr);
+    auto probe = std::make_unique<ScanProbe>();
+    probe->hwnd = frame;
+
+    // The handle is written in the same hex notation the command documents.
+    wchar_t hwndHex[32] = {};
+    _snwprintf_s(hwndHex, _countof(hwndHex), _TRUNCATE, L"0x%llX",
+                 (unsigned long long)(uintptr_t)frame);
+
+    std::wstring cmd = L"byhwnd ";
+    cmd += hwndHex;
+    cmd += L" --count 64";
+    std::string reply;
+    REQUIRE(d.Ask(cmd.c_str(), reply, 60000));
+    ExpectJson("byhwnd", reply);
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+
+    // The reply names the object address and the real distance from the handle
+    // back to it: one machine word.
+    const std::string addr = "\"addr\":\"0x" + HexAddress((uintptr_t)probe.get()) + "\"";
+    CHECK(reply.find(addr) != std::string::npos);
+    char off[40];
+    _snprintf_s(off, sizeof(off), _TRUNCATE, "\"offset\":%llu",
+                (unsigned long long)sizeof(void*));
+    CHECK(reply.find(off) != std::string::npos);
+
+    DestroyWindow(frame);
+}

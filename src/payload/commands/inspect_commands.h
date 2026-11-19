@@ -12,6 +12,17 @@ namespace commands {
 // it stopped (`"exportsTruncated":true`, docs/AUDIT.md A46).
 constexpr size_t kPeMaxExports = 200;
 
+// Caps of the scanner commands (docs/AUDIT.md A83). A count comes from the
+// command line, and the old local parser cast "-1" to size_t: one typo turned
+// `heapobjects --count -1`/`find --max -1` into an unbounded collection over
+// the whole address space - megabytes of hits and a timeout instead of a reply.
+// Every count is parsed with v8i::ParseNumber and checked against these caps.
+constexpr size_t kMaxCount = 8192;          // disasm/xref/find/findvalue rows
+constexpr size_t kMaxHeapObjects = 200000;  // heapobjects --count
+constexpr size_t kMaxMemMapRows = 4096;     // memmap --count
+constexpr size_t kMaxByHwndHits = 256;      // byhwnd --count
+constexpr size_t kMaxHwndOffset = 0x1000;   // byhwnd --offset
+
 // Read-only inspection commands. They never execute code in the target and
 // never follow pointers beyond classifying them; every reply is JSON.
 std::string StrToJson(const std::wstring& args);

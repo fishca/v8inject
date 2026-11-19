@@ -8,6 +8,7 @@
 #include "v8inject/text.h"
 
 #include <windows.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -248,7 +249,16 @@ std::string FindToJson(const std::wstring& args) {
         if (tok.empty()) break;
         if (tok == L"--module")      opt.module = takeToken(rest);
         else if (tok == L"--wide")   opt.wide = true;
-        else if (tok == L"--max")    opt.maxHits = (size_t)_wtoi(takeToken(rest).c_str());
+        else if (tok == L"--max") {
+            // A83: the old parser cast _wtoi("-1") to size_t, and the scan
+            // collected hits until it ran out of address space.
+            uintptr_t v = 0;
+            if (!v8i::ParseNumber(takeToken(rest), &v) || v > kMaxCount) {
+                return "{\"status\":\"error\",\"message\":\"--max must be a number up to " +
+                       std::to_string(kMaxCount) + "\"}";
+            }
+            opt.maxHits = (size_t)v;
+        }
         else if (tok == L"--first")  opt.stopAtFirst = true;
     }
     if (opt.maxHits == 0) opt.maxHits = 64;
@@ -297,6 +307,7 @@ struct ReArgs {
     bool         haveFrom = false;
     bool         haveTo = false;
     std::wstring pattern;
+    std::string  error;                      // JSON error; the command returns it
 };
 
 std::wstring NextToken(std::wstring& in) {
@@ -308,35 +319,86 @@ std::wstring NextToken(std::wstring& in) {
     return tok;
 }
 
-uintptr_t ParseHexToken(const std::wstring& t) {
-    if (t.empty()) return 0;
+std::string TokenError(const char* flag) {
+    return std::string("{\"status\":\"error\",\"message\":\"invalid value for ") + flag + "\"}";
+}
+
+void BadValue(ReArgs& a, const char* flag) {
+    if (a.error.empty()) a.error = TokenError(flag);
+}
+
+void BadAddress(ReArgs& a) {
+    if (a.error.empty()) a.error = "{\"status\":\"error\",\"message\":\"invalid address\"}";
+}
+
+// Addresses are typed and documented in hexadecimal: "0x1A2B" and "1A2B" are
+// both accepted, nothing else is. The old version returned 0 for an empty or
+// malformed token, so a typo silently addressed the first page.
+bool ParseHexToken(const std::wstring& t, uintptr_t* out) {
+    if (!out) return false;
     std::wstring s = t;
     if (s.size() > 2 && s[0] == L'0' && (s[1] == L'x' || s[1] == L'X')) s = s.substr(2);
-    return (uintptr_t)_wcstoui64(s.c_str(), nullptr, 16);
+    if (s.empty() || s.size() > 16) return false;
+    for (wchar_t c : s) {
+        const bool digit = (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') ||
+                           (c >= L'A' && c <= L'F');
+        if (!digit) return false;
+    }
+    *out = (uintptr_t)_wcstoui64(s.c_str(), nullptr, 16);
+    return true;
 }
 
-// Numbers on the command line may be written in hex (0x38) or decimal (56).
-size_t ParseNum(const std::wstring& t) {
-    if (t.empty()) return 0;
-    if (t.size() > 2 && t[0] == L'0' && (t[1] == L'x' || t[1] == L'X'))
-        return (size_t)ParseHexToken(t);
-    return (size_t)_wtoi(t.c_str());
+// Counts may be written in hex (0x38) or decimal (56); a sign or a suffix is
+// not a number. The upper bound differs per command, so the caller checks it.
+bool ParseCountToken(const std::wstring& t, size_t* out) {
+    uintptr_t v = 0;
+    if (!out || !v8i::ParseNumber(t, &v)) return false;
+    *out = (size_t)v;
+    return true;
 }
 
-ReArgs ParseReArgs(const std::wstring& args) {
+ReArgs ParseReArgs(const std::wstring& args, size_t maxCount) {
     ReArgs a;
     std::wstring rest = args;
     for (;;) {
         std::wstring tok = NextToken(rest);
         if (tok.empty()) break;
-        if (tok == L"--module")      a.module = NextToken(rest);
-        else if (tok == L"--addr")   { a.addr = ParseHexToken(NextToken(rest)); a.haveAddr = true; }
-        else if (tok == L"--from")   { a.from = ParseHexToken(NextToken(rest)); a.haveFrom = true; }
-        else if (tok == L"--to")     { a.to = ParseHexToken(NextToken(rest)); a.haveTo = true; }
-        else if (tok == L"--count")  a.count = ParseNum(NextToken(rest));
-        else if (tok == L"--offset") { a.offset = ParseNum(NextToken(rest)); a.haveOffset = true; }
-        else if (tok == L"--pattern") a.pattern = NextToken(rest);
-        else if (tok[0] != L'-')     a.positional.push_back(tok);
+        if (tok == L"--module") {
+            a.module = NextToken(rest);
+        } else if (tok == L"--addr") {
+            if (!ParseHexToken(NextToken(rest), &a.addr)) BadValue(a, "--addr");
+            a.haveAddr = true;
+        } else if (tok == L"--from") {
+            if (!ParseHexToken(NextToken(rest), &a.from)) BadValue(a, "--from");
+            a.haveFrom = true;
+        } else if (tok == L"--to") {
+            if (!ParseHexToken(NextToken(rest), &a.to)) BadValue(a, "--to");
+            a.haveTo = true;
+        } else if (tok == L"--count") {
+            size_t v = 0;
+            if (!ParseCountToken(NextToken(rest), &v)) {
+                BadValue(a, "--count");
+            } else if (v > maxCount) {
+                if (a.error.empty()) {
+                    a.error = "{\"status\":\"error\",\"message\":\"--count is limited to " +
+                              std::to_string(maxCount) + "\"}";
+                }
+            } else {
+                a.count = v;
+            }
+        } else if (tok == L"--offset") {
+            size_t v = 0;
+            if (!ParseCountToken(NextToken(rest), &v) || v > kMaxHwndOffset) {
+                BadValue(a, "--offset");
+            } else {
+                a.offset = v;
+            }
+            a.haveOffset = true;
+        } else if (tok == L"--pattern") {
+            a.pattern = NextToken(rest);
+        } else if (tok[0] != L'-') {
+            a.positional.push_back(tok);
+        }
     }
     if (a.count == 0) a.count = 64;
     return a;
@@ -379,12 +441,17 @@ uintptr_t SectionEnd(const PeImage& img, const PeSection* sec) {
 }  // namespace
 
 std::string DisasmToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxCount);
+    if (!a.error.empty()) return a.error;
     // disasm [<hex-addr>] [--module m] — a positional hex number is the address.
     for (const std::wstring& p : a.positional) {
         if (p.find(L'.') != std::wstring::npos) { if (a.module.empty()) a.module = p; }
-        else if (!a.haveAddr) { a.addr = ParseHexToken(p); a.haveAddr = true; }
+        else if (!a.haveAddr) {
+            if (!ParseHexToken(p, &a.addr)) { BadAddress(a); break; }
+            a.haveAddr = true;
+        }
     }
+    if (!a.error.empty()) return a.error;
     ModuleRange m;
     PeImage img;
     if (!ResolveModule(a.module, m, img)) {
@@ -431,7 +498,8 @@ std::string DisasmToJson(const std::wstring& args) {
 }
 
 std::string ImportsToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxCount);
+    if (!a.error.empty()) return a.error;
     // imports <module> [filter] — the module is positional, not a filter.
     if (a.module.empty() && !a.positional.empty()) {
         a.module = a.positional[0];
@@ -510,7 +578,8 @@ std::string ImportsToJson(const std::wstring& args) {
 // exports <module> [filter] — the module's export table, matched by name.
 // Used to locate engine entry points (autocomplete, editor, ...) by name.
 std::string ExportsToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxCount);
+    if (!a.error.empty()) return a.error;
     if (a.module.empty() && !a.positional.empty()) {
         a.module = a.positional[0];
         if (a.positional.size() > 1 && a.pattern.empty()) a.pattern = a.positional[1];
@@ -577,7 +646,8 @@ std::string ExportsToJson(const std::wstring& args) {
 // every DLL 1C pulled in, so exports/imports/xref can be pointed at the right
 // one (1cv8core, frame, v8baseeditor, ...).
 std::string ModsToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxCount);
+    if (!a.error.empty()) return a.error;
     // Positional filter: `mods edit`, `mods 1cv8`. --pattern also accepted.
     if (a.pattern.empty() && !a.positional.empty()) a.pattern = a.positional[0];
 
@@ -630,7 +700,8 @@ std::string ModsToJson(const std::wstring& args) {
 
 // Resolves the target through the IAT when it looks like an import slot.
 std::string XrefToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxCount);
+    if (!a.error.empty()) return a.error;
     // A positional token is an address when it starts with 0x or looks hex,
     // otherwise it is an import name to resolve through the IAT.
     if (!a.haveAddr) {
@@ -638,8 +709,8 @@ std::string XrefToJson(const std::wstring& args) {
             bool hexLike = (p.size() > 2 && p[0] == L'0' && (p[1] == L'x' || p[1] == L'X')) ||
                            (p.find(L'.') == std::wstring::npos && p.size() >= 5);
             if (hexLike) {
-                uintptr_t v = ParseHexToken(p);
-                if (v) { a.addr = v; a.haveAddr = true; }
+                uintptr_t v = 0;
+                if (ParseHexToken(p, &v) && v) { a.addr = v; a.haveAddr = true; }
             } else if (a.pattern.empty()) {
                 a.pattern = p;
             }
@@ -727,7 +798,8 @@ std::string XrefToJson(const std::wstring& args) {
 // memmap [--count n] — committed regions by protection, with sizes. Used to find
 // where 1C keeps its heap; the object scanner only walks writable regions.
 std::string MemMapToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxMemMapRows);
+    if (!a.error.empty()) return a.error;
     size_t cap = a.count ? a.count : 60;
 
     SYSTEM_INFO si{};
@@ -737,6 +809,12 @@ std::string MemMapToJson(const std::wstring& args) {
 
     struct Reg { uintptr_t base; size_t size; uint32_t protect; uint32_t state; uint32_t type; };
     std::vector<Reg> big;
+
+    // The biggest regions are the interesting ones, but a caller-supplied count
+    // must not turn the list into an unbounded allocation either: the collection
+    // itself is bounded, and the reply says when it stopped.
+    const size_t kMaxCollected = 65536;
+    size_t skippedBig = 0;
 
     size_t committedRw = 0, committedAll = 0, regTotal = 0;
     size_t rwRegions = 0;
@@ -761,17 +839,21 @@ std::string MemMapToJson(const std::wstring& args) {
             if (re > highestCommit) highestCommit = re;
         }
         if (mbi.State == MEM_COMMIT && mbi.RegionSize >= 0x10000) {
-            big.push_back({rb, (size_t)mbi.RegionSize, (uint32_t)mbi.Protect,
-                           (uint32_t)mbi.State, (uint32_t)mbi.Type});
+            if (big.size() < kMaxCollected) {
+                big.push_back({rb, (size_t)mbi.RegionSize, (uint32_t)mbi.Protect,
+                               (uint32_t)mbi.State, (uint32_t)mbi.Type});
+            } else {
+                ++skippedBig;
+            }
         }
         if (re <= rb) break;
         addr = re;
     }
 
-    // Largest first.
-    for (size_t i = 0; i + 1 < big.size(); ++i)
-        for (size_t k = 0; k + 1 < big.size() - i; ++k)
-            if (big[k].size < big[k + 1].size) std::swap(big[k], big[k + 1]);
+    // Largest first. The old bubble sort was O(n^2) over every committed
+    // region (docs/AUDIT.md A83).
+    std::sort(big.begin(), big.end(),
+              [](const Reg& x, const Reg& y) { return x.size > y.size; });
 
     char buf[512];
     std::string j = "{\"status\":\"ok\",\"regions\":";
@@ -794,12 +876,15 @@ std::string MemMapToJson(const std::wstring& args) {
                     (unsigned long long)r.base, r.size, r.protect, r.type);
         j += buf;
     }
-    j += "]}";
+    j += "]";
+    if (skippedBig) j += ",\"regionsTruncated\":true";
+    j += "}";
     return j;
 }
 
 std::string HeapObjectsToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxHeapObjects);
+    if (!a.error.empty()) return a.error;
     for (const std::wstring& p : a.positional)
         if (p.find(L'.') != std::wstring::npos && a.module.empty()) a.module = p;
 
@@ -813,20 +898,23 @@ std::string HeapObjectsToJson(const std::wstring& args) {
     std::vector<HeapObject> objs = FindHeapObjects(m.base, m.size, cap, &scanned, &regions,
                                                    &committed);
 
-    // Group by vtable RVA.
+    // Group by vtable RVA. The linear "seen" scan was O(n^2) in the number of
+    // objects: sorting by rva and counting runs is O(n log n) (A83).
+    std::sort(objs.begin(), objs.end(),
+              [](const HeapObject& x, const HeapObject& y) { return x.vtableRva < y.vtableRva; });
     std::vector<std::pair<uint32_t, size_t>> groups;
     for (const HeapObject& o : objs) {
-        bool seen = false;
-        for (auto& g : groups) {
-            if (g.first == o.vtableRva) { g.second++; seen = true; break; }
+        if (groups.empty() || groups.back().first != o.vtableRva) {
+            groups.push_back({o.vtableRva, 1});
+        } else {
+            ++groups.back().second;
         }
-        if (!seen) groups.push_back({o.vtableRva, 1});
     }
     // Most frequent first.
-    for (size_t i = 0; i + 1 < groups.size(); ++i)
-        for (size_t k = 0; k + 1 < groups.size() - i; ++k)
-            if (groups[k].second < groups[k + 1].second)
-                std::swap(groups[k], groups[k + 1]);
+    std::sort(groups.begin(), groups.end(),
+              [](const std::pair<uint32_t, size_t>& x, const std::pair<uint32_t, size_t>& y) {
+                  return x.second > y.second;
+              });
 
     char buf[512];
     std::string j = "{\"status\":\"ok\",\"module\":\"";
@@ -858,14 +946,24 @@ std::string HeapObjectsToJson(const std::wstring& args) {
 // in memory, annotated with the module/offset when it lands inside a module and
 // with the distance to the nearest object header candidate.
 std::string FindValueToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxCount);
+    if (!a.error.empty()) return a.error;
 
     uint32_t value = 0;
     bool have = false;
     for (const std::wstring& p : a.positional) {
         if (p.find(L'.') != std::wstring::npos) { if (a.module.empty()) a.module = p; }
-        else if (!have) { value = (uint32_t)ParseHexToken(p); have = true; }
+        else if (!have) {
+            uintptr_t v = 0;
+            if (!ParseHexToken(p, &v) || v > 0xFFFFFFFFull) {
+                a.error = "{\"status\":\"error\",\"message\":\"invalid value\"}";
+                break;
+            }
+            value = (uint32_t)v;
+            have = true;
+        }
     }
+    if (!a.error.empty()) return a.error;
     if (!have) return "{\"status\":\"error\",\"message\":\"value required\"}";
 
     size_t scanned = 0;
@@ -892,13 +990,20 @@ std::string FindValueToJson(const std::wstring& args) {
 }
 
 std::string ByHwndToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxByHwndHits);
+    if (!a.error.empty()) return a.error;
 
     uintptr_t hwndVal = 0;
     for (const std::wstring& p : a.positional) {
         if (p.find(L'.') != std::wstring::npos) { if (a.module.empty()) a.module = p; }
-        else if (!hwndVal) hwndVal = ParseHexToken(p);
+        else if (!hwndVal) {
+            if (!ParseHexToken(p, &hwndVal) || hwndVal > 0xFFFFFFFFull) {
+                a.error = "{\"status\":\"error\",\"message\":\"invalid hwnd\"}";
+                break;
+            }
+        }
     }
+    if (!a.error.empty()) return a.error;
     if (!hwndVal) return "{\"status\":\"error\",\"message\":\"hwnd required\"}";
 
     // The window object from `findvalue` showed the vtable up to ~0x40 bytes
@@ -962,13 +1067,16 @@ std::string ByHwndToJson(const std::wstring& args) {
 }
 
 std::string AroundToJson(const std::wstring& args) {
-    ReArgs a = ParseReArgs(args);
+    ReArgs a = ParseReArgs(args, kMaxCount);
+    if (!a.error.empty()) return a.error;
     // around <hex-addr> [--count n] — the address is positional, as in xref.
     for (const std::wstring& p : a.positional) {
         if (p.find(L'.') != std::wstring::npos) continue;   // a module name
-        uintptr_t v = ParseHexToken(p);
+        uintptr_t v = 0;
+        if (!ParseHexToken(p, &v)) { BadAddress(a); break; }
         if (v) { a.addr = v; a.haveAddr = true; break; }
     }
+    if (!a.error.empty()) return a.error;
     if (!a.haveAddr) return "{\"status\":\"error\",\"message\":\"address required\"}";
 
     // Walk back a little so the caller sees the setup before the call.

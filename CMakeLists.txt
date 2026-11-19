@@ -182,6 +182,9 @@ add_executable(v8i_tests
     # state machines that the payload compiles into this binary as well.
     tests/unit_pending.cpp
     tests/unit_menu_patch.cpp
+    # The memory scanners walk the real address space of this process: the test
+    # places a real object and a real window and asks them to be found (A49).
+    tests/unit_memscan.cpp
     # The host side of the protocol lives in the host: the test plays the
     # payload, so it needs the real Client. The injector comes with it (the
     # client calls it), but the test never injects anything.

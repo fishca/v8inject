@@ -45,10 +45,13 @@ bool ModuleContains(const ModuleRange& m, uintptr_t addr) {
     return addr >= m.base && addr < m.base + m.size;
 }
 
-}  // namespace
-
-bool ModuleOfAddress(uintptr_t addr, std::wstring* name, uintptr_t* moduleRva) {
-    for (const ModuleRange& m : EnumModules()) {
+// The loader's module list is collected once per scan and passed down.
+// ModuleOfAddress used to call EnumModules for every hit, and EnumModules walks
+// the PEB lists and copies every path - on a scan with thousands of hits that
+// is the bulk of the work (docs/AUDIT.md A83).
+bool ModuleOfAddressIn(const std::vector<ModuleRange>& modules, uintptr_t addr,
+                       std::wstring* name, uintptr_t* moduleRva) {
+    for (const ModuleRange& m : modules) {
         if (!ModuleContains(m, addr)) continue;
         if (name) {
             const wchar_t* f = wcsrchr(m.path.c_str(), L'\\');
@@ -58,6 +61,12 @@ bool ModuleOfAddress(uintptr_t addr, std::wstring* name, uintptr_t* moduleRva) {
         return true;
     }
     return false;
+}
+
+}  // namespace
+
+bool ModuleOfAddress(uintptr_t addr, std::wstring* name, uintptr_t* moduleRva) {
+    return ModuleOfAddressIn(EnumModules(), addr, name, moduleRva);
 }
 
 std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes) {
@@ -82,6 +91,8 @@ std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes
     const size_t kChunk = 1u << 20;             // 1 MB windows
     const size_t kOverlap = needle.size() > 1 ? needle.size() - 1 : 0;
     std::vector<unsigned char> buf(kChunk + kOverlap);
+
+    const std::vector<ModuleRange> modules = EnumModules();
 
     uintptr_t addr = rangeBase;
     while (addr < rangeEnd) {
@@ -134,7 +145,7 @@ std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes
 
                 std::wstring mod;
                 uintptr_t rva = 0;
-                if (ModuleOfAddress(hit.address, &mod, &rva)) {
+                if (ModuleOfAddressIn(modules, hit.address, &mod, &rva)) {
                     hit.inModule = true;
                     hit.module = mod;
                 }
@@ -160,6 +171,12 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
     const uintptr_t lo = moduleBase;
     const uintptr_t hi = moduleBase + moduleSize;
     const bool anyModule = (moduleBase == 0);
+    const size_t kPtr = sizeof(void*);   // a vtable is a machine word on both builds
+
+    // One list for the whole scan: resolving every vtable candidate through
+    // EnumModules made the reverse walk re-walk the PEB lists (A83).
+    std::vector<ModuleRange> modules;
+    if (anyModule) modules = EnumModules();
 
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
@@ -170,6 +187,7 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
     // unreadable space in a way that loses committed memory.
     const size_t kChunk = 1u << 20;
     std::vector<unsigned char> buf(kChunk);
+    std::vector<unsigned char> backWindow;   // only for hits near a chunk start
     size_t regionCount = 0;
 
     while (addr < maxAddr && out.size() < maxHits) {
@@ -216,25 +234,48 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
             for (size_t off = 0; off + 4 <= got; off += 4) {
                 if (*(const uint32_t*)(buf.data() + off) != want) continue;
                 const uintptr_t hitAddr = cur + off;
-                if (hitAddr < hwndOffset + 0x100) continue;   // object would underflow
+                // The candidate object start must not slide into the first page.
+                if (hwndOffset > hitAddr || hitAddr - hwndOffset < 0x100) continue;
+
+                // The bytes before the handle are read once per hit, not once
+                // per candidate slot: the old walk issued ReadProcessMemory for
+                // every 4 bytes of every hit (docs/AUDIT.md A83).
+                const uintptr_t low = hitAddr - hwndOffset;
+                const unsigned char* window = nullptr;
+                if (off >= hwndOffset) {
+                    window = buf.data() + off - hwndOffset;   // fully in the chunk
+                } else {
+                    backWindow.resize(hwndOffset);
+                    SIZE_T backGot = 0;
+                    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)low,
+                                           backWindow.data(), hwndOffset, &backGot) ||
+                        backGot < hwndOffset) {
+                        continue;
+                    }
+                    window = backWindow.data();
+                }
 
                 uintptr_t bestSlot = 0;
-                uint32_t  bestVtable = 0;
+                uintptr_t bestVtable = 0;
                 size_t    bestDist = hwndOffset + 1;
                 std::wstring bestMod;
                 uintptr_t bestRva = 0;
 
-                for (size_t back = 0; back <= hwndOffset; back += 4) {
+                // A vtable pointer is a machine word and has to end at or
+                // before the handle slot. On x64 the old 4-byte read compared
+                // the low half of a 64-bit pointer against a 64-bit module
+                // range, so no object was ever found (docs/AUDIT.md A49).
+                for (size_t back = kPtr; back <= hwndOffset; back += 4) {
                     const uintptr_t slot = hitAddr - back;
-                    uint32_t vtable = 0;
-                    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)slot, &vtable, 4,
-                                           nullptr))
-                        continue;
+                    if ((slot & (kPtr - 1)) != 0) continue;   // pointer fields are aligned
+
+                    uintptr_t vtable = 0;
+                    memcpy(&vtable, window + (slot - low), kPtr);
 
                     std::wstring mod;
                     uintptr_t rva = 0;
                     if (anyModule) {
-                        if (!ModuleOfAddress(vtable, &mod, &rva)) continue;
+                        if (!ModuleOfAddressIn(modules, vtable, &mod, &rva)) continue;
                     } else if (vtable < lo || vtable >= hi) {
                         continue;
                     } else {
@@ -322,17 +363,23 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
             }
             totalScanned += got;
 
-            for (size_t off = 0; off + 4 <= got; off += 4) {
-                const uintptr_t vt = *(const uint32_t*)(buf.data() + off);
+            // A vtable pointer is a machine word: scanning every 4 bytes and
+            // reading 4 bytes found nothing on x64, where the image base is
+            // above 4 GB and the low half of every real pointer is below it
+            // (docs/AUDIT.md A49).
+            const size_t kPtr = sizeof(void*);
+            for (size_t off = 0; off + kPtr <= got; off += kPtr) {
+                uintptr_t vt = 0;
+                memcpy(&vt, buf.data() + off, kPtr);
                 if (vt <= lo || vt >= hi) continue;
 
                 // A real vtable holds pointers into the same module; demand at
                 // least three of the first four entries.
-                uint32_t slots[4] = {};
+                uintptr_t slots[4] = {};
                 if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)vt, slots, sizeof(slots),
                                        nullptr)) continue;
                 int inside = 0;
-                for (uint32_t v : slots) if ((uintptr_t)v > lo && (uintptr_t)v < hi) ++inside;
+                for (uintptr_t v : slots) if (v > lo && v < hi) ++inside;
                 if (inside < 3) continue;
 
                 HeapObject o;
