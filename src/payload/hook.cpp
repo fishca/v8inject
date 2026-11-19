@@ -9,6 +9,12 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+// x64 has no inline assembly, so the caller chain is unwound from a context
+// built from the hook frame; _AddressOfReturnAddress() is how that frame finds
+// its own return-address slot. The unwind itself uses the kernel32 unwind
+// primitives declared by winnt.h (RtlLookupFunctionEntry/RtlVirtualUnwind).
+#include <intrin.h>
+
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -49,6 +55,10 @@ constexpr size_t kTrampOffset = 64;
 
 constexpr size_t kTraceCapacity = 1024;
 
+// Caller frames recorded per trace slot. This is the budget of the frame walk
+// and of the JSON report: one number, so the walk can never outrun the record.
+constexpr int kMaxFrames = 24;
+
 #if defined(_M_X64)
 extern "C" void V8iThunkX64();
 #define V8I_THUNK V8iThunkX64
@@ -74,11 +84,12 @@ struct TraceSlot {
     uint64_t  tick;
     uintptr_t retAddr;
     uintptr_t args[4];
-    // Return-address chain of the caller frames (frame[0] is normally the
-    // same address as retAddr): maps WHO called the hooked function and their
-    // callers, each attributable to a module. Filled by walking the ebp/rbp
-    // chain from the frame pointer captured at hook entry.
-    uintptr_t frame[24];
+    // Return-address chain above the hooked function's caller: frame[0] is the
+    // address its caller returns to, frame[1] the address that frame returns
+    // to, and so on -- it maps WHO called the hooked function and their
+    // callers, each attributable to a module. Filled by WalkFramesX64 or
+    // WalkFramesX86, both of which truncate the chain instead of faulting.
+    uintptr_t frame[kMaxFrames];
     int       frameCount;
 };
 
@@ -330,6 +341,126 @@ size_t BuildTrampolineTail(uint8_t* at, uintptr_t resume) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
+// Caller chain (audit item A60)
+//
+// The record keeps up to kMaxFrames return addresses of the frames above the
+// hooked function. Two properties matter here:
+//
+//  * A range check is only a snapshot: IsReadable() asks the kernel about the
+//    protection right now, and the memory can still go away -- or the second
+//    word can sit past the end of the mapping -- before the read lands. So the
+//    walk lives in a POD-only helper under __try/__except: a fault truncates
+//    the chain instead of taking the host process down. POD-only because MSVC
+//    refuses __try in a function that needs C++ unwinding (C2712), and because
+//    a frame abandoned by SEH must not own C++ objects.
+//
+//  * On x64 rbp is not a frame pointer: MSVC addresses locals through rsp and
+//    keeps rbp as an ordinary callee-saved register, so the rbp captured at
+//    hook entry is an arbitrary value that must never be dereferenced as [rbp].
+//    The chain is unwound the way Windows unwinds its own: RtlLookupFunctionEntry
+//    plus RtlVirtualUnwind from the caller's context. Those are kernel32 exports
+//    (checked with dumpbin: kernel32.lib exports both for x64), so no extra
+//    library -- DbgHelp and StackWalk64 are not needed. x86 keeps the ebp walk.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+#if defined(_M_X64)
+
+// The stack frame hook_thunk_x64.asm builds between its `call V8iHookEnter` and
+// the hooked function's entry point: the thunk reserves 0x90 bytes and the stub
+// pushes the caller's rax. This is a layout contract with the .asm file, so the
+// walk validates it instead of trusting it: if the two no longer agree with the
+// real stack (a thunk that saves more registers, say), the return-address check
+// below fails and the chain is reported empty rather than walked over garbage.
+constexpr uintptr_t kX64ThunkFrame = 0x90;
+constexpr uintptr_t kX64StubPush   = sizeof(uintptr_t);
+
+// Fills out[] with the return addresses of the frames above the hooked
+// function's caller. `retSlot` is the address of V8iHookEnter's own return
+// address (_AddressOfReturnAddress, taken in V8iHookEnter itself -- inside this
+// helper it would be this helper's slot), `entryRb` is rbp at hook entry, which
+// is the caller's rbp at the call site.
+int WalkFramesX64(uintptr_t retAddr, uintptr_t retSlot, uintptr_t entryRb,
+                  uintptr_t* out, int maxFrames) {
+    int n = 0;
+    __try {
+        // The thunk's rsp at its `call V8iHookEnter` is one word above the slot
+        // that call wrote; the hooked function's entry rsp is kX64ThunkFrame
+        // plus the stub's push above that.
+        const uintptr_t entryRsp =
+            retSlot + sizeof(uintptr_t) + kX64ThunkFrame + kX64StubPush;
+        if (retAddr && IsReadable((const void*)entryRsp, sizeof(uintptr_t)) &&
+            *(const uintptr_t*)entryRsp == retAddr) {
+            // The caller's state at the instant its call to the hooked function
+            // returned: rip is where it resumes, rsp is what it has after the
+            // call popped the return address, rbp is the value it had at the
+            // call site (the hooked function's prologue has not run yet, and
+            // rbp is callee-saved, so the thunk's copy is that same value).
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            ctx.Rip = (DWORD64)retAddr;
+            ctx.Rsp = (DWORD64)(entryRsp + sizeof(uintptr_t));
+            ctx.Rbp = (DWORD64)entryRb;
+
+            for (; n < maxFrames; ++n) {
+                DWORD64 imageBase = 0;
+                PRUNTIME_FUNCTION fn =
+                    RtlLookupFunctionEntry((DWORD64)ctx.Rip, &imageBase, nullptr);
+                const DWORD64 frameRsp = ctx.Rsp;
+                if (fn) {
+                    PVOID handlerData = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, (DWORD64)ctx.Rip, fn,
+                                     &ctx, &handlerData, &establisher, nullptr);
+                } else {
+                    // No unwind data: treat it as a leaf frame, whose return
+                    // address is the first word of its stack frame.
+                    if (!IsReadable((const void*)(uintptr_t)ctx.Rsp, sizeof(uintptr_t))) break;
+                    ctx.Rip = *(const DWORD64*)(uintptr_t)ctx.Rsp;
+                    ctx.Rsp += sizeof(uintptr_t);
+                }
+                // A frame that does not move the stack up, or that unwinds to
+                // nothing, is the end of the usable chain.
+                if (ctx.Rsp <= frameRsp || !ctx.Rip) break;
+                out[n] = (uintptr_t)ctx.Rip;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Whatever was collected before the fault is the result: a truncated
+        // chain is the contract, a crash in the host process is not.
+    }
+    return n;
+}
+
+#else
+
+// x86: rbp is a real frame pointer, so the chain still walks the ebp records.
+// The range check covers both words a step reads -- [fp] and [fp+4] -- because
+// a frame record can straddle the end of a mapping, and virtual memory does not
+// guarantee that the second word is mapped just because the first one is.
+int WalkFramesX86(uintptr_t entryEb, uintptr_t* out, int maxFrames) {
+    int n = 0;
+    __try {
+        uintptr_t fp = entryEb;
+        for (; n < maxFrames; ++n) {
+            if (!fp || !IsReadable((const void*)fp, 2 * sizeof(uintptr_t))) break;
+            const uintptr_t next = *(const uintptr_t*)fp;
+            if (next <= fp || next > fp + 0x200000) break;  // must ascend, bounded
+            out[n] = *(const uintptr_t*)(fp + sizeof(uintptr_t));
+            fp = next;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Truncated chain, same contract as the x64 walk.
+    }
+    return n;
+}
+
+#endif
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // The recording entry point. Called from assembly on every hooked call.
 // ---------------------------------------------------------------------------
 
@@ -358,20 +489,21 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
     s.args[1] = a1;
     s.args[2] = a2;
     s.args[3] = a3;
-    // Walk the caller chain. The captured frame pointer is the hooked
-    // function's caller frame: [fp] = caller's caller fp, [fp+4] = the return
-    // address into the caller. Stop on unreadable memory or a frame that does
-    // not ascend (a frame-pointer-less caller yields garbage quickly, and one
-    // good frame is better than a crash).
+    // Walk the caller chain. Each architecture uses the mechanism it actually
+    // has: x64 unwinds through the exception directory from the caller's
+    // context, because there is no frame pointer to follow; x86 follows the ebp
+    // records. Both run inside a POD-only SEH frame, so a range check that went
+    // stale (or a frame record cut by the end of a mapping) costs the rest of
+    // the chain and nothing else.
     int n = 0;
-    uintptr_t fp = entryEb;
-    for (; n < 24; ++n) {
-        if (!fp || !IsReadable((const void*)fp, 8)) break;
-        uintptr_t next = *(const uintptr_t*)fp;
-        if (next <= fp || next > fp + 0x200000) break;  // must ascend, bounded
-        s.frame[n] = *(const uintptr_t*)(fp + sizeof(uintptr_t));
-        fp = next;
-    }
+#if defined(_M_X64)
+    // _AddressOfReturnAddress() has to be read here, in this function's frame:
+    // inside the helper it would name the helper's own return-address slot.
+    n = WalkFramesX64((uintptr_t)retAddr, (uintptr_t)_AddressOfReturnAddress(),
+                      entryEb, s.frame, kMaxFrames);
+#else
+    n = WalkFramesX86(entryEb, s.frame, kMaxFrames);
+#endif
     s.frameCount = n;
     InterlockedIncrement(&s.seq);                 // even: record complete
 
@@ -964,7 +1096,7 @@ std::string TraceCommandToJson(const std::wstring& args) {
              HexStr(a2) + "\",\"" + HexStr(a3) + "\"]";
         j += ",\"stack\":[";
         int fc = s.frameCount;
-        if (fc > 24) fc = 24;
+        if (fc > kMaxFrames) fc = kMaxFrames;
         for (int fi = 0; fi < fc; ++fi) {
             if (fi) j += ",";
             j += "\"" + HexStr(s.frame[fi]) + "\"";

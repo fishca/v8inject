@@ -107,6 +107,11 @@ foreach ($id in 1..4) {
 if ($out -notmatch '"args":\["0x1111"') { Fail "first argument not captured: $out" }
 if ($out -notmatch '"0x2222"')          { Fail "second argument not captured: $out" }
 if ($out -notmatch '"0x4444"')          { Fail "fourth argument not captured: $out" }
+# A60: the caller chain must not be empty. On x64 rbp is not a frame pointer,
+# so the old walk read [rbp] of an arbitrary value and either stopped at once
+# ("stack":[]) or -- when the value pointed at the last bytes of a mapping --
+# faulted in the target. A non-empty chain is the observable part of the fix.
+if ($out -notmatch '"stack":\["0x')     { Fail "caller chain is empty: $out" }
 if ($out -notmatch '"removed":4')       { Fail "unhook failed: $out" }
 
 # After the unhook the function runs natively again; the trace that starts with
