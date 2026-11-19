@@ -300,6 +300,12 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
 }
 }  // namespace
 
+// A67: a heap page can be freed between VirtualQuery and the read (1C
+// allocates constantly), so a scan must not dereference memory it has just
+// described as committed. Defined with the x86 scanner below; declared here
+// because the x64 scanners above are at namespace scope.
+static bool ReadPtrSafe(uintptr_t addr, uintptr_t* out);
+
 #if defined(_WIN64)
 // True when `vt` is a config.dll .rdata table whose slots 3..40 point into
 // config.dll .text — the shape shared by the ITopLevelFrame vtable family.
@@ -372,7 +378,8 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
                                       ? 64 * 1024 * 1024 : (uintptr_t)mi.RegionSize;
             for (uintptr_t p = (uintptr_t)mi.BaseAddress;
                  p < (uintptr_t)mi.BaseAddress + cap; p += sizeof(void*)) {
-                uintptr_t v = *(uintptr_t*)p;
+                uintptr_t v = 0;
+                if (!ReadPtrSafe(p, &v)) continue;
                 if (v < rdataLo || v >= rdataHi) continue;
                 if (!X64FrameVtValid(cfg, v)) continue;
                 objs.push_back(p);
@@ -392,15 +399,18 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
     static const uintptr_t kRecvOffs[] = {0x20, 0x10, 0x18, 0x28, 0x30, 0x38, 0x40, 0x08};
     uintptr_t fallbackObj = 0, fallbackOff = 0;
     for (uintptr_t obj : objs) {
-        uintptr_t core = *(uintptr_t*)(obj + sizeof(void*));
+        uintptr_t core = 0;
+        if (!ReadPtrSafe(obj + sizeof(void*), &core) || !core) continue;
         if (!IsReadable((void*)core, sizeof(void*))) continue;
         for (uintptr_t off : kRecvOffs) {
             uintptr_t recv = core - off;
             if (!IsReadable((void*)recv, sizeof(void*))) continue;
-            uintptr_t recvVt = *(uintptr_t*)recv;
+            uintptr_t recvVt = 0;
+            if (!ReadPtrSafe(recv, &recvVt)) continue;
             if (!IsReadable((void*)recvVt, 6 * sizeof(void*))) continue;
             if (!insideModule(recvVt)) continue;
-            uintptr_t tr = ((uintptr_t*)recvVt)[3];
+            uintptr_t tr = 0;
+            if (!ReadPtrSafe(recvVt + 3 * sizeof(void*), &tr)) continue;
             if (!insideModule(tr)) continue;
             if (!IsReadable((void*)tr, 32)) continue;
             if (*(const unsigned char*)tr == 0xCC) continue;   // int3 padding, not code
@@ -808,6 +818,12 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    // Restoring "our own proc as the original" would make CallWindowProcW call
+    // V8iSubclass85 again: the first ordinary message after that is an endless
+    // recursion (0xC00000FD) in the UI thread of 1C. Ownership is enforced
+    // where the subclass is installed; this is the last line of defence.
+    if (g85_origWndProc && g85_origWndProc == (WNDPROC)V8iSubclass85)
+        return DefWindowProcW(h, m, w, l);
     return g85_origWndProc ? CallWindowProcW(g85_origWndProc, h, m, w, l) : 0;
 }
 
@@ -833,20 +849,38 @@ static void V8iResolveCore85Proc(uintptr_t* outBase, uint32_t* outRva);
 // Runs the subscribe attempt on the UI thread of the given window: the
 // subclass is installed for the duration of one message, so the platform
 // code runs on its own thread. The early path (the CBT hook, the inline
-// CreateWindowExW hook) and the polling watcher can both reach this point,
-// hence the lock: an overlapping attempt would capture the subclass proc as
-// the "original" one and leave the window subclassed for good.
+// CreateWindowExW hook), the polling watcher and "cmdinfo" can all reach this
+// point, hence the lock: an overlapping attempt would capture the subclass proc
+// as the "original" one and leave the window subclassed for good.
+//
+// A44: this function is the only owner of the subclass. "cmdinfo" used to do
+// the same SetWindowLongPtrW dance by hand, bypassing both the lock and this
+// check, while its own startup watcher installed the same subclass through
+// here - the race captured V8iSubclass85 as g85_origWndProc, i.e. a window
+// proc calling itself.
 static volatile LONG g_subclassBusy = 0;
-static void V8iSubscribeOnUiThread(HWND h) {
-    if (!h) return;
-    if (InterlockedCompareExchange(&g_subclassBusy, 1, 0) != 0) return;
-    WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)V8iSubclass85);
-    if (old) {
-        g85_origWndProc = old;
-        SendMessageW(h, WM_APP + 0x602, 0, 0);
-        SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
+static bool V8iSubscribeOnUiThread(HWND h) {
+    if (!h) return false;
+    if (InterlockedCompareExchange(&g_subclassBusy, 1, 0) != 0) return false;
+    bool installed = false;
+    // Ask before setting: if the window already carries our proc (an earlier
+    // attempt that has not been restored, or a concurrent one that won), there
+    // is nothing to install and nothing to restore.
+    WNDPROC cur = (WNDPROC)GetWindowLongPtrW(h, GWLP_WNDPROC);
+    if (cur && cur != (WNDPROC)V8iSubclass85) {
+        WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)V8iSubclass85);
+        if (old == (WNDPROC)V8iSubclass85) {
+            // Somebody else installed it between the two calls: leave it alone,
+            // it will be restored by its owner.
+        } else if (old) {
+            g85_origWndProc = old;
+            installed = true;
+            SendMessageW(h, WM_APP + 0x602, 0, 0);
+            SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
+        }
     }
     InterlockedExchange(&g_subclassBusy, 0);
+    return installed;
 }
 
 static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
@@ -1186,9 +1220,10 @@ static bool V8iCaptureRecv85Late() {
                                       ? 64 * 1024 * 1024 : (uintptr_t)mi.RegionSize;
             for (uintptr_t p = (uintptr_t)mi.BaseAddress;
                  p < (uintptr_t)mi.BaseAddress + cap; p += sizeof(void*)) {
-                if (*(uintptr_t*)p != kFrameVtbl) continue;
-                uintptr_t fvt = *(uintptr_t*)p;
-                uintptr_t fn31 = ((uintptr_t*)fvt)[31];
+                uintptr_t fvt = 0;
+                if (!ReadPtrSafe(p, &fvt) || fvt != kFrameVtbl) continue;
+                uintptr_t fn31 = 0;
+                if (!ReadPtrSafe(fvt + 31 * sizeof(void*), &fn31)) continue;
                 if (!fn31 || !IsReadable((void*)fn31, 1) || !insideCfg(fn31)) continue;
 
                 HWND cmdHwnd = nullptr;
@@ -1653,8 +1688,16 @@ static void V8iObserveCreateWindow(uintptr_t a0, uintptr_t a1, uintptr_t a2, uin
     // The class of the designer's main frame. On 8.5 it is "V8TopLevelFrame"
     // (the CBT dump of a live Configurator shows it), and such a window is
     // created on the UI thread - the only thread allowed to call core85.
+    //
+    // A43: lpClassName is not necessarily a string pointer. Win32 allows an
+    // atom (MAKEINTATOM), and 8.5 really does create its frame with a numeric
+    // class, so wcsncmp on 0x8002 is an AV on the UI thread of 1C. The same
+    // guard as the CBT hook above: a pointer-shaped value and a readable
+    // buffer are the minimum before the class can be compared.
     const wchar_t* cls = (const wchar_t*)a1;
-    if (!cls) return;
+    if (!cls || cls <= (const wchar_t*)0x10000) return;
+    constexpr size_t kClassBytes = 96;
+    if (!IsReadable(cls, kClassBytes)) return;
     if (wcsncmp(cls, L"V8TopLevelFrame", 15) != 0 &&
         wcsncmp(cls, L"V8Window0", 9) != 0) return;
     if (InterlockedExchange(&g_cwTriggered, 1) != 0) return;
@@ -1849,10 +1892,12 @@ std::string CmdInfoToJsonA() {
                                                                  : (uintptr_t)mi.RegionSize;
                 for (uintptr_t p = (uintptr_t)mi.BaseAddress;
                      p + 16 < (uintptr_t)mi.BaseAddress + cap; p += 8) {
-                    uintptr_t vt = *(uintptr_t*)p;
+                    uintptr_t vt = 0;
+                    if (!ReadPtrSafe(p, &vt)) continue;
                     const MR* mf = inSpan(fam, vt);
                     if (!mf) continue;
-                    uintptr_t core = *(uintptr_t*)(p + 8);
+                    uintptr_t core = 0;
+                    if (!ReadPtrSafe(p + 8, &core)) continue;
                     const MR* mc = inSpan(cores, core);
                     if (!mc) continue;
                     if (!firstS) j += ",";
@@ -1870,10 +1915,12 @@ std::string CmdInfoToJsonA() {
                         for (int off = 0x08; off <= 0x60; off += 4) {
                             uintptr_t recv = core - off;
                             if (!IsReadable((void*)recv, 16)) continue;
-                            uintptr_t vtr = *(uintptr_t*)recv;
+                            uintptr_t vtr = 0;
+                            if (!ReadPtrSafe(recv, &vtr)) continue;
                             const MR* mr = inSpan(fam, vtr);
                             if (!mr) continue;
-                            uintptr_t slot3 = ((uintptr_t*)vtr)[3];
+                            uintptr_t slot3 = 0;
+                            if (!ReadPtrSafe(vtr + 3 * sizeof(void*), &slot3)) continue;
                             std::string smod;
                             unsigned long long srva = modRva(slot3, smod);
                             if (!firstR2) j += ",";
@@ -2122,13 +2169,12 @@ std::string CmdInfoToJsonA() {
                 if (uiWin) {
                     dbgUiWin = 1;
                     g85_uiWin = (uintptr_t)uiWin;
-                    g85_origWndProc = (WNDPROC)SetWindowLongPtrW(uiWin, GWLP_WNDPROC,
-                                                                (LONG_PTR)V8iSubclass85);
-                    if (g85_origWndProc) {
-                        dbgCc = 1;
-                        SendMessageW(uiWin, WM_APP + 0x602, 0, 0);
-                        SetWindowLongPtrW(uiWin, GWLP_WNDPROC, (LONG_PTR)g85_origWndProc);
-                    }
+                    // A44: the subclass is installed only by its owner. This
+                    // used to be a hand-written SetWindowLongPtrW pair, racing
+                    // the startup watcher armed just above; losing that race
+                    // left g85_origWndProc == V8iSubclass85 (a window proc
+                    // calling itself, 0xC00000FD on the first message).
+                    dbgCc = V8iSubscribeOnUiThread(uiWin) ? 1 : 0;
                 }
                 dbgDone = g85_proc ? 1 : 0;
                 std::string pm, sm, sm2, sm3, sm4;
