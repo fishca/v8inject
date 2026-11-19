@@ -190,11 +190,12 @@ void InjectOne(DWORD pid, bool is64) {
         if (ok && resp.find("visible") == std::string::npos)
             Log(L"gitbar strange reply: " + Utf8ToWide(resp.substr(0, 120)));
     }
-    c.Close(3000);
+    if (!c.Close(3000))
+        Log(L"close pid=" + std::to_wstring(pid) + L" not clean: " + c.LastError());
 }
 
-// The Client dtor does NOT ask the payload to unload, so the GitBar window
-// (and hooks) survive the session close -- exactly like one-shot CLI runs.
+// The payload leaves its command loop when the session closes; the GitBar window
+// it installed (and the hooks) survive that, exactly like one-shot CLI runs.
 
 void Poll() {
     auto procs = v8i::ListProcesses();
@@ -273,7 +274,8 @@ void ShowTrayMenu() {
             if (c.Open(p.pid, PayloadFor(p.is64), ExeDir(), 8000)) {
                 std::string r;
                 c.Call(L"gitbar", r, 8000);
-                c.Close(3000);
+                if (!c.Close(3000))
+                    Log(L"gitbar close not clean: " + std::wstring(c.LastError()));
             }
         }
         break;

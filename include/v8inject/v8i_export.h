@@ -20,7 +20,21 @@ namespace v8i {
 //
 // Returns 0 when the loop ends normally (the host asked the payload to
 // leave), a negative value when it could not start.
+//
+// The loop also watches the host process named in the block: a payload must not
+// outlive its host, or its block keeps the next host out with
+// ERROR_ALREADY_EXISTS forever (A45).
 int V8iRunCommandLoop(SharedIo* io);
+
+// Publishes one reply into the block, if and only if the request it answers is
+// still the one the host waits for: `requestSeq` must match the block's seq and
+// the state must still be "request". A host that timed out has taken the state
+// word back, and a later request carries its own sequence, so a stale reply is
+// dropped instead of being handed to the next command (A45).
+//
+// Exposed so the protocol tests check the host against the real publish rule
+// instead of a simplified copy of it. Returns true when the reply was published.
+bool V8iPublishReply(SharedIo* io, LONG requestSeq, const char* data, size_t len);
 
 // The command receiver of the main frame, for the native-menu hooks
 // (src/payload/mainmenu.cpp). Runs the same discovery and live hasHandler

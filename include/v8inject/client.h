@@ -24,26 +24,55 @@ public:
     // whoever answers the block may be anywhere. The tests use it with their
     // own fake payload; the production path is Open() = OpenBlock() plus the
     // injection and the handshake.
+    //
+    // A block that already exists is only reused when the host that created it
+    // is gone (a crashed host leaves its payload behind, and that payload is
+    // on its way out once it notices -- A45). A live host is refused.
     bool OpenBlock(uint32_t pid, const std::wstring& logDir);
 
     // Sends one command and returns the raw JSON reply.
-    // Returns false on timeout or protocol error.
+    //
+    // A command that runs past timeoutMs gets a grace period of the same length
+    // (capped) before it is declared lost: the heavy scans finish a little late
+    // more often than they never finish, and a late answer is still the right
+    // one. A command that is really lost does not kill the session: the state
+    // word is taken back, the payload drops its late reply, and the next Call
+    // works normally (A45).
     bool Call(const std::wstring& command, std::string& response, int timeoutMs = 15000);
 
     // Asks the payload to unload and waits for it.
-    void Close(int timeoutMs = 5000);
+    //
+    // Returns true only when the payload confirmed it left (the injected thread
+    // ended). A payload that is still inside a long command is told to leave and
+    // will do so once the command returns; the call reports that as a failure
+    // with LastError() explaining it, instead of freeing the handles silently
+    // (A45).
+    bool Close(int timeoutMs = 5000);
 
     bool IsOpen() const { return hMap_ != nullptr; }
     LONG LastDiag() const { return lastDiag_; }
     int  LastStage() const { return lastStage_; }
     DWORD LastWin32Error() const { return lastWin32_; }
-    // Last handshake failure text, empty when Open succeeded.
+    // Last refusal text: a failed Open/OpenBlock, a refused or timed-out Call,
+    // a Close that could not confirm the payload left. Empty after a success.
     const wchar_t* LastError() const { return lastError_; }
     const wchar_t* SharedName() const { return sharedName_; }
 
 private:
-    bool WaitForState(LONG expected, int timeoutMs);
-    void ReleaseHandles();
+    // Outcome of waiting for the payload's reply.
+    enum class Await {
+        arrived,   // the reply of this request is in the block
+        timeout,   // nothing arrived within the budget
+        lost,      // the payload left (exit state) and will not answer
+        foreign,   // somebody else's reply: wrong sequence number
+    };
+
+    Await AwaitResponse(int timeoutMs, LONG expectedSeq);
+    void  TakeResponse(std::string& response);
+    bool  WaitForState(LONG expected, int timeoutMs);
+    bool  WaitThreadExit(int timeoutMs);
+    void  ReleaseHandles();
+    void  SetErrorText(const wchar_t* fmt, ...);
 
     HANDLE        hMap_ = nullptr;
     SharedIo*     io_   = nullptr;
@@ -56,5 +85,12 @@ private:
     wchar_t       lastError_[256] = {};
     wchar_t       sharedName_[64] = {};
 };
+
+// Checks the protocol handshake of a block the payload answered: returns an
+// empty string when the payload speaks this build's protocol, or the text to
+// show the user when the target still runs a payload of another build (A96).
+// The payload stamps its version only after accepting the block, so a payload
+// that predates the check answers the handshake and leaves the stamp at 0.
+std::wstring CheckProtocolHandshake(const SharedIo* io);
 
 }  // namespace v8i

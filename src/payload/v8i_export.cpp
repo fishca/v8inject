@@ -29,6 +29,12 @@ namespace {
 
 SharedIo* g_io = nullptr;
 
+// Sequence number of the request the payload is answering right now. The command
+// loop is single-threaded, so a plain variable is enough; PutResponse publishes
+// the reply only while that same request is still the one the host waits for
+// (A45).
+LONG g_curSeq = 0;
+
 // Log folder comes from the shared block, so host and payload always agree.
 void InitPayloadLog(const wchar_t* dirFromBlock) {
     if (dirFromBlock && dirFromBlock[0]) {
@@ -48,14 +54,21 @@ void InitPayloadLog(const wchar_t* dirFromBlock) {
     }
 }
 
-void PutResponse(const std::string& json) {
-    if (!g_io) return;
+// The "loaded" reply of the handshake is not an answer to a request -- nothing
+// has been posted yet -- so it is published unconditionally. The sequence stamp
+// plays no part in it: the host takes the reply and puts the word back to idle.
+void PublishHandshakeReply(SharedIo* io, const std::string& json) {
+    if (!io) return;
     size_t n = json.size();
     if (n > kResponseBytes - 1) n = kResponseBytes - 1;
-    memcpy(g_io->response, json.data(), n);
-    g_io->response[n] = 0;
-    InterlockedExchange((volatile LONG*)&g_io->responseLen, (LONG)n);
-    InterlockedExchange((volatile LONG*)&g_io->ready, kStateResponse);
+    memcpy(io->response, json.data(), n);
+    io->response[n] = 0;
+    InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)n);
+    InterlockedExchange((volatile LONG*)&io->ready, kStateResponse);
+}
+
+bool PutResponse(const std::string& json) {
+    return g_io && V8iPublishReply(g_io, g_curSeq, json.data(), json.size());
 }
 
 // A41: the address comes from the command line, so it may point at anything at
@@ -237,6 +250,38 @@ static std::string Guarded(const wchar_t* what, CommandFn fn, const std::wstring
 
 }  // namespace
 
+bool v8i::V8iPublishReply(SharedIo* io, LONG requestSeq, const char* data, size_t len) {
+    if (!io || !data) return false;
+
+    // The host owns the state word from idle to request; a reply may only be
+    // published while that same request is still the current one. Checked
+    // before the buffer is touched: a host that timed out has already taken the
+    // word back, and the next request owns `response` now (A45).
+    if (InterlockedCompareExchange((volatile LONG*)&io->ready, 0, 0) != kStateRequest) return false;
+    if (InterlockedCompareExchange((volatile LONG*)&io->seq, 0, 0) != requestSeq) {
+        LogLine("reply for seq %ld dropped: the host moved on to %ld",
+                (long)requestSeq, (long)io->seq);
+        return false;
+    }
+
+    const size_t n = len > kResponseBytes - 1 ? kResponseBytes - 1 : len;
+    memcpy(io->response, data, n);
+    io->response[n] = 0;
+    InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)n);
+    InterlockedExchange((volatile LONG*)&io->respSeq, requestSeq);
+
+    // Request -> Response, not a blind store: when the host reset the word (or
+    // the host-gone watchdog did) between the check and here, the reply is
+    // dropped and the state stays what the host chose. The other order cannot
+    // lose an exit: the watchdog's plain store always wins over this CAS.
+    if (InterlockedCompareExchange((volatile LONG*)&io->ready, kStateResponse, kStateRequest) !=
+        kStateRequest) {
+        LogLine("reply for seq %ld dropped: state changed while publishing", (long)requestSeq);
+        return false;
+    }
+    return true;
+}
+
 V8I_API int V8I_CALL v8i_version() {
     return 1;
 }
@@ -248,11 +293,23 @@ static int RunPayload(const wchar_t* sharedName) {
     if (!hMap) {
         InitPayloadLog(nullptr);
         LogLine("OpenFileMapping(%ls) failed, win32=%lu", sharedName, GetLastError());
-        return -2;
+        return kDiagNoBlock;
     }
 
     g_io = (SharedIo*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedIo));
-    if (!g_io) { CloseHandle(hMap); return -3; }
+    if (!g_io) {
+        // The block is smaller than this build's SharedIo: it was created by a
+        // host of an older protocol. There is nothing to write the reason into
+        // -- that is the mismatch -- so it only reaches the log and the host
+        // sees "no reply".
+        const DWORD err = GetLastError();
+        CloseHandle(hMap);
+        InitPayloadLog(nullptr);
+        LogLine("MapViewOfFile(%ls, %llu) failed, win32=%lu: the block was created "
+                "by a host of another protocol version", sharedName,
+                (unsigned long long)sizeof(SharedIo), err);
+        return kDiagNoView;
+    }
 
     InitPayloadLog(g_io->logDir);
     HookInstallFaultLogger();
@@ -260,12 +317,29 @@ static int RunPayload(const wchar_t* sharedName) {
             sizeof(void*) == 8 ? "x64" : "x86");
     LogLine("MapViewOfFile -> %p", (void*)g_io);
 
+    // A96: refuse a block laid out for another protocol before promising
+    // anything. The host stamps the version it created the block for; the stamp
+    // this payload echoes is what tells the host which build answered.
+    const LONG hostAbi = g_io->abiVersion;
+    const LONG hostSize = g_io->structSize;
+    if (hostAbi != kProtocolAbi || hostSize != (LONG)sizeof(SharedIo)) {
+        LogLine("protocol mismatch: block speaks abi=%ld size=%ld, payload speaks "
+                "abi=%ld size=%d", hostAbi, hostSize, kProtocolAbi, (int)sizeof(SharedIo));
+        InterlockedExchange((volatile LONG*)&g_io->diag, kDiagAbiMismatch);
+        InterlockedExchange((volatile LONG*)&g_io->ready, kStateExit);
+        UnmapViewOfFile(g_io);
+        g_io = nullptr;
+        CloseHandle(hMap);
+        return kDiagAbiMismatch;
+    }
+    InterlockedExchange((volatile LONG*)&g_io->payloadAbi, kProtocolAbi);
+
     // Native «GitBar» item in the Configurator menu (8.3.27/8.5 layout, see
     // src/payload/mainmenu.cpp). Outside 1C (the tests) this is a no-op.
     if (V8iIsTargetProcess()) v8i::V8iStartNativeMenu();
 
     // Report readiness before anything that can fail.
-    PutResponse("{\"status\":\"loaded\"}");
+    PublishHandshakeReply(g_io, "{\"status\":\"loaded\"}");
 
     const int rc = V8iRunCommandLoop(g_io);
     UnmapViewOfFile(g_io);
@@ -274,11 +348,59 @@ static int RunPayload(const wchar_t* sharedName) {
     return rc;
 }
 
+// A45: a payload must not outlive its host. The host's pid is in the block; when
+// that process is gone nobody reads a reply any more, and the named block keeps
+// the next host out with ERROR_ALREADY_EXISTS for good. The watchdog asks the
+// command loop to leave instead, which releases the mapping (and with it the
+// block) once the running command returns.
+struct HostWatch {
+    HANDLE host = nullptr;   // SYNCHRONIZE on the host process
+    HANDLE stop = nullptr;   // set by the loop before it unmaps the block
+    SharedIo* io = nullptr;
+};
+
+static DWORD WINAPI HostGoneThread(LPVOID arg) {
+    HostWatch* w = (HostWatch*)arg;
+    HANDLE waits[2] = { w->stop, w->host };
+    const DWORD r = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+    if (r == WAIT_OBJECT_0 + 1) {
+        LogLine("host process is gone: asking the command loop to leave");
+        // A plain store, not a CAS: the loop must see it whatever state the word
+        // is in. A reply that is being published loses against it, which is the
+        // point -- nobody reads that reply any more.
+        InterlockedExchange((volatile LONG*)&w->io->ready, kStateExit);
+    }
+    return 0;
+}
+
 int v8i::V8iRunCommandLoop(SharedIo* io) {
     if (!io) return -1;
     g_io = io;
 
-    LogLine("waiting for commands, ready=%ld", (long)g_io->ready);
+    HostWatch watch;
+    watch.io = io;
+    const DWORD hostPid = (DWORD)InterlockedCompareExchange((volatile LONG*)&io->hostPid, 0, 0);
+    if (hostPid) {
+        watch.host = OpenProcess(SYNCHRONIZE, FALSE, hostPid);
+        if (!watch.host) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_INVALID_PARAMETER) {
+                // The host died before the payload got here: nothing will ever
+                // be read from this block, so leave right away.
+                LogLine("host pid %lu is already gone: leaving", hostPid);
+                InterlockedExchange((volatile LONG*)&io->ready, kStateExit);
+            } else {
+                LogLine("cannot watch host pid %lu (win32=%lu): the payload will "
+                        "not notice the host leaving", hostPid, err);
+            }
+        }
+    }
+    watch.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE watcher = nullptr;
+    if (watch.host && watch.stop)
+        watcher = CreateThread(nullptr, 0, HostGoneThread, &watch, 0, nullptr);
+
+    LogLine("waiting for commands, ready=%ld hostPid=%lu", (long)g_io->ready, hostPid);
     for (;;) {
         // The state word is read through an interlocked operation: it is the
         // acquire barrier that pairs with the host's release store of the
@@ -290,7 +412,12 @@ int v8i::V8iRunCommandLoop(SharedIo* io) {
             Sleep(15);
             continue;
         }
-        LogLine("command received: %ls (ready=%ld)", g_io->request, (long)state);
+        // The reply of this request is published only while it is still the
+        // current one: the host may have given up on it and posted another
+        // request meanwhile (A45).
+        g_curSeq = (LONG)InterlockedCompareExchange((volatile LONG*)&g_io->seq, 0, 0);
+        LogLine("command received: %ls (ready=%ld seq=%ld)", g_io->request, (long)state,
+                (long)g_curSeq);
         if (wcscmp(g_io->request, L"exit") == 0) break;
 
         if (wcscmp(g_io->request, L"version") == 0) {
@@ -510,6 +637,16 @@ int v8i::V8iRunCommandLoop(SharedIo* io) {
         LogLine("response sent, %zu bytes", rep.funcs.size());
     }
 
+    // Stop the host watch before the caller unmaps the block: the watchdog
+    // touches the state word, so it must be gone before the view is.
+    if (watch.stop) SetEvent(watch.stop);
+    if (watcher) {
+        WaitForSingleObject(watcher, INFINITE);
+        CloseHandle(watcher);
+    }
+    if (watch.stop) CloseHandle(watch.stop);
+    if (watch.host) CloseHandle(watch.host);
+
     // Hooks must be gone before the DLL that owns their thunks is unloaded.
     {
         size_t removed = HookRemoveAll();
@@ -533,16 +670,11 @@ static volatile LONG g_probeActive = 0;
 // reply through a private mapping of the same block.
 static int ReportLoadedOnly(const wchar_t* sharedName) {
     HANDLE hMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, sharedName);
-    if (!hMap) return -2;
+    if (!hMap) return kDiagNoBlock;
     SharedIo* io = (SharedIo*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0,
                                             sizeof(SharedIo));
-    if (!io) { CloseHandle(hMap); return -3; }
-    static const char kLoaded[] = "{\"status\":\"loaded\"}";
-    const size_t n = sizeof(kLoaded) - 1;
-    memcpy(io->response, kLoaded, n);
-    io->response[n] = 0;
-    InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)n);
-    InterlockedExchange((volatile LONG*)&io->ready, kStateResponse);
+    if (!io) { CloseHandle(hMap); return kDiagNoView; }
+    PublishHandshakeReply(io, "{\"status\":\"loaded\"}");
     UnmapViewOfFile(io);
     CloseHandle(hMap);
     return 0;

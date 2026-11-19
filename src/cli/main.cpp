@@ -116,6 +116,7 @@ Options ParseOptions(int argc, wchar_t** argv, int first) {
 // Defined below RunWatch; declared here so the watch block can use them.
 DWORD ResolvePid(int argc, wchar_t** argv, const wchar_t* exe);
 void PrintOpenFailure(v8i::Client& client, const Options& o);
+void CloseSession(v8i::Client& client);
 
 // Console output must be wide: the payload speaks UTF-8, and %hs would try to
 // interpret that as the active ANSI code page (866/1251), producing mojibake.
@@ -176,7 +177,7 @@ int RunWatch(int argc, wchar_t** argv) {
     if (!client.Call(L"hook kernel32.dll!CreateFileW --name cfw", resp, 30000) ||
         resp.find("\"status\":\"ok\"") == std::string::npos) {
         wprintf(L"watch: hook failed: %ls\n", Utf8ToWide(resp).c_str());
-        client.Close();
+        CloseSession(client);
         return 5;
     }
     // Parse the allocated hook id: it is 1 after unhook all, but read it
@@ -309,7 +310,7 @@ int RunWatch(int argc, wchar_t** argv) {
         Sleep(250);
     }
 
-    client.Close();
+    CloseSession(client);
     return 0;
 }
 
@@ -323,6 +324,19 @@ void PrintOpenFailure(v8i::Client& client, const Options& o) {
     v8i::LogLine("handshake FAILED stage=%d win32=%lu diag=%ld",
                  client.LastStage(), client.LastWin32Error(), client.LastDiag());
     wprintf(L"log    : %ls\n", v8i::GetLogPath());
+}
+
+// A45: Close reports whether the payload confirmed it left. A command that is
+// still running inside the target cannot be interrupted, so the payload is told
+// to leave and leaves when the command returns -- the user has to be told that
+// instead of seeing a silent success. On stderr: several commands write JSON on
+// stdout and a warning line there would break the readers of that JSON.
+void CloseSession(v8i::Client& client) {
+    if (client.Close()) return;
+    const wchar_t* why = client.LastError();
+    fwprintf(stderr, L"warning: session not closed cleanly: %ls\n",
+             why && why[0] ? why : L"the payload did not confirm the exit");
+    v8i::LogLine("close FAILED: %ls", why);
 }
 
 // Target selection. A name picks the first process with that image; --pid picks
@@ -377,7 +391,7 @@ int RunPayloadCommand(const wchar_t* cmdName, const wchar_t* exe,
     std::string resp;
     bool ok = client.Call(request, resp, timeoutMs);
     wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
-    client.Close();
+    CloseSession(client);
     return ok ? 0 : 5;
 }
 
@@ -414,7 +428,7 @@ int wmain(int argc, wchar_t** argv) {
         bool ok = client.Call(L"objects", resp, o.timeoutMs);
         wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         wprintf(L"log   : %ls\n", v8i::GetLogPath());
-        client.Close();
+        CloseSession(client);
         return ok ? 0 : 5;
     }
 
@@ -441,7 +455,7 @@ int wmain(int argc, wchar_t** argv) {
         std::string resp;
         bool ok = client.Call(request, resp, 120000);
         wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
-        client.Close();
+        CloseSession(client);
         return ok ? 0 : 5;
     }
 
@@ -501,7 +515,7 @@ int wmain(int argc, wchar_t** argv) {
         std::string resp;
         bool ok = client.Call(request, resp, o.timeoutMs);
         wprintf(L"reply : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
-        client.Close();
+        CloseSession(client);
         return ok ? 0 : 5;
     }
 
@@ -557,7 +571,7 @@ int wmain(int argc, wchar_t** argv) {
             fflush(stdout);
         }
 
-        client.Close();
+        CloseSession(client);
         return 0;
     }
 
@@ -659,7 +673,7 @@ int wmain(int argc, wchar_t** argv) {
         v8i::Client client;
         bool ok = client.Open(pi.dwProcessId, o.dll, ExeDir(), o.timeoutMs);
         wprintf(L"launched pid=%lu inject=%s\n", pi.dwProcessId, ok ? L"ok" : L"FAILED");
-        if (ok) client.Close();
+        if (ok) CloseSession(client);
         DWORD wait = WaitForSingleObject(pi.hProcess, 8000);
         if (wait == WAIT_OBJECT_0) {
             DWORD ec = 0;
@@ -709,7 +723,7 @@ int wmain(int argc, wchar_t** argv) {
         wprintf(L"session    : %s\n", client.SharedName());
         wprintf(L"reply      : %ls\n", ok ? Utf8ToWide(resp).c_str() : L"<no reply>");
         wprintf(L"log        : %ls\n", v8i::GetLogPath());
-        client.Close();
+        CloseSession(client);
         return ok ? 0 : 5;
     }
 
@@ -748,7 +762,7 @@ int wmain(int argc, wchar_t** argv) {
 
         std::string resp;
         bool ok = client.Call(request, resp, o.timeoutMs);
-        client.Close();
+        CloseSession(client);
 
         if (!ok) { wprintf(L"no reply from payload\n"); return 5; }
         fwrite(resp.data(), 1, resp.size(), stdout);

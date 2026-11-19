@@ -528,8 +528,13 @@ void DoInject() {
 void DoDetach() {
     if (!g_client.IsOpen()) return;
     Log(L"Отключаюсь...");
-    g_client.Close();
-    Log(L"Сессия закрыта");
+    // A45: a command that is still running inside the target keeps the payload
+    // alive until it returns; say so instead of reporting a clean detach.
+    if (g_client.Close()) {
+        Log(L"Сессия закрыта");
+    } else {
+        Log(std::wstring(L"Сессия закрыта не полностью: ") + g_client.LastError());
+    }
     SetStatus(L"Не подключено");
     EnableWindow(GetDlgItem(g_hwnd, kIdSend), FALSE);
     EnableWindow(GetDlgItem(g_hwnd, kIdDetach), FALSE);
