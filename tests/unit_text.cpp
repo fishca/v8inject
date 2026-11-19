@@ -114,3 +114,20 @@ V8I_TEST(Text_UnescapeStrValue) {
     CHECK_EQ(UnescapeStrValue("\\uZZZZ"), std::wstring(L"\\uZZZZ"));
     CHECK_EQ(UnescapeStrValue("\\u041"), std::wstring(L"\\u041"));
 }
+
+// A82: one implementation of the CommandLineToArgvW quoting rules, shared by
+// the git runner and by the autostart Run value of the tray agent.
+V8I_TEST(Text_QuoteArgQuotesOnlyWhenNeeded) {
+    CHECK_EQ(QuoteArg(L""), std::wstring(L"\"\""));
+    CHECK_EQ(QuoteArg(L"plain"), std::wstring(L"plain"));
+    CHECK_EQ(QuoteArg(L"--name"), std::wstring(L"--name"));
+    CHECK_EQ(QuoteArg(L"a b"), std::wstring(L"\"a b\""));
+    CHECK_EQ(QuoteArg(L"a\tb"), std::wstring(L"\"a\tb\""));
+    // An embedded quote is escaped, and the backslashes before it double.
+    CHECK_EQ(QuoteArg(L"a\"b"), std::wstring(L"\"a\\\"b\""));
+    CHECK_EQ(QuoteArg(L"a\\\"b"), std::wstring(L"\"a\\\\\\\"b\""));
+    // A trailing backslash inside the quotes is doubled, not lost to the
+    // closing quote.
+    CHECK_EQ(QuoteArg(L"C:\\dir with space\\"), std::wstring(L"\"C:\\dir with space\\\\\""));
+    CHECK_EQ(QuoteArg(L"C:\\dir with space"), std::wstring(L"\"C:\\dir with space\""));
+}

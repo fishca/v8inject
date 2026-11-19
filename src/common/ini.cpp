@@ -8,6 +8,8 @@ namespace {
 
 // Creates the folder of an ini file when it is missing. Without it the write
 // fails with ERROR_FILE_NOT_FOUND, and the settings are lost without a word.
+// Every missing component is created: a caller may point the file at a path
+// deeper than one folder, and CreateDirectoryW alone would fail there.
 void EnsureFolderOf(const wchar_t* path) {
     if (!path) return;
     std::wstring p(path);
@@ -15,7 +17,18 @@ void EnsureFolderOf(const wchar_t* path) {
     if (slash == std::wstring::npos) return;
     p.resize(slash);
     if (p.empty()) return;
-    CreateDirectoryW(p.c_str(), nullptr);   // ERROR_ALREADY_EXISTS is fine
+    const bool rooted = p.size() >= 2 && (p[1] == L':' || (p[0] == L'\\' && p[1] == L'\\'));
+    if (!rooted) {
+        CreateDirectoryW(p.c_str(), nullptr);
+        return;
+    }
+    for (size_t i = 2; i <= p.size(); ++i) {
+        if (i < p.size() && p[i] != L'\\') continue;
+        const std::wstring part = p.substr(0, i);
+        // A trailing separator would name nothing; "C:" is a volume.
+        if (part.empty() || part.back() == L'\\' || part.back() == L':') continue;
+        CreateDirectoryW(part.c_str(), nullptr);   // ERROR_ALREADY_EXISTS is fine
+    }
 }
 
 // The Win32 ini functions write Unicode only into a file that already has a

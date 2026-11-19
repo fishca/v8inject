@@ -88,31 +88,9 @@ void LogGit(const wchar_t* what, const std::wstring& text) {
 }
 
 // One argument of a command line, quoted the way CommandLineToArgvW expects.
-// Only an empty argument or one containing a space / tab needs the quotes: a
-// quoted switch is not a switch for cmd.exe, and a path that ends in a backslash
-// loses it to the \" escape when it is quoted unconditionally (A76).
-static std::wstring QuoteArg(const std::wstring& arg) {
-    if (!arg.empty() && arg.find_first_of(L" \t") == std::wstring::npos) return arg;
-    std::wstring out;
-    size_t slashes = 0;
-    for (const wchar_t c : arg) {
-        if (c == L'\\') {
-            ++slashes;
-            continue;
-        }
-        if (c == L'"') {
-            out.append(slashes * 2 + 1, L'\\');   // the quote itself, escaped
-            out += L'"';
-            slashes = 0;
-            continue;
-        }
-        out.append(slashes, L'\\');
-        slashes = 0;
-        out += c;
-    }
-    out.append(slashes * 2, L'\\');   // trailing backslashes stay literal
-    return L"\"" + out + L"\"";
-}
+// The implementation lives in v8i_common (see v8inject/text.h): the tray agent
+// quotes the Run value of its autostart entry with the same rules (A82).
+using v8i::QuoteArg;
 
 // Runs "<exe> <args>" and collects stdout + stderr.
 //

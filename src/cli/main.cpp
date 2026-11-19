@@ -5,6 +5,8 @@
 #include "v8inject/protocol.h"
 #include "v8inject/text.h"
 
+#include "cli/watch_state.h"
+
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -193,23 +195,19 @@ int RunWatch(int argc, wchar_t** argv) {
             pid, needle.c_str(), debounceMs, timeoutMs, once ? L"\"once\":true" : L"\"once\":false");
     fflush(stdout);
 
-    struct PathCache { uintptr_t addr; std::wstring path; };
-    std::vector<PathCache> cache;
+    // The debounce state and the address -> path cache live in watch_state.h:
+    // the watcher used to fire once and never again, and the cache grew
+    // without a limit (A56).
+    v8i::WatchGate gate;
+    v8i::WatchPathCache cache;
     LONG lastSeq = 0;
-    int matchCount = 0, fireCount = 0;
     ULONGLONG startTick = GetTickCount64();
-    ULONGLONG lastActive = 0;
-    bool fired = false;
 
-    auto findPath = [&](uintptr_t addr) -> const std::wstring* {
-        for (auto& c : cache)
-            if (c.addr == addr) return &c.path;
-        return nullptr;
-    };
-    auto decodePath = [&](uintptr_t addr) -> const std::wstring* {
-        if (const std::wstring* p = findPath(addr)) return p;
+    auto decodePath = [&](uint64_t addr, uint64_t now) -> const std::wstring* {
+        if (const std::wstring* p = cache.Find(addr, now)) return p;
         wchar_t req[64];
-        _snwprintf_s(req, _countof(req), _TRUNCATE, L"str 0x%llX", (unsigned long long)addr);
+        _snwprintf_s(req, _countof(req), _TRUNCATE, L"str 0x%llX",
+                     (unsigned long long)addr);
         std::string r2;
         std::wstring path;
         if (client.Call(req, r2, 5000)) {
@@ -222,14 +220,15 @@ int RunWatch(int argc, wchar_t** argv) {
                 path = UnescapeStrValue(val);
             }
         }
-        cache.push_back({addr, path});
-        return &cache.back().path;
+        cache.Store(addr, std::move(path), now);
+        return cache.Find(addr, now);
     };
 
     while (true) {
         ULONGLONG now = GetTickCount64();
         if (now - startTick > (ULONGLONG)timeoutMs) {
-            wprintf(L"{\"status\":\"timeout\",\"matches\":%d,\"fired\":%d}\n", matchCount, fireCount);
+            wprintf(L"{\"status\":\"timeout\",\"matches\":%d,\"fired\":%d}\n",
+                    gate.matchCount, gate.fireCount);
             break;
         }
 
@@ -261,14 +260,13 @@ int RunWatch(int argc, wchar_t** argv) {
             any = true;
 
             if (hook == cfwId) {  // cfw: args[0] = path pointer
-                uintptr_t addr = (uintptr_t)_wcstoui64(Utf8ToWide(arg0).c_str(), nullptr, 16);
-                const std::wstring* p = decodePath(addr);
+                uint64_t addr = _wcstoui64(Utf8ToWide(arg0).c_str(), nullptr, 16);
+                const std::wstring* p = decodePath(addr, now);
                 if (p && !p->empty()) {
                     std::wstring np = NormalizePath(*p);
                     if (np.compare(0, needle.size(), needle) == 0 &&
                         np.size() > needle.size() && np[needle.size()] == L'/') {
-                        ++matchCount;
-                        lastActive = now;
+                        gate.Match(now);
                     }
                 }
             }
@@ -276,12 +274,10 @@ int RunWatch(int argc, wchar_t** argv) {
         }
         if (any) lastSeq = maxSeq;
 
-        ULONGLONG quiet = (lastActive == 0) ? 0 : now - lastActive;
-        if (matchCount > 0 && !fired && quiet > (ULONGLONG)debounceMs) {
-            fired = true;
-            ++fireCount;
+        if (gate.Due(now, debounceMs)) {
+            gate.Fired();
             wprintf(L"{\"status\":\"%s\",\"matches\":%d,\"command\":\"%ls\"}\n",
-                    dryRun ? L"would-fire" : L"firing", matchCount, runCmd.c_str());
+                    dryRun ? L"would-fire" : L"firing", gate.matchCount, runCmd.c_str());
             fflush(stdout);
             if (!dryRun) {
                 std::wstring cmdline = L"cmd.exe /S /C \"" + runCmd + L"\"";
@@ -305,11 +301,10 @@ int RunWatch(int argc, wchar_t** argv) {
                 }
             }
             if (once) break;
-            lastActive = 0;  // rearm for the next dump
+            gate.Rearm();   // the next dump fires again (A56)
         }
         Sleep(250);
     }
-
     CloseSession(client);
     return 0;
 }

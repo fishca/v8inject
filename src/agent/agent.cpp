@@ -18,6 +18,9 @@
 #include "v8inject/text.h"
 #include "v8inject/procs.h"
 
+#include "host/agent_state.h"
+#include "host/autostart.h"
+
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -25,7 +28,6 @@
 #include <shlwapi.h>
 #include <string>
 #include <vector>
-#include <unordered_set>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -49,8 +51,11 @@ enum MenuId {
 HWND g_hwnd = nullptr;
 HINSTANCE g_hinst = nullptr;
 NOTIFYICONDATAW g_nid{};
-std::unordered_set<DWORD> g_injected;
-std::unordered_set<DWORD> g_failed;
+// Which processes were already injected into and which ones are being retried.
+// The two sets this replaces were only ever added to, so a transient failure
+// disabled the auto-injection for that window forever and a reused pid was
+// skipped as "already injected" (A62).
+v8i::AgentTracker g_tracker;
 std::wstring g_names;        // comma-separated process names
 bool g_autoGitBar = true;
 
@@ -105,31 +110,23 @@ void SaveConfig() {
                 g_autoGitBar ? L"1" : L"0");
 }
 
+// The checkbox reads the registry, not the ini: the old code wrote its own
+// "autostart" flag unconditionally, so the checkbox claimed an entry that
+// RegSetValueExW had refused to create (A82).
 bool AutostartEnabled() {
-    wchar_t val[512] = {};
-    DWORD n = GetPrivateProfileStringW(
-        L"agent", L"autostart", L"", val, 512,
-        (AppDataDir() + L"\\" + kIniPath).c_str());
-    return n > 0 && val[0] == L'1';
+    return v8i::AutostartActive(HKEY_CURRENT_USER, v8i::kRunKeyPath, v8i::kRunValueName);
 }
 
 void SetAutostart(bool on) {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                      0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring error;
+    if (!v8i::AutostartSet(HKEY_CURRENT_USER, v8i::kRunKeyPath, v8i::kRunValueName, exe, on,
+                           &error)) {
+        Log(L"autostart: не удалось: " + error);
         return;
-    if (on) {
-        wchar_t exe[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        RegSetValueExW(key, L"v8inject-agent", 0, REG_SZ,
-                       (const BYTE*)exe, (DWORD)(wcslen(exe) + 1) * 2);
-    } else {
-        RegDeleteValueW(key, L"v8inject-agent");
     }
-    RegCloseKey(key);
-    v8i::IniSet((AppDataDir() + L"\\" + kIniPath).c_str(), L"agent", L"autostart",
-                on ? L"1" : L"0");
+    Log(on ? L"autostart: включён" : L"autostart: выключен");
 }
 
 // Payloads live in <agent dir>\x64\... and \x86\... (agent may itself sit in
@@ -165,11 +162,11 @@ bool MatchesNames(const std::wstring& name) {
     return false;
 }
 
-void InjectOne(DWORD pid, bool is64) {
+void InjectOne(DWORD pid, uint64_t created, bool is64) {
     std::wstring dll = PayloadFor(is64);
     if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log(L"payload not found: " + dll);
-        g_failed.insert(pid);
+        g_tracker.Failed(pid, created, GetTickCount64());
         return;
     }
     v8i::Client c;
@@ -178,11 +175,11 @@ void InjectOne(DWORD pid, bool is64) {
         Log(L"inject pid=" + std::to_wstring(pid) + L" [" + (is64 ? L"x64" : L"x86") +
             L"] failed: " + c.LastError() + L" (stage " + std::to_wstring(c.LastStage()) +
             L", win32=" + std::to_wstring(c.LastWin32Error()) + L")");
-        g_failed.insert(pid);
+        g_tracker.Failed(pid, created, GetTickCount64());
         return;
     }
     Log(L"injected pid=" + std::to_wstring(pid) + L" [" + (is64 ? L"x64" : L"x86") + L"]");
-    g_injected.insert(pid);
+    g_tracker.Injected(pid, created);
     if (g_autoGitBar) {
         std::string resp;
         bool ok = c.Call(L"gitbar", resp, 8000);
@@ -198,12 +195,32 @@ void InjectOne(DWORD pid, bool is64) {
 // it installed (and the hooks) survive that, exactly like one-shot CLI runs.
 
 void Poll() {
-    auto procs = v8i::ListProcesses();
+    const auto procs = v8i::ListProcesses();
+    std::vector<uint32_t> alive;
+    alive.reserve(procs.size());
+    for (const auto& p : procs) alive.push_back(p.pid);
+
+    // A process that is gone - or whose pid now belongs to another process - is
+    // forgotten here: the old sets kept the entry and skipped the new 1C that
+    // inherited the pid (A62).
+    const size_t dropped = g_tracker.Prune(alive);
+    if (dropped) Log(L"poll: забыто процессов: " + std::to_wstring(dropped));
+
+    const uint64_t now = GetTickCount64();
     for (const auto& p : procs) {
         if (p.session0) continue;
         if (!MatchesNames(p.name)) continue;
-        if (g_injected.count(p.pid) || g_failed.count(p.pid)) continue;
-        InjectOne(p.pid, p.is64);
+        const uint64_t created = v8i::ProcessCreated(p.pid);
+        // A failed attempt is retried with a backoff instead of being remembered
+        // forever, and the creation time tells a reused pid apart.
+        switch (g_tracker.Decide(p.pid, created, now)) {
+        case v8i::AgentDecision::Inject:
+            InjectOne(p.pid, created, p.is64);
+            break;
+        case v8i::AgentDecision::WaitForRetry:
+        case v8i::AgentDecision::Skip:
+            break;
+        }
     }
 }
 
@@ -253,12 +270,15 @@ void ShowTrayMenu() {
         PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
         break;
     case kMInjectAll: {
-        auto procs = v8i::ListProcesses();
+        const auto procs = v8i::ListProcesses();
         int done = 0;
         for (const auto& p : procs) {
             if (p.session0 || !MatchesNames(p.name)) continue;
-            if (g_injected.count(p.pid) || g_failed.count(p.pid)) continue;
-            InjectOne(p.pid, p.is64);
+            const uint64_t created = v8i::ProcessCreated(p.pid);
+            // A manual request ignores the backoff of the poll, but not the
+            // knowledge that this very process is already injected.
+            if (g_tracker.WasInjected(p.pid, created)) continue;
+            InjectOne(p.pid, created, p.is64);
             ++done;
         }
         if (done == 0) Log(L"manual inject: nothing new");

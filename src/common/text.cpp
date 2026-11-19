@@ -135,6 +135,32 @@ bool ParseNumber(const std::wstring& text, uintptr_t* out) {
     return true;
 }
 
+std::wstring QuoteArg(const std::wstring& arg) {
+    // A double quote anywhere in the argument needs the escape as well: an
+    // unquoted `a"b` reaches the program as `ab`, the quote being the quoting
+    // switch of CommandLineToArgvW and not a character of the argument.
+    if (!arg.empty() && arg.find_first_of(L" \t\"") == std::wstring::npos) return arg;
+    std::wstring out;
+    size_t slashes = 0;
+    for (const wchar_t c : arg) {
+        if (c == L'\\') {
+            ++slashes;
+            continue;
+        }
+        if (c == L'"') {
+            out.append(slashes * 2 + 1, L'\\');   // the quote itself, escaped
+            out += L'"';
+            slashes = 0;
+            continue;
+        }
+        out.append(slashes, L'\\');
+        slashes = 0;
+        out += c;
+    }
+    out.append(slashes * 2, L'\\');   // trailing backslashes stay literal
+    return L"\"" + out + L"\"";
+}
+
 std::wstring UnescapeStrValue(const std::string& v) {
     std::string raw;
     raw.reserve(v.size());

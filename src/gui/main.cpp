@@ -15,7 +15,13 @@
 #include "v8inject/injector.h"
 #include "v8inject/procs.h"
 
+#include "host/gui_settings.h"
+#include "host/ui_job.h"
+#include "host/ui_layout.h"
+#include "host/ui_loop.h"
+
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -47,7 +53,26 @@ HWND g_filter = nullptr;
 std::vector<v8i::ProcessEntry> g_procs;
 v8i::Client g_client;
 uint32_t g_targetPid = 0;
+uint32_t g_sessionPid = 0;   // the process the open session belongs to
 std::wstring g_targetName;
+
+// The DPI of the monitor the window is on. Every coordinate of the form is
+// written in 96-DPI units and scaled with it; the window is per-monitor DPI
+// aware, so Windows does not scale anything for it (A81).
+int g_dpi = 96;
+
+// Labels and buttons at a fixed place, in 96-DPI units: positioned once and
+// repositioned after the window moved to a monitor with another DPI.
+std::vector<v8i::UiAnchor> g_anchors;
+
+void Anchor(HWND h, int x, int y, int w, int h2) {
+    if (!h) return;
+    g_anchors.push_back({ h, x, y, w, h2 });
+    const v8i::UiAnchor& a = g_anchors.back();
+    SetWindowPos(h, nullptr, v8i::DpiScale(a.x, g_dpi), v8i::DpiScale(a.y, g_dpi),
+                 v8i::DpiScale(a.w, g_dpi), v8i::DpiScale(a.h, g_dpi),
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
 
 // ---------------------------------------------------------------------------
 // 1C-style theme: the same palette as the in-process GitBar dialogs (measured
@@ -66,24 +91,65 @@ const COLORREF kUiSel      = RGB(49, 106, 197);
 const COLORREF kUiSelIdle  = RGB(212, 208, 200);
 const COLORREF kUiHeader   = RGB(238, 234, 222);
 
-HFONT CreateUiFont(int weight) {
-    HDC dc = GetDC(nullptr);
-    int h = -MulDiv(8, GetDeviceCaps(dc, LOGPIXELSY), 72);
-    ReleaseDC(nullptr, dc);
-    return CreateFontW(h, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
+// The window is per-monitor DPI aware, so Windows does not scale it for us and
+// the font has to be built for the DPI of the monitor the window is on: the
+// 96-DPI 8pt font stays 8pt in points, while every box of the layout keeps its
+// 96-DPI pixel size and clips the text at 150-200% (A81). `g_dpi` itself and
+// the anchors that use it are declared above.
+HFONT g_font = nullptr;
+HFONT g_fontBold = nullptr;
+
+HFONT CreateUiFont(int dpi, int weight) {
+    return CreateFontW(-MulDiv(8, dpi, 72), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Tahoma");
 }
 
-HFONT UiFont() {
-    static HFONT f = CreateUiFont(FW_NORMAL);
-    return f;
+HFONT UiFont() { return g_font ? g_font : (g_font = CreateUiFont(g_dpi, FW_NORMAL)); }
+HFONT UiFontBold() {
+    return g_fontBold ? g_fontBold : (g_fontBold = CreateUiFont(g_dpi, FW_BOLD));
 }
 
-HFONT UiFontBold() {
-    static HFONT f = CreateUiFont(FW_BOLD);
-    return f;
+// Applies the fonts of the current DPI to every control of the thread: the main
+// window's children and, while the settings dialog is open, its own controls.
+// The old fonts are deleted afterwards, when nothing selects them anymore.
+struct FontPair {
+    HFONT normal = nullptr;
+    HFONT bold = nullptr;
+};
+
+BOOL CALLBACK RefontChild(HWND child, LPARAM lp) {
+    SendMessageW(child, WM_SETFONT, (WPARAM)((const FontPair*)lp)->normal, TRUE);
+    return TRUE;
 }
+
+BOOL CALLBACK RefontTopWindow(HWND top, LPARAM lp) {
+    const FontPair* fp = (const FontPair*)lp;
+    EnumChildWindows(top, RefontChild, (LPARAM)fp);
+    (void)top;
+    return TRUE;
+}
+
+void ResetUiFonts(int dpi) {
+    FontPair fp;
+    fp.normal = CreateUiFont(dpi, FW_NORMAL);
+    fp.bold = CreateUiFont(dpi, FW_BOLD);
+    if (!fp.normal || !fp.bold) {
+        if (fp.normal) DeleteObject(fp.normal);
+        if (fp.bold) DeleteObject(fp.bold);
+        return;
+    }
+    const HFONT oldNormal = g_font;
+    const HFONT oldBold = g_fontBold;
+    g_font = fp.normal;
+    g_fontBold = fp.bold;
+    g_dpi = dpi;
+    EnumThreadWindows(GetCurrentThreadId(), RefontTopWindow, (LPARAM)&fp);
+    if (g_list) SendMessageW(ListView_GetHeader(g_list), WM_SETFONT, (WPARAM)fp.bold, TRUE);
+    if (oldNormal) DeleteObject(oldNormal);
+    if (oldBold) DeleteObject(oldBold);
+}
+
 
 HBRUSH UiBgBrush() {
     static HBRUSH b = CreateSolidBrush(kUiBg);
@@ -127,10 +193,12 @@ LRESULT CALLBACK UiButtonProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 HWND CreateUiButton(HWND parent, int id, const wchar_t* text,
-                    int x, int y, int w, int h) {
+                    int x, int y, int w, int h, int dpi) {
     HWND btn = CreateWindowExW(0, L"BUTTON", text,
                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                               x, y, w, h, parent, (HMENU)(INT_PTR)id,
+                               v8i::DpiScale(x, dpi), v8i::DpiScale(y, dpi),
+                               v8i::DpiScale(w, dpi), v8i::DpiScale(h, dpi),
+                               parent, (HMENU)(INT_PTR)id,
                                (HINSTANCE)GetWindowLongPtrW(parent, GWLP_HINSTANCE),
                                nullptr);
     if (!btn) return nullptr;
@@ -173,10 +241,14 @@ bool UiDrawOwnerButton(const DRAWITEMSTRUCT* dis) {
 }
 
 // Edits and lists sit 1px inside a frame drawn by the parent, so the frame has
-// to be repainted when the focus moves (the border turns blue).
+// to be repainted when the focus moves (the border turns blue). The frame and
+// the control are stored in 96-DPI units (`base`) and scaled to the monitor of
+// the window: the window is per-monitor DPI aware, so nothing scales the form
+// for it (A81).
 struct UiField {
     HWND hwnd = nullptr;
-    RECT cell{};
+    RECT cell{};   // the frame, physical pixels
+    RECT base{};   // the frame, 96-DPI units
 };
 std::vector<UiField> g_fields;
 
@@ -189,25 +261,52 @@ LRESULT CALLBACK UiFieldProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(old, h, msg, wp, lp);
 }
 
+void PlaceFieldIn(std::vector<UiField>& fields, HWND h, int x, int y, int w, int h2,
+                  int dpi);
+
 void TrackFieldIn(std::vector<UiField>& fields, HWND h, int x, int y, int w, int h2) {
     WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)UiFieldProc);
     SetPropW(h, L"v8i.oldFieldProc", (HANDLE)old);
-    fields.push_back({ h, { x, y, x + w, y + h2 } });
+    UiField f;
+    f.hwnd = h;
+    f.base = { x, y, x + w, y + h2 };
+    f.cell = f.base;
+    fields.push_back(f);
 }
 
 void TrackField(HWND h, int x, int y, int w, int h2) {
     TrackFieldIn(g_fields, h, x, y, w, h2);
 }
 
-void PlaceFieldIn(std::vector<UiField>& fields, HWND h, int x, int y, int w, int h2) {
-    SetWindowPos(h, nullptr, x + 1, y + 1, w - 2, h2 - 2, SWP_NOZORDER);
+// Places one field for the given DPI: the frame is scaled from its base rect
+// and the control sits 1 (scaled) pixel inside it.
+void PlaceFieldIn(std::vector<UiField>& fields, HWND h, int x, int y, int w, int h2,
+                  int dpi) {
+    const RECT base{ x, y, x + w, y + h2 };
     for (auto& f : fields) {
-        if (f.hwnd == h) { f.cell = { x, y, x + w, y + h2 }; break; }
+        if (f.hwnd != h) continue;
+        f.base = base;
+        f.cell = v8i::ScaleRect(base, dpi);
+        const int inset = v8i::DpiScale(1, dpi);
+        SetWindowPos(h, nullptr, f.cell.left + inset, f.cell.top + inset,
+                     (f.cell.right - f.cell.left) - 2 * inset,
+                     (f.cell.bottom - f.cell.top) - 2 * inset,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        break;
     }
 }
 
 void PlaceField(HWND h, int x, int y, int w, int h2) {
-    PlaceFieldIn(g_fields, h, x, y, w, h2);
+    PlaceFieldIn(g_fields, h, x, y, w, h2, g_dpi);
+}
+
+// After the DPI changed: every field goes back to its base rect, now scaled
+// with the new DPI.
+void RelayoutFieldsIn(std::vector<UiField>& fields, int dpi) {
+    for (auto& f : fields) {
+        PlaceFieldIn(fields, f.hwnd, f.base.left, f.base.top, f.base.right - f.base.left,
+                     f.base.bottom - f.base.top, dpi);
+    }
 }
 
 void PaintFieldFramesIn(HDC dc, const std::vector<UiField>& fields) {
@@ -456,7 +555,213 @@ void BrowseDll() {
     if (GetOpenFileNameW(&ofn)) SetWindowTextW(g_dllEdit, file);
 }
 
+// ---------------------------------------------------------------------------
+// A80: every call that talks to the target - open, version, a command - runs
+// on a worker thread. Each of them has a 10-20 s timeout, and on the UI thread
+// the window stopped painting, Windows marked it "Не отвечает" and offered to
+// kill it.
+// ---------------------------------------------------------------------------
+
+constexpr UINT kMsgJobDone = WM_APP + 10;
+
+enum class JobKind { None, Inject, Detach, Send, GitbarShow, GitbarHide };
+
+struct JobOutcome {
+    bool openOk = false;       // a session is live after the job
+    bool fresh = false;        // this job opened it
+    bool versionOk = false;    // the fresh session answered `version`
+    bool callOk = false;       // the last payload call answered
+    bool noConnection = false; // the job needed a session and there was none
+    std::string version;
+    std::string reply;
+    std::wstring error;
+    int stage = 0;
+    DWORD win32 = 0;
+};
+
+v8i::UiJob g_job;
+JobKind g_jobKind = JobKind::None;
+JobOutcome g_jobOutcome;
+
+// The buttons that start a job, plus the inputs, are off while it runs: a
+// second injection or a command typed over the first one would fight for the
+// same client.
+void SetJobButtonsEnabled(bool enabled) {
+    static const int kIds[] = { kIdRefresh, kIdInject, kIdDetach, kIdSend, kIdBrowse,
+                                kIdGitbarShow, kIdGitbarHide, kIdGitbarSettings };
+    for (int id : kIds) {
+        HWND h = GetDlgItem(g_hwnd, id);
+        if (!h) continue;
+        BOOL on = enabled ? TRUE : FALSE;
+        if (enabled && (id == kIdDetach || id == kIdSend)) on = g_client.IsOpen() ? TRUE : FALSE;
+        EnableWindow(h, on);
+    }
+    HWND fields[] = { g_list, g_dllEdit, g_cmdEdit, g_filter };
+    for (HWND h : fields) EnableWindow(h, enabled ? TRUE : FALSE);
+}
+
+// Runs on the worker thread. Opens the session when it is not open yet and
+// then sends `command` (nullptr for none). With `reconnect` a session of
+// another process is closed first: the user picked a different 1C. The UI
+// thread reads nothing of the client while the job runs: its controls are
+// disabled for the duration.
+JobOutcome RunJobCalls(uint32_t pid, const std::wstring& dll, const wchar_t* command,
+                       bool reconnect = false) {
+    JobOutcome r;
+    if (reconnect && g_client.IsOpen()) {
+        if (!g_client.Close()) {
+            // The payload did not leave; going on would open over a live
+            // session. Say why instead.
+            r.error = g_client.LastError();
+            return r;
+        }
+    }
+    if (!g_client.IsOpen()) {
+        if (!pid) {
+            r.noConnection = true;
+            return r;
+        }
+        if (!g_client.Open(pid, dll, ExeDir(), 15000)) {
+            r.error = g_client.LastError();
+            r.stage = g_client.LastStage();
+            r.win32 = g_client.LastWin32Error();
+            return r;
+        }
+        r.fresh = true;
+        r.versionOk = g_client.Call(L"version", r.version, 10000);
+    }
+    r.openOk = true;
+    if (command) {
+        r.callOk = g_client.Call(command, r.reply, 20000);
+        if (!r.callOk && r.error.empty()) r.error = g_client.LastError();
+    }
+    return r;
+}
+
+bool StartJob(JobKind kind, std::function<JobOutcome()> work) {
+    if (g_job.Busy()) return false;
+    g_jobKind = kind;
+    g_jobOutcome = JobOutcome{};
+    SetJobButtonsEnabled(false);
+    if (!g_job.Start(g_hwnd, kMsgJobDone, [work]() { g_jobOutcome = work(); })) {
+        g_jobKind = JobKind::None;
+        SetJobButtonsEnabled(true);
+        return false;
+    }
+    return true;
+}
+
+// Applies the outcome of the finished job, on the UI thread.
+void OnJobDone() {
+    const JobKind kind = g_jobKind;
+    g_jobKind = JobKind::None;
+    const JobOutcome r = g_jobOutcome;   // the join in Finish() made it visible
+    if (!g_client.IsOpen()) g_sessionPid = 0;
+    SetJobButtonsEnabled(true);
+
+    switch (kind) {
+    case JobKind::Inject:
+        if (!r.openOk) {
+            Log(std::wstring(L"ОШИБКА: ") + r.error);
+            wchar_t diag[512];
+            _snwprintf_s(diag, _countof(diag), _TRUNCATE, L"stage=%d win32=%lu\nlog: %s",
+                         r.stage, r.win32, v8i::GetLogPath());
+            Log(diag);
+            SetStatus(L"Ошибка подключения");
+            MessageBoxW(g_hwnd, diag, L"Не удалось подключиться", MB_ICONERROR);
+        } else if (!r.fresh) {
+            Log(L"Уже подключено: " + g_targetName);
+            SetStatus(L"Подключено к " + g_targetName);
+        } else if (r.versionOk) {
+            g_sessionPid = g_targetPid;
+            Log(L"Подключено: " + Utf8ToWide(r.version));
+            SetStatus(L"Подключено к " + g_targetName);
+        } else {
+            g_sessionPid = g_targetPid;
+            Log(L"Подключение прошло, но payload не ответил на version");
+            SetStatus(L"Нет ответа от payload");
+        }
+        break;
+
+    case JobKind::Detach:
+        // A45: a command that is still running inside the target keeps the
+        // payload alive until it returns; say so instead of reporting a clean
+        // detach.
+        if (r.callOk) {
+            Log(L"Сессия закрыта");
+        } else {
+            Log(std::wstring(L"Сессия закрыта не полностью: ") + r.error);
+        }
+        SetStatus(L"Не подключено");
+        g_targetPid = 0;
+        break;
+
+    case JobKind::Send:
+        if (r.callOk) {
+            Log(Utf8ToWide(r.reply));
+        } else {
+            Log(r.error.empty() ? std::wstring(L"(нет ответа)")
+                                : (L"(нет ответа) " + r.error));
+        }
+        SetStatus(g_client.IsOpen() ? std::wstring(L"Подключено к ") + g_targetName
+                                    : std::wstring(L"Не подключено"));
+        break;
+
+    case JobKind::GitbarShow:
+    case JobKind::GitbarHide: {
+        const bool show = kind == JobKind::GitbarShow;
+        if (r.fresh && r.openOk) g_sessionPid = g_targetPid;
+        if (r.noConnection) {
+            MessageBoxW(g_hwnd,
+                        show ? L"Нет подключения к процессу (выберите 1cv8.exe)."
+                             : L"Сначала подключитесь к процессу.",
+                        L"GitBar", MB_ICONINFORMATION);
+        } else if (r.callOk) {
+            Log(Utf8ToWide(r.reply));
+            SetStatus(show ? L"GitBar: панель показана (payload остаётся в процессе)"
+                           : L"GitBar: панель скрыта");
+        } else {
+            Log(L"(нет ответа)");
+            SetStatus(L"GitBar: нет ответа");
+        }
+        break;
+    }
+
+    case JobKind::None:
+        break;
+    }
+}
+
+// The UI-side half of "connect to the selected process": picks the pid and the
+// payload of that bitness. The blocking part runs on the job thread (A80).
+bool PrepareTarget(uint32_t* pidOut, std::wstring* dllOut) {
+    const uint32_t pid = SelectedPid();
+    if (!pid) return false;
+
+    wchar_t dllBuf[MAX_PATH] = {};
+    GetWindowTextW(g_dllEdit, dllBuf, MAX_PATH);
+    std::wstring dll = dllBuf;
+    if (dll.empty()) {
+        dll = DefaultPayloadFor(SelectedIs64());
+        SetWindowTextW(g_dllEdit, dll.c_str());
+    }
+    if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+
+    g_targetPid = pid;
+    g_targetName = SelectedName();
+
+    wchar_t msg[512];
+    _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"[%lu] %s — подключаюсь...",
+                 g_targetPid, g_targetName.c_str());
+    Log(msg);
+    if (pidOut) *pidOut = pid;
+    if (dllOut) *dllOut = dll;
+    return true;
+}
+
 void DoInject() {
+    if (g_job.Busy()) return;
+
     uint32_t pid = SelectedPid();
     if (!pid) {
         MessageBoxW(g_hwnd, L"Выберите процесс в списке.", L"v8inject", MB_ICONINFORMATION);
@@ -489,10 +794,9 @@ void DoInject() {
         return;
     }
 
+    Log(L"------------------------------");
     g_targetPid = pid;
     g_targetName = SelectedName();
-
-    Log(L"------------------------------");
 
     wchar_t msg[512];
     _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"[%lu] %s — подключаюсь...",
@@ -500,48 +804,31 @@ void DoInject() {
     Log(msg);
     SetStatus(L"Подключение...");
 
-    if (!g_client.Open(pid, dll, ExeDir(), 15000)) {
-        Log(std::wstring(L"ОШИБКА: ") + g_client.LastError());
-        wchar_t diag[512];
-        _snwprintf_s(diag, _countof(diag), _TRUNCATE,
-                     L"stage=%d win32=%lu\nlog: %s",
-                     g_client.LastStage(), g_client.LastWin32Error(),
-                     v8i::GetLogPath());
-        Log(diag);
-        SetStatus(L"Ошибка подключения");
-        MessageBoxW(g_hwnd, diag, L"Не удалось подключиться", MB_ICONERROR);
-        return;
-    }
-
-    std::string resp;
-    if (g_client.Call(L"version", resp, 10000)) {
-        Log(L"Подключено: " + Utf8ToWide(resp));
-        SetStatus(L"Подключено к " + g_targetName);
-        EnableWindow(GetDlgItem(g_hwnd, kIdSend), TRUE);
-        EnableWindow(GetDlgItem(g_hwnd, kIdDetach), TRUE);
-    } else {
-        Log(L"Подключение прошло, но payload не ответил на version");
-        SetStatus(L"Нет ответа от payload");
-    }
+    // A session with another process is closed by the worker: injecting into
+    // the second 1C must not keep talking to the first one.
+    const bool reconnect = g_client.IsOpen() && g_sessionPid != pid;
+    if (!StartJob(JobKind::Inject, [pid, dll, reconnect]() {
+            return RunJobCalls(pid, dll, nullptr, reconnect);
+        }))
+        Log(L"Занято: предыдущая операция ещё выполняется");
 }
 
 void DoDetach() {
+    if (g_job.Busy()) return;
     if (!g_client.IsOpen()) return;
     Log(L"Отключаюсь...");
-    // A45: a command that is still running inside the target keeps the payload
-    // alive until it returns; say so instead of reporting a clean detach.
-    if (g_client.Close()) {
-        Log(L"Сессия закрыта");
-    } else {
-        Log(std::wstring(L"Сессия закрыта не полностью: ") + g_client.LastError());
-    }
-    SetStatus(L"Не подключено");
-    EnableWindow(GetDlgItem(g_hwnd, kIdSend), FALSE);
-    EnableWindow(GetDlgItem(g_hwnd, kIdDetach), FALSE);
-    g_targetPid = 0;
+    SetStatus(L"Отключаюсь...");
+    if (!StartJob(JobKind::Detach, [] {
+            JobOutcome r;
+            r.callOk = g_client.Close();
+            r.error = g_client.LastError();
+            return r;
+        }))
+        Log(L"Занято: предыдущая операция ещё выполняется");
 }
 
 void DoSend() {
+    if (g_job.Busy()) return;
     if (!g_client.IsOpen()) {
         MessageBoxW(g_hwnd, L"Сначала подключитесь к процессу.", L"v8inject",
                     MB_ICONINFORMATION);
@@ -552,12 +839,11 @@ void DoSend() {
     if (!cmd[0]) return;
 
     Log(std::wstring(L"> ") + cmd);
-    std::string resp;
-    if (g_client.Call(cmd, resp, 20000)) {
-        Log(Utf8ToWide(resp));
-    } else {
-        Log(L"(нет ответа)");
-    }
+    SetStatus(L"Команда выполняется...");
+    const std::wstring command = cmd;
+    if (!StartJob(JobKind::Send,
+                  [command]() { return RunJobCalls(0, std::wstring(), command.c_str()); }))
+        Log(L"Занято: предыдущая операция ещё выполняется");
 }
 
 // ---------------------------------------------------------------------------
@@ -565,99 +851,34 @@ void DoSend() {
 // dialog that writes the same %APPDATA%\v8inject\gitbar.ini the payload reads.
 // ---------------------------------------------------------------------------
 
-const wchar_t* GitBarIniPath() {
-    static wchar_t path[MAX_PATH] = {};
-    if (!path[0]) {
-        ExpandEnvironmentStringsW(L"%APPDATA%\\v8inject\\gitbar.ini", path, MAX_PATH);
-    }
-    return path;
-}
-
-std::wstring GitBarIniGet(const wchar_t* key) {
-    wchar_t buf[1024] = {};
-    GetPrivateProfileStringW(L"git", key, L"", buf, 1024, GitBarIniPath());
-    return buf;
-}
-
-void GitBarIniSet(const wchar_t* key, const wchar_t* value) {
-    WritePrivateProfileStringW(L"git", key, value, GitBarIniPath());
-}
-
-// Connects to the selected process if not connected yet (same path as
-// DoInject, minus the messages). Returns true when a session is live.
-bool EnsureConnected() {
-    if (g_client.IsOpen()) return true;
-    uint32_t pid = SelectedPid();
-    if (!pid) return false;
-
-    wchar_t dllBuf[MAX_PATH] = {};
-    GetWindowTextW(g_dllEdit, dllBuf, MAX_PATH);
-    std::wstring dll = dllBuf;
-    bool targetIs64 = SelectedIs64();
-    if (dll.empty()) {
-        dll = DefaultPayloadFor(targetIs64);
-        SetWindowTextW(g_dllEdit, dll.c_str());
-    }
-    if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
-
-    g_targetPid = pid;
-    g_targetName = SelectedName();
-
-    wchar_t msg[512];
-    _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"[%lu] %s — подключаюсь...",
-                 g_targetPid, g_targetName.c_str());
-    Log(msg);
-    SetStatus(L"Подключение...");
-
-    if (!g_client.Open(pid, dll, ExeDir(), 15000)) {
-        Log(std::wstring(L"ОШИБКА: ") + g_client.LastError());
-        SetStatus(L"Ошибка подключения");
-        return false;
-    }
-    std::string resp;
-    if (g_client.Call(L"version", resp, 10000)) {
-        Log(L"Подключено: " + Utf8ToWide(resp));
-        SetStatus(L"Подключено к " + g_targetName);
-        EnableWindow(GetDlgItem(g_hwnd, kIdSend), TRUE);
-        EnableWindow(GetDlgItem(g_hwnd, kIdDetach), TRUE);
-        return true;
-    }
-    Log(L"Подключение прошло, но payload не ответил на version");
-    SetStatus(L"Нет ответа от payload");
-    return false;
-}
-
 void DoGitbarShow() {
-    if (!EnsureConnected()) {
+    if (g_job.Busy()) return;
+    uint32_t pid = 0;
+    std::wstring dll;
+    if (!g_client.IsOpen() && !PrepareTarget(&pid, &dll)) {
         MessageBoxW(g_hwnd, L"Нет подключения к процессу (выберите 1cv8.exe).",
                     L"GitBar", MB_ICONINFORMATION);
         return;
     }
     Log(L"> gitbar");
-    std::string resp;
-    if (g_client.Call(L"gitbar", resp, 20000)) {
-        Log(Utf8ToWide(resp));
-        SetStatus(L"GitBar: панель показана (payload остаётся в процессе)");
-    } else {
-        Log(L"(нет ответа)");
-        SetStatus(L"GitBar: нет ответа");
-    }
+    SetStatus(L"GitBar: показываю...");
+    if (!StartJob(JobKind::GitbarShow,
+                  [pid, dll]() { return RunJobCalls(pid, dll, L"gitbar"); }))
+        Log(L"Занято: предыдущая операция ещё выполняется");
 }
 
 void DoGitbarHide() {
+    if (g_job.Busy()) return;
     if (!g_client.IsOpen()) {
         MessageBoxW(g_hwnd, L"Сначала подключитесь к процессу.", L"GitBar",
                     MB_ICONINFORMATION);
         return;
     }
     Log(L"> gitbar hide");
-    std::string resp;
-    if (g_client.Call(L"gitbar hide", resp, 20000)) {
-        Log(Utf8ToWide(resp));
-        SetStatus(L"GitBar: панель скрыта");
-    } else {
-        Log(L"(нет ответа)");
-    }
+    SetStatus(L"GitBar: скрываю...");
+    if (!StartJob(JobKind::GitbarHide,
+                  [] { return RunJobCalls(0, std::wstring(), L"gitbar hide"); }))
+        Log(L"Занято: предыдущая операция ещё выполняется");
 }
 
 // Buttons notify their parent with a SENT WM_COMMAND, which a GetMessage pump
@@ -666,7 +887,10 @@ void DoGitbarHide() {
 struct GitBarSettingsCtx {
     HWND ed[4] = {};
     std::vector<UiField> fields;
+    std::vector<v8i::UiAnchor> anchors;
+    std::wstring iniPath;
     bool saved = false;
+    std::wstring saveError;
 };
 
 LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -710,11 +934,15 @@ LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (c && LOWORD(wp) == IDOK) {
             wchar_t b[4][1024] = {};
             for (int i = 0; i < 4; ++i) GetWindowTextW(c->ed[i], b[i], 1024);
-            if (b[0][0]) GitBarIniSet(L"gitpath", b[0]);
-            if (b[1][0]) GitBarIniSet(L"dumpdir", b[1]);
-            GitBarIniSet(L"commitmsg", b[2]);
-            GitBarIniSet(L"remote", b[3]);
-            c->saved = true;
+            v8i::GitBarSettings s;
+            s.gitPath = b[0];
+            s.dumpDir = b[1];
+            s.commitMessage = b[2];
+            s.remote = b[3];
+            // A64: through v8i::IniSet, which creates the folder of the file
+            // and writes UTF-16 with a marker; "saved" is reported only when
+            // every write succeeded.
+            c->saved = v8i::SaveGitBarSettings(c->iniPath.c_str(), s, &c->saveError);
             DestroyWindow(h);
             return 0;
         }
@@ -734,6 +962,24 @@ LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+    case WM_DPICHANGED: {
+        if (!c) break;
+        const int dpi = (int)HIWORD(wp);
+        const RECT* suggested = (const RECT*)lp;
+        SetWindowPos(h, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        if (dpi >= 48) {
+            // The fonts of the thread are rebuilt by the handler of the main
+            // window for the same change; the places follow here (A81).
+            v8i::ApplyAnchors(c->anchors, dpi);
+            RelayoutFieldsIn(c->fields, dpi);
+        }
+        InvalidateRect(h, nullptr, TRUE);
+        return 0;
+    }
+
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;
@@ -742,31 +988,40 @@ LRESULT CALLBACK GitBarSettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void DoGitbarSettings() {
+    const int dpi = g_dpi;
+    const auto S = [dpi](int v) { return v8i::DpiScale(v, dpi); };
+
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"#32770", L"GitBar — настройки",
                                WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED | WS_VISIBLE |
                                    WS_CLIPCHILDREN,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 460, 226, g_hwnd, nullptr,
+                               CW_USEDEFAULT, CW_USEDEFAULT, S(460), S(226), g_hwnd, nullptr,
                                GetModuleHandleW(nullptr), nullptr);
     if (!dlg) return;
 
     GitBarSettingsCtx ctx;
+    ctx.iniPath = v8i::GitBarIniPath();
     SetWindowLongPtrW(dlg, GWLP_WNDPROC, (LONG_PTR)GitBarSettingsProc);
     SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&ctx);
 
     auto Lbl = [&](int y, const wchar_t* t) {
         HWND s = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                 12, y, 140, 18, dlg, nullptr,
+                                 S(12), S(y), S(140), S(18), dlg, nullptr,
                                  GetModuleHandleW(nullptr), nullptr);
         SendMessageW(s, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+        ctx.anchors.push_back({ s, 12, y, 140, 18 });
     };
     auto Edt = [&](int cellY, int cellW) {
         HWND e = CreateWindowExW(0, L"EDIT", L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                 159, cellY + 1, cellW - 2, 22, dlg, nullptr,
-                                 GetModuleHandleW(nullptr), nullptr);
+                                 0, 0, 0, 0, dlg, nullptr, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(e, WM_SETFONT, (WPARAM)UiFont(), TRUE);
         TrackFieldIn(ctx.fields, e, 158, cellY, cellW, 24);
+        PlaceFieldIn(ctx.fields, e, 158, cellY, cellW, 24, dpi);
         return e;
+    };
+    auto Btn = [&](int id, const wchar_t* text, int x, int y, int w, int h2) {
+        HWND b = CreateUiButton(dlg, id, text, x, y, w, h2, dpi);
+        ctx.anchors.push_back({ b, x, y, w, h2 });
     };
 
     ctx.ed[0] = Edt(13, 286);
@@ -779,43 +1034,68 @@ void DoGitbarSettings() {
     Lbl(45, L"папка выгрузки");
     Lbl(75, L"комментарий к коммиту");
     Lbl(105, L"remote origin (не обяз.)");
-    CreateUiButton(dlg, 2001, L"...", 414, 44, 28, 22);
-    CreateUiButton(dlg, IDOK, L"OK", 158, 150, 90, 26);
-    CreateUiButton(dlg, IDCANCEL, L"Отмена", 258, 150, 90, 26);
+    Btn(2001, L"...", 414, 44, 28, 22);
+    Btn(IDOK, L"OK", 158, 150, 90, 26);
+    Btn(IDCANCEL, L"Отмена", 258, 150, 90, 26);
 
     // Prefill: current values, or a sensible git default.
-    std::wstring git = GitBarIniGet(L"gitpath");
-    if (git.empty() && GetFileAttributesW(L"C:\\Program Files\\Git\\cmd\\git.exe")
-                           != INVALID_FILE_ATTRIBUTES) {
-        git = L"C:\\Program Files\\Git\\cmd\\git.exe";
+    v8i::GitBarSettings s = v8i::LoadGitBarSettings(ctx.iniPath.c_str());
+    if (s.gitPath.empty() && GetFileAttributesW(L"C:\\Program Files\\Git\\cmd\\git.exe")
+                                 != INVALID_FILE_ATTRIBUTES) {
+        s.gitPath = L"C:\\Program Files\\Git\\cmd\\git.exe";
     }
-    SetWindowTextW(ctx.ed[0], git.c_str());
-    SetWindowTextW(ctx.ed[1], GitBarIniGet(L"dumpdir").c_str());
-    SetWindowTextW(ctx.ed[2], GitBarIniGet(L"commitmsg").c_str());
-    SetWindowTextW(ctx.ed[3], GitBarIniGet(L"remote").c_str());
+    SetWindowTextW(ctx.ed[0], s.gitPath.c_str());
+    SetWindowTextW(ctx.ed[1], s.dumpDir.c_str());
+    SetWindowTextW(ctx.ed[2], s.commitMessage.c_str());
+    SetWindowTextW(ctx.ed[3], s.remote.c_str());
 
     SetForegroundWindow(dlg);
     SetFocus(ctx.ed[0]);
 
-    MSG msg;
-    for (;;) {
-        if (!IsWindow(dlg)) break;
-        if (!GetMessageW(&msg, nullptr, 0, 0)) break;
-        if (IsDialogMessageW(dlg, &msg)) continue;
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+    // A61: the owner is disabled for the duration of the dialog, and a WM_QUIT
+    // that arrives meanwhile goes back to the loop of the main window instead
+    // of being eaten here.
+    v8i::PumpOwnedModalLoop(dlg, g_hwnd);
     if (IsWindow(dlg)) DestroyWindow(dlg);
-    if (ctx.saved) Log(L"Настройки GitBar сохранены в " + std::wstring(GitBarIniPath()));
+
+    if (ctx.saved) {
+        Log(L"Настройки GitBar сохранены в " + ctx.iniPath);
+    } else if (!ctx.saveError.empty()) {
+        Log(L"Настройки GitBar НЕ сохранены: " + ctx.saveError);
+    }
+}
+
+// The list columns are fixed widths in 96-DPI units: they follow the DPI of the
+// monitor, and the row image list keeps the rows at 18 units.
+struct ListCol { const wchar_t* text; int width; };
+const ListCol kListCols[] = {
+    { L"PID", 70 }, { L"Имя", 200 }, { L"Разр.", 60 }, { L"Путь", 420 }
+};
+
+void LayoutListColumns(int dpi) {
+    if (!g_list) return;
+    for (int i = 0; i < _countof(kListCols); ++i)
+        ListView_SetColumnWidth(g_list, i, v8i::DpiScale(kListCols[i].width, dpi));
+}
+
+void RecreateRowImageList(int dpi) {
+    if (!g_list) return;
+    // A 1px image list is only there to keep the rows at 1C-ish 18px.
+    HIMAGELIST rowH = ImageList_Create(1, v8i::DpiScale(18, dpi), ILC_COLOR32, 1, 1);
+    if (!rowH) return;
+    HIMAGELIST old = ListView_SetImageList(g_list, rowH, LVSIL_SMALL);
+    if (old) ImageList_Destroy(old);
 }
 
 void CreateControls(HWND hwnd) {
     HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+    const auto S = [](int v) { return v8i::DpiScale(v, g_dpi); };
 
     auto Lbl = [&](int y, int w, const wchar_t* t) {
         HWND s = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                 12, y, w, 20, hwnd, nullptr, hInst, nullptr);
+                                 S(12), S(y), S(w), S(20), hwnd, nullptr, hInst, nullptr);
         SendMessageW(s, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+        Anchor(s, 12, y, w, 20);
         return s;
     };
 
@@ -823,113 +1103,163 @@ void CreateControls(HWND hwnd) {
 
     g_filter = CreateWindowExW(0, L"EDIT", L"",
                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                               97, 10, 218, 22, hwnd, (HMENU)(UINT_PTR)kIdFilter, hInst, nullptr);
+                               0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)kIdFilter, hInst, nullptr);
     SendMessageW(g_filter, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_filter, EM_SETCUEBANNER, TRUE, (LPARAM)L"фильтр по имени");
     TrackField(g_filter, 96, 9, 220, 24);
+    PlaceField(g_filter, 96, 9, 220, 24);
 
-    CreateUiButton(hwnd, kIdRefresh, L"Обновить", 324, 9, 90, 26);
+    Anchor(CreateUiButton(hwnd, kIdRefresh, L"Обновить", 324, 9, 90, 26, g_dpi),
+           324, 9, 90, 26);
 
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
                                  LVS_SHOWSELALWAYS,
-                             13, 45, 758, 238, hwnd, (HMENU)(UINT_PTR)kIdList, hInst, nullptr);
+                             0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)kIdList, hInst, nullptr);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     SendMessageW(g_list, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     ListView_SetBkColor(g_list, kUiFieldBg);
     ListView_SetTextBkColor(g_list, kUiFieldBg);
     ListView_SetTextColor(g_list, kUiText);
-    // A 1px image list is only there to keep the rows at 1C-ish 18px.
-    HIMAGELIST rowH = ImageList_Create(1, 18, ILC_COLOR32, 1, 1);
-    if (rowH) ListView_SetImageList(g_list, rowH, LVSIL_SMALL);
 
-    struct Col { const wchar_t* text; int width; };
-    const Col cols[] = {
-        {L"PID", 70}, {L"Имя", 200}, {L"Разр.", 60}, {L"Путь", 420}
-    };
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < _countof(kListCols); ++i) {
         LVCOLUMNW c{};
         c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-        c.pszText = (LPWSTR)cols[i].text;
-        c.cx = cols[i].width;
+        c.pszText = (LPWSTR)kListCols[i].text;
+        c.cx = v8i::DpiScale(kListCols[i].width, g_dpi);
         c.iSubItem = i;
         ListView_InsertColumn(g_list, i, &c);
     }
     SendMessageW(ListView_GetHeader(g_list), WM_SETFONT, (WPARAM)UiFontBold(), TRUE);
     TrackField(g_list, 12, 44, 760, 240);
+    PlaceField(g_list, 12, 44, 760, 240);
 
     Lbl(294, 80, L"Payload DLL:");
     g_dllEdit = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                97, 292, 558, 22, hwnd, (HMENU)(UINT_PTR)kIdDllEdit, hInst, nullptr);
+                                0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)kIdDllEdit, hInst, nullptr);
     SendMessageW(g_dllEdit, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     TrackField(g_dllEdit, 96, 291, 560, 24);
+    PlaceField(g_dllEdit, 96, 291, 560, 24);
 
-    CreateUiButton(hwnd, kIdBrowse, L"...", 662, 291, 32, 26);
+    // The browse and send buttons follow the right edge, so LayoutMain places
+    // them; the rest of the row is fixed.
+    CreateUiButton(hwnd, kIdBrowse, L"...", 662, 291, 32, 26, g_dpi);
 
-    CreateUiButton(hwnd, kIdInject, L"Инжектировать", 12, 324, 150, 30);
+    Anchor(CreateUiButton(hwnd, kIdInject, L"Инжектировать", 12, 324, 150, 30, g_dpi),
+           12, 324, 150, 30);
 
-    HWND detach = CreateUiButton(hwnd, kIdDetach, L"Отключиться", 170, 324, 120, 30);
+    HWND detach = CreateUiButton(hwnd, kIdDetach, L"Отключиться", 170, 324, 120, 30, g_dpi);
     EnableWindow(detach, FALSE);
+    Anchor(detach, 170, 324, 120, 30);
 
-    CreateUiButton(hwnd, kIdGitbarShow, L"GitBar: показать", 298, 324, 130, 30);
-    CreateUiButton(hwnd, kIdGitbarHide, L"скрыть", 434, 324, 70, 30);
-    CreateUiButton(hwnd, kIdGitbarSettings, L"Настройки", 510, 324, 100, 30);
+    Anchor(CreateUiButton(hwnd, kIdGitbarShow, L"GitBar: показать", 298, 324, 130, 30, g_dpi),
+           298, 324, 130, 30);
+    Anchor(CreateUiButton(hwnd, kIdGitbarHide, L"скрыть", 434, 324, 70, 30, g_dpi),
+           434, 324, 70, 30);
+    Anchor(CreateUiButton(hwnd, kIdGitbarSettings, L"Настройки", 510, 324, 100, 30, g_dpi),
+           510, 324, 100, 30);
 
     g_cmdEdit = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                13, 365, 558, 24, hwnd, (HMENU)(UINT_PTR)kIdCommand, hInst, nullptr);
+                                0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)kIdCommand, hInst, nullptr);
     SendMessageW(g_cmdEdit, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_cmdEdit, EM_SETCUEBANNER, TRUE,
                  (LPARAM)L"objects | pe | peek <addr> [len] | scan <addr>");
     TrackField(g_cmdEdit, 12, 364, 560, 26);
+    PlaceField(g_cmdEdit, 12, 364, 560, 26);
 
-    HWND send = CreateUiButton(hwnd, kIdSend, L"Отправить", 580, 364, 100, 26);
+    HWND send = CreateUiButton(hwnd, kIdSend, L"Отправить", 580, 364, 100, 26, g_dpi);
     EnableWindow(send, FALSE);
 
     g_log = CreateWindowExW(0, L"EDIT", L"",
                             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
                                 ES_READONLY | WS_VSCROLL,
-                            13, 399, 758, 218, hwnd, (HMENU)(UINT_PTR)kIdLog, hInst, nullptr);
+                            0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)kIdLog, hInst, nullptr);
     SendMessageW(g_log, WM_SETFONT, (WPARAM)UiFont(), TRUE);
     SendMessageW(g_log, EM_SETLIMITTEXT, 0, 0);
     TrackField(g_log, 12, 398, 760, 220);
+    PlaceField(g_log, 12, 398, 760, 220);
 
     g_status = CreateWindowExW(0, L"STATIC", L"Не подключено",
                                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                               12, 626, 500, 20, hwnd, (HMENU)(UINT_PTR)kIdStatus, hInst, nullptr);
+                               0, 0, 0, 0, hwnd, (HMENU)(UINT_PTR)kIdStatus, hInst, nullptr);
     SendMessageW(g_status, WM_SETFONT, (WPARAM)UiFont(), TRUE);
+
+    RecreateRowImageList(g_dpi);
 
     // The GUI runs in UTF-8; the payload replies in UTF-8 too.
     SetConsoleOutputCP(CP_UTF8);
 }
 
+// Places everything that depends on the size of the window - and, after a DPI
+// change, everything else - for the DPI of the current monitor (A81).
+void LayoutMain() {
+    if (!g_list) return;
+    const int dpi = g_dpi;
+    const auto S = [dpi](int v) { return v8i::DpiScale(v, dpi); };
+
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    const int pw = rc.right - rc.left;
+    const int ph = rc.bottom - rc.top;
+    // The layout is written for 96-DPI pixels, so the client size is converted
+    // back to them before the fixed boxes are computed.
+    const int w = MulDiv(pw, 96, dpi);
+    const int h = MulDiv(ph, 96, dpi);
+
+    v8i::ApplyAnchors(g_anchors, dpi);
+    PlaceField(g_list, 12, 44, w - 24, 240);
+    PlaceField(g_dllEdit, 96, 291, w - 24 - 96 - 44, 24);
+    SetWindowPos(GetDlgItem(g_hwnd, kIdBrowse), nullptr, S(w - 24 - 40), S(291), S(32),
+                 S(26), SWP_NOZORDER | SWP_NOACTIVATE);
+    PlaceField(g_cmdEdit, 12, 364, w - 24 - 112, 26);
+    SetWindowPos(GetDlgItem(g_hwnd, kIdSend), nullptr, S(w - 24 - 100), S(364), S(100),
+                 S(26), SWP_NOZORDER | SWP_NOACTIVATE);
+    PlaceField(g_log, 12, 398, w - 24, h - 398 - 34);
+    SetWindowPos(g_status, nullptr, S(12), ph - S(26), pw - S(24), S(20),
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+}
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         g_hwnd = hwnd;
+        // The DPI of the monitor the window opened on: the fonts and every
+        // coordinate of the layout are built from it (A81).
+        g_dpi = v8i::WindowDpi(hwnd);
+        // The form opens at 800x700 units. Created at 800x700 physical pixels
+        // it would be smaller than the minimum size at 150%.
+        SetWindowPos(hwnd, nullptr, 0, 0, v8i::DpiScale(800, g_dpi),
+                     v8i::DpiScale(700, g_dpi), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        ResetUiFonts(g_dpi);
         CreateControls(hwnd);
+        LayoutListColumns(g_dpi);
+        LayoutMain();
         RefreshProcesses();
         return 0;
 
     case WM_SIZE:
-        if (g_list) {
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            int w = rc.right - rc.left;
-            int h = rc.bottom - rc.top;
-            PlaceField(g_list, 12, 44, w - 24, 240);
-            PlaceField(g_dllEdit, 96, 291, w - 24 - 96 - 44, 24);
-            SetWindowPos(GetDlgItem(hwnd, kIdBrowse), nullptr, w - 24 - 40, 291, 32, 26,
-                         SWP_NOZORDER);
-            PlaceField(g_cmdEdit, 12, 364, w - 24 - 112, 26);
-            SetWindowPos(GetDlgItem(hwnd, kIdSend), nullptr, w - 24 - 100, 364, 100, 26,
-                         SWP_NOZORDER);
-            PlaceField(g_log, 12, 398, w - 24, h - 398 - 34);
-            SetWindowPos(g_status, nullptr, 12, h - 26, w - 24, 20, SWP_NOZORDER);
-            InvalidateRect(hwnd, nullptr, TRUE);
-        }
+        LayoutMain();
         return 0;
+
+    case WM_DPICHANGED: {
+        // Moved to a monitor with another DPI. Windows hands over a suggested
+        // rectangle; the layout, the fonts and the list follow (A81).
+        const int dpi = (int)HIWORD(wp);
+        const RECT* suggested = (const RECT*)lp;
+        if (dpi >= 48) g_dpi = dpi;
+        SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        ResetUiFonts(g_dpi);
+        LayoutListColumns(g_dpi);
+        RecreateRowImageList(g_dpi);
+        RelayoutFieldsIn(g_fields, g_dpi);
+        LayoutMain();
+        return 0;
+    }
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -939,8 +1269,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // The 1C form separates its status line with a single border.
         HPEN pen = CreatePen(PS_SOLID, 1, kUiBorder);
         HGDIOBJ op = SelectObject(dc, pen);
-        MoveToEx(dc, 12, rc.bottom - 32, nullptr);
-        LineTo(dc, rc.right - 12, rc.bottom - 32);
+        const int x = v8i::DpiScale(12, g_dpi);
+        MoveToEx(dc, x, rc.bottom - v8i::DpiScale(32, g_dpi), nullptr);
+        LineTo(dc, rc.right - x, rc.bottom - v8i::DpiScale(32, g_dpi));
         SelectObject(dc, op);
         DeleteObject(pen);
         PaintFieldFrames(dc);
@@ -974,11 +1305,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_GETMINMAXINFO: {
         auto* mmi = (MINMAXINFO*)lp;
-        // The button row (12..610) plus the 1C-like side margins.
-        mmi->ptMinTrackSize.x = 640;
-        mmi->ptMinTrackSize.y = 560;
+        // The button row (12..610) plus the 1C-like side margins, in 96-DPI
+        // units like the rest of the layout.
+        mmi->ptMinTrackSize.x = v8i::DpiScale(640, g_dpi);
+        mmi->ptMinTrackSize.y = v8i::DpiScale(560, g_dpi);
         return 0;
     }
+
+    case kMsgJobDone:
+        if (g_job.Finish(wp, kMsgJobDone)) OnJobDone();
+        return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -1025,6 +1361,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_DESTROY:
+        // The job may be holding the client and the target process: wait for it
+        // before the client goes away (A80).
+        g_job.Stop();
         g_client.Close();
         PostQuitMessage(0);
         return 0;

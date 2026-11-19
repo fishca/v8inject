@@ -29,6 +29,16 @@ std::string JsonEscape(const std::string& s);
 // The same for a wide string: it is converted to UTF-8 first.
 std::string JsonEscapeWide(const std::wstring& w);
 
+// ---- command lines --------------------------------------------------------
+
+// One argument of a command line, quoted the way CommandLineToArgvW expects.
+// Only an empty argument, or one containing a space, a tab or a double quote,
+// is quoted: a quoted switch is not a switch for cmd.exe, and a path that ends
+// in a backslash loses it to the \" escape when it is quoted unconditionally.
+// Used for git's argv and for the Run value of the tray agent, where the
+// unquoted "C:\Program Files\..." started "C:\Program.exe" (A82).
+std::wstring QuoteArg(const std::wstring& arg);
+
 // ---- numbers and paths ----------------------------------------------------
 
 // Parses a number in the notation of the command line: "0x1A2B" is

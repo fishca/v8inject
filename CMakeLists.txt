@@ -124,20 +124,27 @@ v8i_set_output(v8i_payload)
 # ---- host + cli: runs OUTSIDE the target process ----
 add_executable(v8inject
     src/cli/main.cpp
+    src/cli/watch_state.cpp
     src/host/injector.cpp
     src/host/client.cpp
     src/host/procs.cpp
 )
+target_include_directories(v8inject PRIVATE src)
 target_link_libraries(v8inject PRIVATE v8i_common psapi)
 v8i_set_output(v8inject)
 
 # ---- gui: same host logic, windowed front end ----
 add_executable(v8inject-gui WIN32
     src/gui/main.cpp
+    src/host/gui_settings.cpp
     src/host/injector.cpp
     src/host/client.cpp
     src/host/procs.cpp
+    src/host/ui_job.cpp
+    src/host/ui_layout.cpp
+    src/host/ui_loop.cpp
 )
+target_include_directories(v8inject-gui PRIVATE src)
 target_link_libraries(v8inject-gui PRIVATE v8i_common psapi comctl32 comdlg32 shell32)
 # Injecting into 1C:Enterprise needs PROCESS_VM_* and CREATE_THREAD on the
 # target. When 1C runs elevated a Medium-IL injector gets ACCESS_DENIED (5),
@@ -150,10 +157,13 @@ v8i_set_output(v8inject-gui)
 add_executable(v8inject-agent WIN32
     src/agent/agent.cpp
     src/agent/agent.rc
+    src/host/agent_state.cpp
+    src/host/autostart.cpp
     src/host/injector.cpp
     src/host/client.cpp
     src/host/procs.cpp
 )
+target_include_directories(v8inject-agent PRIVATE src)
 target_link_libraries(v8inject-agent PRIVATE v8i_common psapi comctl32 comdlg32 shlwapi)
 v8i_set_output(v8inject-agent)
 
@@ -189,6 +199,17 @@ add_executable(v8i_tests
     # implementation: porcelain paths, quit propagation, the repository gate and
     # the git runner's deadline/cap (A54, A55, A58, A76, A77).
     tests/unit_gitbar.cpp
+    # The hosts: the watcher's rearm and cache (A56), the modal loop of the GUI
+    # and its worker thread (A61, A80), the agent's process bookkeeping and Run
+    # key (A62, A82), the GitBar settings write (A64) and the DPI scaling (A81).
+    tests/unit_hosts.cpp
+    src/cli/watch_state.cpp
+    src/host/agent_state.cpp
+    src/host/autostart.cpp
+    src/host/gui_settings.cpp
+    src/host/ui_job.cpp
+    src/host/ui_layout.cpp
+    src/host/ui_loop.cpp
     # The host side of the protocol lives in the host: the test plays the
     # payload, so it needs the real Client. The injector comes with it (the
     # client calls it), but the test never injects anything.
@@ -215,6 +236,7 @@ add_executable(v8i_tests
     src/payload/objects.cpp
     src/payload/v8i_export.cpp
 )
+target_include_directories(v8i_tests PRIVATE src)
 target_link_libraries(v8i_tests PRIVATE v8i_common capstone comctl32 msimg32 shell32)
 # The payload sources are compiled in, so their exported entry points are
 # defined here rather than imported.
