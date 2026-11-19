@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 
+#include "v8inject/text.h"
+
 // Menu enumeration and invocation for the configurator's own menus. The menu
 // bar of 1C's designer is an MFC custom control: GetMenu() on the frame from
 // OUTSIDE the process returns null, so these commands exist inside the payload
@@ -14,13 +16,6 @@
 namespace v8i {
 
 namespace {
-
-std::string Narrow(const std::wstring& w) {
-    std::string out;
-    out.reserve(w.size());
-    for (wchar_t c : w) out.push_back(c < 0x80 ? (char)c : '?');
-    return out;
-}
 
 std::string TrimNarrow(const std::string& s) {
     size_t a = 0, b = s.size();
@@ -39,85 +34,95 @@ std::string WideToUtf8(const wchar_t* s) {
     return out;
 }
 
-// One menu item, flattened text without ampersands.
-std::string ItemText(HMENU menu, int i) {
+// One menu item, flattened text without ampersands, escaped for a JSON string.
+std::string ItemTextJson(HMENU menu, int i) {
     wchar_t buf[512] = {};
     GetMenuStringW(menu, i, buf, 512, MF_BYPOSITION);
-    std::string t = WideToUtf8(buf);
-    std::string out;
-    for (char c : t) if (c != '&') out.push_back(c);
-    return TrimNarrow(out);
+    const std::string t = WideToUtf8(buf);
+    std::string flat;
+    for (char c : t) if (c != '&') flat.push_back(c);
+    return JsonEscape(TrimNarrow(flat));
 }
 
-void AppendItem(std::string& j, HMENU menu, int i, int depth) {
-    UINT state = GetMenuState(menu, i, MF_BYPOSITION);
-    UINT id = GetMenuItemID(menu, i);
-    bool separator = (state & MF_SEPARATOR) != 0;
-    bool grayed = (state & (MF_GRAYED | MF_DISABLED)) != 0;
+// All items of a menu, joined by commas. Declared first: a submenu item needs
+// it, and the two call each other.
+std::string ItemsOf(HMENU menu, int depth);
 
-    if (separator) return;
+// One menu item as a complete JSON value, or an empty string for a separator.
+//
+// A47: the whole fragment (a 45-byte prefix and the text) used to be formatted
+// into a char[64], so any item with a few characters of text was cut inside a
+// JSON string, the text went in through %s without escaping (a file-base path
+// with a backslash broke the document), and the caller wrote a comma before
+// asking for an item that a separator then returned empty: the reply of every
+// real designer menu was ",," and dangling commas. Now one item is one
+// std::string, and the caller joins the non-empty ones.
+std::string ItemJson(HMENU menu, int i, int depth) {
+    const UINT state = GetMenuState(menu, i, MF_BYPOSITION);
+    if (state & MF_SEPARATOR) return std::string();
 
-    char buf[64];
+    const UINT id = GetMenuItemID(menu, i);
+    const bool grayed = (state & (MF_GRAYED | MF_DISABLED)) != 0;
+    const std::string text = ItemTextJson(menu, i);
+
     if (id == (UINT)-1 || id == 0) {
         // Popup submenu.
         HMENU sub = GetSubMenu(menu, i);
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"kind\":\"submenu\",\"depth\":%d,\"text\":\"%s\",\"items\":[",
-                    depth, ItemText(menu, i).c_str());
-        j += buf;
-        if (sub) {
-            int n = GetMenuItemCount(sub);
-            for (int k = 0; k < n; ++k) {
-                if (k) j += ",";
-                AppendItem(j, sub, k, depth + 1);
-            }
-        }
-        j += "]}";
-    } else {
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"kind\":\"cmd\",\"depth\":%d,\"id\":%u,\"text\":\"%s\",\"enabled\":%s}",
-                    depth, id, ItemText(menu, i).c_str(), grayed ? "false" : "true");
-        j += buf;
+        return "{\"kind\":\"submenu\",\"depth\":" + std::to_string(depth) +
+               ",\"text\":\"" + text + "\",\"items\":[" +
+               (sub ? ItemsOf(sub, depth + 1) : std::string()) + "]}";
     }
+    return "{\"kind\":\"cmd\",\"depth\":" + std::to_string(depth) + ",\"id\":" +
+           std::to_string(id) + ",\"text\":\"" + text + "\",\"enabled\":" +
+           (grayed ? "false" : "true") + "}";
 }
 
-void AppendWindow(std::string& j, HWND hwnd, const std::string& filter) {
+std::string ItemsOf(HMENU menu, int depth) {
+    std::string out;
+    const int n = GetMenuItemCount(menu);
+    for (int i = 0; i < n; ++i) {
+        const std::string one = ItemJson(menu, i, depth);
+        if (one.empty()) continue;
+        if (!out.empty()) out += ",";
+        out += one;
+    }
+    return out;
+}
+
+// One window as a complete JSON value, or an empty string when the filter
+// rejects it: the caller used to append the comma before the call, so a
+// filtered-out window left the comma behind (A47).
+std::string WindowJson(HWND hwnd, const std::string& filter) {
     wchar_t title[256] = {};
     GetWindowTextW(hwnd, title, 256);
     wchar_t cls[128] = {};
     GetClassNameW(hwnd, cls, 128);
 
-    std::string t = WideToUtf8(title);
-    std::string c = WideToUtf8(cls);
+    const std::string t = WideToUtf8(title);
+    const std::string c = WideToUtf8(cls);
     if (!filter.empty() && t.find(filter) == std::string::npos &&
         c.find(filter) == std::string::npos) {
-        return;
+        return std::string();
     }
 
-    char buf[256];
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "{\"hwnd\":\"0x%llX\",\"class\":\"%s\",\"title\":\"%s\",\"menu\":",
-                (unsigned long long)(uintptr_t)hwnd, c.c_str(), t.c_str());
-    j += buf;
+    char num[48];
+    _snprintf_s(num, sizeof(num), _TRUNCATE, "\"hwnd\":\"0x%llX\",",
+                (unsigned long long)(uintptr_t)hwnd);
+    std::string j = "{" + std::string(num) + "\"class\":\"" + JsonEscape(c) + "\",\"title\":\"" +
+                    JsonEscape(t) + "\",\"menu\":";
 
     HMENU menu = GetMenu(hwnd);
-    if (!menu) {
-        j += "null}";
-        return;
-    }
-    j += "[";
-    int n = GetMenuItemCount(menu);
-    for (int i = 0; i < n; ++i) {
-        if (i) j += ",";
-        AppendItem(j, menu, i, 0);
-    }
-    j += "]}";
+    if (!menu) return j + "null}";
+    return j + "[" + ItemsOf(menu, 0) + "]}";
 }
 
 }  // namespace
 
 std::string MenuCommandToJson(const std::wstring& args) {
-    std::string filter = Narrow(args);
+    // A47: the filter is UTF-8, not ASCII: a Cyrillic window title has to be
+    // selectable by its own text.
+    const std::string filter = WideToUtf8(args.c_str());
+
     // First window with a non-empty title is the main frame; include children
     // too, because the menu may live on a client window of the frame.
     struct Win { HWND h; std::string cls; std::string title; };
@@ -146,11 +151,15 @@ std::string MenuCommandToJson(const std::wstring& args) {
     bool first = true;
     for (const Win& w : wins) {
         // Only frames and their immediate children; skip tiny tool windows.
-        BOOL isChild = GetParent(w.h) == frame || w.h == frame;
+        const BOOL isChild = GetParent(w.h) == frame || w.h == frame;
         if (!isChild) continue;
+        // A47: the comma belongs to a window that is really in the reply, not
+        // to one the filter drops.
+        std::string one = WindowJson(w.h, filter);
+        if (one.empty()) continue;
         if (!first) j += ",";
         first = false;
-        AppendWindow(j, w.h, filter);
+        j += one;
     }
     j += "]}";
     return j;

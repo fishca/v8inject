@@ -188,19 +188,26 @@ std::string PeToJson(const std::wstring& args) {
 
     j += ",\"exportCount\":" + std::to_string(img.exports.size());
     j += ",\"exports\":[";
+    // A46: the counter was incremented before the limit was checked, so the
+    // 201st export left a trailing comma and the reply of a large module
+    // (core83, config: hundreds of exports) did not parse at all. The item is
+    // also assembled into a std::string now: a mangled name longer than ~100
+    // characters used to be cut inside a char[256].
     size_t shown = 0;
     for (const PeExport& e : img.exports) {
-        if (shown++) j += ",";
-        if (shown > 200) break;
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"name\":\"%s\",\"rva\":\"0x%X\",\"va\":\"0x%llX\",\"ordinal\":%u%s%s%s}",
-                    JsonEscape(e.name).c_str(), e.rva, (unsigned long long)(img.base + e.rva), e.ordinal,
-                    e.forwarded ? ",\"forwarded\":true,\"to\":\"" : "",
-                    e.forwarded ? JsonEscape(e.forwarder).c_str() : "",
-                    e.forwarded ? "\"" : "");
-        j += buf;
+        if (shown >= kPeMaxExports) break;
+        if (shown) j += ",";
+        ++shown;
+        char num[128];
+        _snprintf_s(num, sizeof(num), _TRUNCATE,
+                    "\"rva\":\"0x%X\",\"va\":\"0x%llX\",\"ordinal\":%u", e.rva,
+                    (unsigned long long)(img.base + e.rva), e.ordinal);
+        j += "{\"name\":\"" + JsonEscape(e.name) + "\"," + num;
+        if (e.forwarded) j += ",\"forwarded\":true,\"to\":\"" + JsonEscape(e.forwarder) + "\"";
+        j += "}";
     }
     j += "]";
+    if (shown < img.exports.size()) j += ",\"exportsTruncated\":true";
 
     // Only the module names: a full list with bases overflows the response
     // buffer and hides the interesting fields.

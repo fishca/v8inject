@@ -136,14 +136,21 @@ void LogLine(const char* fmt, ...) {
     if (n > 0) {
         va_list ap;
         va_start(ap, fmt);
-        int m = _vsnprintf_s(line + n, sizeof(line) - n, _TRUNCATE, fmt, ap);
+        // Two bytes stay reserved for the line end: a message that fills the
+        // buffer completely would otherwise leave its entry without "\r\n" and
+        // the next line would be glued to it.
+        int m = _vsnprintf_s(line + n, sizeof(line) - n - 2, _TRUNCATE, fmt, ap);
         va_end(ap);
-        if (m > 0) n += m;
-        if (n < (int)sizeof(line) - 2) {
-            line[n++] = '\r';
-            line[n++] = '\n';
-            line[n] = 0;
-        }
+        // A89: with _TRUNCATE the function returns -1 when the text did not
+        // fit -- but it did write what fits and NUL-terminated it. Adding only
+        // positive returns kept the timestamp prefix and threw the message away
+        // ("command received: <4 KB>" reached the log as an empty line). Measure
+        // what actually landed in the buffer.
+        if (m < 0) m = (int)strlen(line + n);
+        n += m;
+        line[n++] = '\r';
+        line[n++] = '\n';
+        line[n] = 0;
     }
 
     EnsureLogLock();

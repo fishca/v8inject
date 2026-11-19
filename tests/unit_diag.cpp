@@ -98,3 +98,47 @@ V8I_TEST(Diag_ConcurrentInitAndPathSwitch) {
     LogLine("fallback check");
     SetLogDirectory(dirA.c_str());
 }
+
+V8I_TEST(Diag_LongLineKeepsItsText) {
+    const std::wstring dir = TempDir(L"long");
+    DeleteFileW((dir + L"v8inject.log").c_str());
+    SetLogDirectory(dir.c_str());
+
+    // A89: _vsnprintf_s returns -1 when the text does not fit, but it does
+    // write what fits and terminates it. The code added only positive returns,
+    // so `n` stayed at the length of the timestamp prefix and the payload wrote
+    // that many bytes: a long line -- "command received: <4 KB>" -- reached the
+    // log as an empty line.
+    //
+    // The message is longer than a line (2048 bytes), so the call really
+    // truncates; the marker sits 1500 characters in, inside what does fit.
+    const std::string tail = "_LOGTAIL_";
+    std::string message(1500, 'x');
+    message += tail;
+    message += std::string(1500, 'y');
+    LogLine("%s", message.c_str());
+    LogLine("second line");
+
+    FILE* f = nullptr;
+    REQUIRE(_wfopen_s(&f, (dir + L"v8inject.log").c_str(), L"rb") == 0);
+    REQUIRE(f != nullptr);
+    std::string all;
+    char buf[4096];
+    for (size_t got = 0; (got = fread(buf, 1, sizeof(buf), f)) > 0;) all.append(buf, got);
+    fclose(f);
+
+    // The line carries its text, not only the prefix.
+    CHECK(all.find(tail) != std::string::npos);
+    CHECK(all.find(std::string(64, 'x')) != std::string::npos);
+    CHECK(all.size() > 1500);
+    // The timestamp prefix is still there.
+    CHECK(all.find("[pid ") != std::string::npos);
+
+    // A truncated line still ends its line: the next entry starts on a new one.
+    const size_t end = all.find("\r\n");
+    REQUIRE(end != std::string::npos);
+    CHECK(all.find("second line") > end);
+    // And no entry runs past the buffer of one line.
+    CHECK(end < 2048);
+}
+

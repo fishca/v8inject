@@ -14,11 +14,13 @@
 #include "v8inject/text.h"
 #include "commands/inspect_commands.h"
 #include "platform/platform_commands.h"
+#include "reply_fit.h"
 
 #include <windows.h>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <string>
 
 using namespace v8i;
@@ -212,34 +214,85 @@ struct ThunkCtx {
 };
 ThunkCtx g_thunk{};
 
+// Why the packer returned 0 (no reply landed in the buffer). A crash of the
+// command is not the only way there: a C++ exception thrown by the command --
+// std::bad_alloc above all, when a scan wants a vector it cannot have -- used
+// to escape the packer and terminate the payload thread with no answer at all
+// (A69).
+enum PackReason {
+    kPackNone = 0,
+    kPackOutOfMemory,
+    kPackThrew,
+};
+PackReason g_packReason = kPackNone;
+
 int PackedThunk(const wchar_t* text, char* out, size_t outCap, size_t* outLen) {
     if (!g_thunk.fn) return 0;
-    std::string tmp = g_thunk.fn(std::wstring(text ? text : L""));
-    size_t n = tmp.size();
-    if (n > outCap - 1) n = outCap - 1;
-    memcpy(out, tmp.data(), n);
-    out[n] = 0;
-    *outLen = n;
-    return 1;
+    g_packReason = kPackNone;
+    try {
+        // A69: the reply is no longer cut to the buffer. `tmp` lives in this
+        // frame, which is unwound without C++ destructors if the command
+        // faults -- the request is answered with an error and the one buffer
+        // is what the crash costs.
+        std::string tmp = g_thunk.fn(std::wstring(text ? text : L""));
+        return (int)payload::FitReply(tmp, out, outCap, outLen);
+    } catch (const std::bad_alloc&) {
+        g_packReason = kPackOutOfMemory;
+    } catch (...) {
+        g_packReason = kPackThrew;
+    }
+    *outLen = 0;
+    return 0;
 }
 
 }  // namespace
 
 static std::string Guarded(const wchar_t* what, CommandFn fn, const std::wstring& args) {
-    wchar_t safe[1024] = {};
-    wcsncpy_s(safe, _countof(safe), args.c_str(), _TRUNCATE);
-
-    static std::vector<char> buffer(512 * 1024);
-    buffer.resize(512 * 1024);
+    // A69: the request holds kRequestChars (4096) wide characters, and the
+    // argument used to be copied into wchar_t[1024]: a long command line was
+    // answered for its first quarter, silently. The guarded frame takes only a
+    // pointer, and `args` outlives the call, so it is passed as it is.
+    //
+    // The response goes into a buffer of exactly the size the block has: the
+    // copy either fits whole or is refused (see reply_fit.h).
+    static char buffer[kResponseBytes];
 
     g_thunk.fn = fn;
+    g_packReason = kPackNone;
     size_t len = 0;
     unsigned code = 0;
     uintptr_t faultAt = 0;
-    if (GuardCall(PackedThunk, safe, buffer.data(), buffer.size(), &len, &code, &faultAt))
-        return std::string(buffer.data(), len);
+    const int fit = GuardCall(PackedThunk, args.c_str(), buffer, sizeof(buffer), &len, &code,
+                              &faultAt);
+    if (fit == payload::kReplyFits) return std::string(buffer, len);
 
     char buf[320];
+    if (fit == payload::kReplyTooLarge) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"response too large\","
+                    "\"command\":\"%ls\",\"bytes\":%llu,\"limit\":%d}",
+                    what ? what : L"?", (unsigned long long)len, (int)(kResponseBytes - 1));
+        LogLine("command refused: %llu-byte reply does not fit %d bytes", (unsigned long long)len,
+                (int)(kResponseBytes - 1));
+        return buf;
+    }
+    if (g_packReason == kPackOutOfMemory) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"out of memory in command\","
+                    "\"command\":\"%ls\"}",
+                    what ? what : L"?");
+        LogLine("command ran out of memory");
+        return buf;
+    }
+    if (g_packReason == kPackThrew) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"status\":\"error\",\"message\":\"command raised a C++ exception\","
+                    "\"command\":\"%ls\"}",
+                    what ? what : L"?");
+        LogLine("command threw an exception");
+        return buf;
+    }
+
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "{\"status\":\"error\",\"message\":\"command crashed\","
                 "\"command\":\"%ls\",\"exception\":\"0x%08X\",\"at\":\"0x%llX\"}",

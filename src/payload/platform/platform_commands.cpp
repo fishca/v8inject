@@ -1,4 +1,5 @@
 #include "platform_commands.h"
+#include "cmdinfo_json.h"
 #include "pending_slot.h"
 
 #include "v8inject/diag.h"
@@ -1860,6 +1861,22 @@ static void V8iObserveCreateWindow(uintptr_t a0, uintptr_t a1, uintptr_t a2, uin
 // return value landed eight bytes off and the caller's frame was touched.
 // The engine's thunk restores the stack before it enters the trampoline, so
 // the copied prologue sees exactly the frame the original function would.
+// A48: the counters of the 8.5 path as one member list. Every member carries
+// its own comma here, so a field cannot be joined to the next one by accident
+// -- which is what happened between "subscribed" and "qProcFrame", and the
+// reply of an 8.5 process was not JSON at all.
+std::string CmdInfoTailJson(const CmdInfoTail& t) {
+    char buf[640];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                ",\"evCount\":%ld,\"evFrame\":\"0x%llX\",\"hookOk\":%d,\"cwHits\":%ld,"
+                "\"subscribed\":%d,\"qProcFrame\":\"0x%llX\",\"qProcRecv\":\"0x%llX\","
+                "\"qCmdFrame\":\"0x%llX\",\"qCmdRecv\":\"0x%llX\","
+                "\"qEvFrame\":\"0x%llX\",\"qEvRecv\":\"0x%llX\"",
+                t.evCount, t.evFrame, t.hookOk, t.cwHits, t.subscribed, t.qProcFrame,
+                t.qProcRecv, t.qCmdFrame, t.qCmdRecv, t.qEvFrame, t.qEvRecv);
+    return std::string(buf);
+}
+
 static bool V8iInstallCreateWindowHook() {
     if (g_cwHookOk) return true;
     HMODULE u32 = GetModuleHandleW(L"user32.dll");
@@ -2410,18 +2427,20 @@ std::string CmdInfoToJsonA() {
                     j += fb;
                 }
                 {
-                    char nb2[520];
-                    _snprintf_s(nb2, sizeof(nb2), _TRUNCATE,
-                                ",\"evCount\":%ld,\"evFrame\":\"0x%llX\",\"hookOk\":%d,\"cwHits\":%ld,\"subscribed\":%d"
-                                "\"qProcFrame\":\"0x%llX\",\"qProcRecv\":\"0x%llX\","
-                                "\"qCmdFrame\":\"0x%llX\",\"qCmdRecv\":\"0x%llX\","
-                                "\"qEvFrame\":\"0x%llX\",\"qEvRecv\":\"0x%llX\"",
-                                g85_evCount, (unsigned long long)g85_evFrame,
-                                g_cwHookOk, g_cwHits, g85_subscribed,
-                                (unsigned long long)g85_qProcFrame, (unsigned long long)g85_qProcRecv,
-                                (unsigned long long)g85_qCmdFrame, (unsigned long long)g85_qCmdRecv,
-                                (unsigned long long)g85_qEvFrame, (unsigned long long)g85_qEvRecv);
-                    j += nb2;
+                    // A48: one builder, one comma per member.
+                    CmdInfoTail t;
+                    t.evCount = g85_evCount;
+                    t.evFrame = (unsigned long long)g85_evFrame;
+                    t.hookOk = g_cwHookOk;
+                    t.cwHits = g_cwHits;
+                    t.subscribed = g85_subscribed;
+                    t.qProcFrame = (unsigned long long)g85_qProcFrame;
+                    t.qProcRecv = (unsigned long long)g85_qProcRecv;
+                    t.qCmdFrame = (unsigned long long)g85_qCmdFrame;
+                    t.qCmdRecv = (unsigned long long)g85_qCmdRecv;
+                    t.qEvFrame = (unsigned long long)g85_qEvFrame;
+                    t.qEvRecv = (unsigned long long)g85_qEvRecv;
+                    j += CmdInfoTailJson(t);
                 }
             } else {
                 j += "\"fn\":null";
