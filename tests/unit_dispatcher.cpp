@@ -58,13 +58,26 @@ public:
         io_->request[0] = 0;
         io_->response[0] = 0;
 
-        thread_ = std::thread([this] { V8iRunCommandLoop(io_); });
+        thread_ = std::thread([this] {
+            V8iRunCommandLoop(io_);
+            finished_ = true;
+        });
         return true;
     }
 
     void Stop() {
         if (!thread_.joinable()) return;
         InterlockedExchange((volatile LONG*)&io_->ready, kStateExit);
+        // A command that is walking memory can outlive the test that sent it,
+        // and an unbounded join() would hang the whole `unit` process (A87).
+        // The deadline is generous; if it passes, the loop thread is detached
+        // and the mapping stays alive for it instead of being unmapped under
+        // it -- the test process is about to exit anyway.
+        for (int i = 0; i < 600 && !finished_; ++i) Sleep(10);
+        if (!finished_) {
+            thread_.detach();
+            return;
+        }
         thread_.join();
         if (io_) { UnmapViewOfFile(io_); io_ = nullptr; }
         if (hMap_) { CloseHandle(hMap_); hMap_ = nullptr; }
@@ -114,6 +127,7 @@ private:
     HANDLE hMap_ = nullptr;
     SharedIo* io_ = nullptr;
     std::thread thread_;
+    std::atomic<bool> finished_{false};
 };
 
 // ---- windows with a real menu bar, for the `menu` command (A47) ----------
@@ -165,6 +179,86 @@ void ExpectJson(const char* what, const std::string& reply) {
                 reply.substr(from, 260).c_str());
     CHECK(false);
 }
+
+// A window of another process, for the `menucmd` pid check (A93). The child is
+// this very binary in its --window-child mode: it creates the window, prints
+// its handle and leaves when its stdin reaches EOF, so it cannot outlive the
+// test that started it.
+class ForeignWindow {
+public:
+    ~ForeignWindow() { Stop(); }
+
+    bool Start() {
+        SECURITY_ATTRIBUTES inheritable = { sizeof(inheritable), nullptr, TRUE };
+        // The child's stdin: the write end stays here, so the child lives while
+        // the test does and goes away when it is closed.
+        if (!CreatePipe(&lifeRead_, &lifeWrite_, &inheritable, 0)) return false;
+        SetHandleInformation(lifeWrite_, HANDLE_FLAG_INHERIT, 0);
+        if (!CreatePipe(&outRead_, &outWrite_, &inheritable, 0)) { Stop(); return false; }
+
+        wchar_t self[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(self) + L"\" --window-child";
+
+        STARTUPINFOW si = {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = lifeRead_;
+        si.hStdOutput = outWrite_;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        PROCESS_INFORMATION pi = {};
+        const BOOL started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
+                                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        CloseHandle(lifeRead_);
+        lifeRead_ = nullptr;
+        CloseHandle(outWrite_);
+        outWrite_ = nullptr;
+        if (!started) { Stop(); return false; }
+        process_ = pi.hProcess;
+        thread_ = pi.hThread;
+
+        // The handle arrives as one hex line.
+        std::string text;
+        char c = 0;
+        DWORD got = 0;
+        while (ReadFile(outRead_, &c, 1, &got, nullptr) && got == 1) {
+            if (c == '\n') break;
+            text += c;
+        }
+        CloseHandle(outRead_);
+        outRead_ = nullptr;
+        hwnd_ = (HWND)_wcstoui64(Utf8ToWide(text).c_str(), nullptr, 16);
+        return hwnd_ != nullptr;
+    }
+
+    void Stop() {
+        if (lifeWrite_) { CloseHandle(lifeWrite_); lifeWrite_ = nullptr; }
+        if (outRead_) { CloseHandle(outRead_); outRead_ = nullptr; }
+        if (process_) {
+            // EOF on stdin is the normal way out; the wait is only a bound.
+            if (WaitForSingleObject(process_, 3000) != WAIT_OBJECT_0) {
+                TerminateProcess(process_, 0);
+                WaitForSingleObject(process_, 1000);
+            }
+            CloseHandle(process_);
+            process_ = nullptr;
+        }
+        if (thread_) { CloseHandle(thread_); thread_ = nullptr; }
+        if (lifeRead_) { CloseHandle(lifeRead_); lifeRead_ = nullptr; }
+        hwnd_ = nullptr;
+    }
+
+    HWND hwnd() const { return hwnd_; }
+
+private:
+    HANDLE lifeRead_ = nullptr;
+    HANDLE lifeWrite_ = nullptr;
+    HANDLE outRead_ = nullptr;
+    HANDLE outWrite_ = nullptr;
+    HANDLE process_ = nullptr;
+    HANDLE thread_ = nullptr;
+    HWND hwnd_ = nullptr;
+};
 
 }  // namespace
 
@@ -713,4 +807,114 @@ V8I_TEST(Dispatcher_ByHwndFindsTheOwnerOnThisBuild) {
     CHECK(reply.find(off) != std::string::npos);
 
     DestroyWindow(frame);
+}
+
+// ---------------------------------------------------------------------------
+// A93: `menucmd` refuses a window it does not own
+// ---------------------------------------------------------------------------
+
+V8I_TEST(MenuCmdRefusesAWindowOfAnotherProcess) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    ForeignWindow foreign;
+    REQUIRE(foreign.Start());
+
+    HWND own = CreateMenuFrame(L"v8i menucmd own", nullptr);
+    REQUIRE(own != nullptr);
+
+    wchar_t ownHex[32] = {};
+    _snwprintf_s(ownHex, _countof(ownHex), _TRUNCATE, L"0x%llX",
+                 (unsigned long long)(uintptr_t)own);
+    wchar_t foreignHex[32] = {};
+    _snwprintf_s(foreignHex, _countof(foreignHex), _TRUNCATE, L"0x%llX",
+                 (unsigned long long)(uintptr_t)foreign.hwnd());
+
+    std::string reply;
+
+    // The normal case: the window belongs to the process the payload lives in.
+    REQUIRE(d.Ask((std::wstring(L"menucmd ") + ownHex + L" 101").c_str(), reply));
+    ExpectJson("menucmd (own window)", reply);
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(reply.find("\"posted\":true") != std::string::npos);
+
+    // Another process's window: posting WM_COMMAND into it would call a window
+    // procedure of a process this payload does not drive (A93).
+    REQUIRE(d.Ask((std::wstring(L"menucmd ") + foreignHex + L" 101").c_str(), reply));
+    ExpectJson("menucmd (foreign window)", reply);
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+    CHECK(reply.find("another process") != std::string::npos);
+
+    // A handle that names no window at all is refused as well.
+    REQUIRE(d.Ask(L"menucmd 0x1 101", reply));
+    ExpectJson("menucmd (no window)", reply);
+    CHECK(reply.find("\"status\":\"error\"") != std::string::npos);
+
+    DestroyWindow(own);
+}
+
+// ---------------------------------------------------------------------------
+// A93: `around` and `xref` build a JSON document and escape their text
+// ---------------------------------------------------------------------------
+
+V8I_TEST(AroundAndXrefAnswersAreJson) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    // A real instruction stream of this process: the reply disassembles it and
+    // marks the exact address. Capstone text goes through JsonEscape now, the
+    // same way `disasm` builds its own reply.
+    const uintptr_t here = (uintptr_t)&AroundAndXrefAnswersAreJson;
+    wchar_t hex[32] = {};
+    _snwprintf_s(hex, _countof(hex), _TRUNCATE, L"0x%llX", (unsigned long long)here);
+
+    wchar_t self[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    const wchar_t* leaf = wcsrchr(self, L'\\');
+    leaf = leaf ? leaf + 1 : self;
+
+    std::wstring cmd = L"around ";
+    cmd += leaf;
+    cmd += L" ";
+    cmd += hex;
+
+    std::string reply;
+    REQUIRE(d.Ask(cmd.c_str(), reply, 10000));
+    ExpectJson("around", reply);
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(reply.find("\"here\":true") != std::string::npos);
+    CHECK(reply.find("\"text\":") != std::string::npos);
+
+    // xref resolves the module from the main image (the test binary) and walks
+    // its code section; the reply states what was scanned.
+    cmd = L"xref ";
+    cmd += leaf;
+    cmd += L" ";
+    cmd += hex;
+    cmd += L" --count 32";
+    REQUIRE(d.Ask(cmd.c_str(), reply, 120000));
+    ExpectJson("xref", reply);
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(reply.find("\"module\":\"") != std::string::npos);
+    CHECK(reply.find("\"scannedTo\":\"0x") != std::string::npos);
+    CHECK(reply.find("\"xrefs\":[") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// A94: a non-ASCII command line reaches the payload intact
+// ---------------------------------------------------------------------------
+
+V8I_TEST(Dispatcher_ReadsACyrillicCommandLine) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    // The request block carries UTF-16, and `find` echoes its pattern as JSON.
+    // A command that went through a narrow conversion somewhere on the way
+    // would come back as "???" -- which is exactly what a console read with
+    // fgets and decoded as UTF-8 produced (A94).
+    std::string reply;
+    REQUIRE(d.Ask(L"find ЖЖЖ --max 1", reply, 60000));
+    ExpectJson("find <cyrillic>", reply);
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(reply.find(WideToUtf8(L"ЖЖЖ")) != std::string::npos);
 }

@@ -157,10 +157,26 @@ jobs:
             $bin = "artifacts/v8inject-$arch"
             # The release ships the four user-facing binaries only: the hook
             # test target and the smoke-test log live in the artifact too and
-            # stay out of the archive.
+            # stay out of the archive. The archive is assembled in a staging
+            # folder because Compress-Archive flattens the paths it is given:
+            # the license texts have to land under LICENSES/.
+            $stage = "dist/v8inject-$tag-$arch"
+            New-Item -ItemType Directory -Force $stage | Out-Null
             $files = @('v8inject.exe', 'v8inject-gui.exe', 'v8inject-agent.exe',
                        'v8i_payload.dll') | ForEach-Object { Join-Path $bin $_ }
-            Compress-Archive -Path $files -DestinationPath "dist/v8inject-$tag-$arch.zip"
+            Copy-Item $files -Destination $stage -ErrorAction Stop
+            # BSD-3-Clause (Capstone) and MIT (the GitBar icons) require their
+            # texts in a binary distribution: the project's own LICENSE and the
+            # vendored license files travel with the binaries (A88).
+            Copy-Item LICENSE, THIRD-PARTY-NOTICES.md $stage -ErrorAction Stop
+            New-Item -ItemType Directory -Force "$stage/LICENSES/capstone" | Out-Null
+            New-Item -ItemType Directory -Force "$stage/LICENSES/icons" | Out-Null
+            Copy-Item third_party/capstone/LICENSE.TXT,
+                      third_party/capstone/LICENSE_LLVM.TXT -Destination "$stage/LICENSES/capstone" -ErrorAction Stop
+            Copy-Item src/payload/icons/qtv8reader/LICENSE-METADATA-ICONS.txt,
+                      src/payload/icons/qtv8reader/ATTRIBUTION.md -Destination "$stage/LICENSES/icons" -ErrorAction Stop
+            Compress-Archive -Path "$stage/*" -DestinationPath "dist/v8inject-$tag-$arch.zip"
+            Remove-Item -Recurse -Force $stage
           }
           Get-ChildItem dist
 

@@ -182,6 +182,18 @@ std::string MenuCmdToJson(const std::wstring& args) {
         return "{\"status\":\"error\",\"message\":\"usage: menucmd <hwnd> <menu-id>\"}";
     }
 
+    // A93: the payload acts on ITS process. Posting WM_COMMAND into a window of
+    // another process would run a window procedure this payload knows nothing
+    // about, and a handle of a dead window can be reused.
+    DWORD owner = 0;
+    GetWindowThreadProcessId((HWND)hwnd, &owner);
+    if (!owner || !IsWindow((HWND)hwnd)) {
+        return "{\"status\":\"error\",\"message\":\"no window with that handle\"}";
+    }
+    if (owner != GetCurrentProcessId()) {
+        return "{\"status\":\"error\",\"message\":\"the window belongs to another process\"}";
+    }
+
     BOOL ok = PostMessageW((HWND)hwnd, WM_COMMAND, (WPARAM)id, 0);
     char buf[128];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,

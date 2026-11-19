@@ -2,9 +2,12 @@
 #include "v8inject/diag.h"
 #include "v8inject/injector.h"
 #include "v8inject/pe_utils.h"
+#include "v8inject/procs.h"
 #include "v8inject/protocol.h"
 #include "v8inject/text.h"
 
+#include "cli/argv_tools.h"
+#include "cli/console_input.h"
 #include "cli/watch_state.h"
 
 #include <windows.h>
@@ -116,9 +119,14 @@ Options ParseOptions(int argc, wchar_t** argv, int first) {
 }
 
 // Defined below RunWatch; declared here so the watch block can use them.
-DWORD ResolvePid(int argc, wchar_t** argv, const wchar_t* exe);
+DWORD ResolvePid(const wchar_t* exe);
 void PrintOpenFailure(v8i::Client& client, const Options& o);
 void CloseSession(v8i::Client& client);
+
+// Set by wmain from --pid: the option is stripped out of argv before anything
+// counts positions (A95), so the choice has to be carried here rather than
+// scanned for again in every command.
+DWORD g_pidOverride = 0;
 
 // Console output must be wide: the payload speaks UTF-8, and %hs would try to
 // interpret that as the active ANSI code page (866/1251), producing mojibake.
@@ -137,18 +145,22 @@ void CloseSession(v8i::Client& client);
 // line, e.g. a git commit script). With --once it fires exactly once and
 // exits; without it, it rearms and keeps watching until --timeout-sec.
 int RunWatch(int argc, wchar_t** argv) {
-    if (argc < 3) {
+    // A95: with --pid the <exe> argument is not there, so the first option is
+    // already argv[2]; the option was stripped out of argv by wmain.
+    const bool pidGiven = g_pidOverride != 0;
+    const int firstArg = pidGiven ? 2 : 3;
+    if (argc < firstArg) {
         wprintf(L"usage: v8inject watch <exe> --dump-dir <path> --run <cmd> "
                 L"[--debounce-sec N] [--timeout-sec N] [--once] [--dry-run]\n");
         return 1;
     }
-    DWORD pid = ResolvePid(argc, argv, argv[2]);
-    if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+    DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+    if (!pid) return 2;
 
     std::wstring dumpDir, runCmd;
     int debounceMs = 8000, timeoutMs = 600000;
     bool once = false, dryRun = false;
-    for (int i = 3; i < argc; ++i) {
+    for (int i = firstArg; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--dump-dir" && i + 1 < argc) dumpDir = argv[++i];
         else if (a == L"--run" && i + 1 < argc) runCmd = argv[++i];
@@ -164,7 +176,7 @@ int RunWatch(int argc, wchar_t** argv) {
     if (debounceMs <= 0) debounceMs = 8000;
     if (timeoutMs <= 0) timeoutMs = 600000;
 
-    Options o = ParseOptions(argc, argv, 3);
+    Options o = ParseOptions(argc, argv, firstArg);
     v8i::Client client;
     if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
         PrintOpenFailure(client, o);
@@ -336,22 +348,28 @@ void CloseSession(v8i::Client& client) {
 
 // Target selection. A name picks the first process with that image; --pid picks
 // one exactly, which matters when several instances of the same binary run (two
-// 1cv8.exe windows, for instance).
-DWORD ResolvePid(int argc, wchar_t** argv, const wchar_t* exe) {
-    for (int i = 2; i + 1 < argc; ++i) {
-        if (std::wstring(argv[i]) == L"--pid") {
-            DWORD pid = (DWORD)_wtoi(argv[i + 1]);
-            if (!pid) continue;
-            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (!h) {
-                wprintf(L"cannot open pid %lu (win32 %lu)\n", pid, GetLastError());
-                return 0;
-            }
-            CloseHandle(h);
-            return pid;
+// 1cv8.exe windows, for instance). `exe` is empty when --pid was given.
+DWORD ResolvePid(const wchar_t* exe) {
+    if (g_pidOverride) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_pidOverride);
+        if (!h) {
+            wprintf(L"cannot open pid %lu (win32 %lu)\n", g_pidOverride, GetLastError());
+            return 0;
         }
+        CloseHandle(h);
+        return g_pidOverride;
     }
-    return v8i::FindProcessByName(exe);
+    const DWORD pid = v8i::FindProcessByName(exe);
+    if (!pid) wprintf(L"process not found: %ls\n", exe);
+    return pid;
+}
+
+// The image name of a pid: `scan --pid N` has no <exe> argument to take it from,
+// and the payload needs the module name for the default target.
+std::wstring ImageNameOf(DWORD pid) {
+    for (const v8i::ProcessEntry& e : v8i::ListProcesses())
+        if (e.pid == pid) return e.name;
+    return std::wstring();
 }
 
 // A payload command that just forwards its argument string across the shared
@@ -359,8 +377,8 @@ DWORD ResolvePid(int argc, wchar_t** argv, const wchar_t* exe) {
 // to build the request line and print whatever JSON comes back.
 int RunPayloadCommand(const wchar_t* cmdName, const wchar_t* exe,
                       int argc, wchar_t** argv, int first, int timeoutMs) {
-    DWORD pid = ResolvePid(argc, argv, exe);
-    if (!pid) { wprintf(L"process not found: %s\n", exe); return 2; }
+    DWORD pid = ResolvePid(exe);
+    if (!pid) return 2;
 
     Options o = ParseOptions(argc, argv, first);
     v8i::LogLine("%ls: target pid=%lu", cmdName, pid);
@@ -395,6 +413,24 @@ int RunPayloadCommand(const wchar_t* cmdName, const wchar_t* exe,
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2) { PrintUsage(); return 1; }
 
+    // A95: "--pid <n>" is an option of the CLI, not the <exe> argument. It is
+    // removed before anything counts positions: `peek --pid 1234 0x1000` used
+    // to read the pid as the address and quietly ignore the real one.
+    const v8i::PidOption pidOption = v8i::StripPidOption(argc, argv);
+    std::vector<std::wstring> args = pidOption.args;
+    std::vector<wchar_t*> argPtrs;
+    argPtrs.reserve(args.size());
+    for (std::wstring& a : args) argPtrs.push_back(&a[0]);
+    argc = (int)argPtrs.size();
+    argv = argPtrs.data();
+    g_pidOverride = (DWORD)pidOption.pid;
+    if (argc < 2) { PrintUsage(); return 1; }
+
+    // With --pid there is no <exe> argument at all: the option took its slot,
+    // so the first payload argument is already argv[2].
+    const bool pidGiven = g_pidOverride != 0;
+    const int arg0 = pidGiven ? 2 : 3;
+
     std::wstring cmd = argv[1];
     if (cmd == L"--help" || cmd == L"-h" || cmd == L"/?") { PrintUsage(); return 0; }
 
@@ -402,15 +438,17 @@ int wmain(int argc, wchar_t** argv) {
     InitHostLog();
 
     // Windows console defaults to the OEM code page; switching to UTF-8 lets
-    // Cyrillic window titles survive the trip from the payload.
+    // Cyrillic window titles survive the trip from the payload. Input needs no
+    // SetConsoleCP: the interactive session reads the console with
+    // ReadConsoleW, which hands out UTF-16 regardless of the code page (A94).
     SetConsoleOutputCP(CP_UTF8);
 
     if (cmd == L"objects") {
-        if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+        if (argc < arg0) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
 
-        Options o = ParseOptions(argc, argv, 3);
+        Options o = ParseOptions(argc, argv, arg0);
         v8i::LogLine("objects: target pid=%lu", pid);
 
         v8i::Client client;
@@ -428,13 +466,13 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (cmd == L"find") {
-        if (argc < 4) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+        if (argc < arg0 + 1) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
 
-        Options o = ParseOptions(argc, argv, 4);
+        Options o = ParseOptions(argc, argv, arg0 + 1);
         std::wstring request = L"find ";
-        for (int i = 3; i < argc; ++i) {
+        for (int i = arg0; i < argc; ++i) {
             std::wstring a = argv[i];
             if (a == L"--dll" || a == L"--timeout" || a == L"--pid") { ++i; continue; }
             request += a;
@@ -463,39 +501,46 @@ int wmain(int argc, wchar_t** argv) {
         cmd == L"cmd85" || cmd == L"cmd" || cmd == L"menu" || cmd == L"menucmd" ||
         cmd == L"str" ||
         cmd == L"hook" || cmd == L"hooks" || cmd == L"unhook" || cmd == L"trace") {
-        if (argc < 3) { PrintUsage(); return 1; }
-        if (cmd == L"imports" && argc < 4) { PrintUsage(); return 1; }
+        if (argc < arg0) { PrintUsage(); return 1; }
+        if (cmd == L"imports" && argc < arg0 + 1) { PrintUsage(); return 1; }
         // cmd 45 opens a modal dump dialog: the 1C UI thread (and with it the
         // payload's marshal SendMessageTimeout, 30 s) stays busy, so the reply
         // legitimately takes longer than the default 15 s.
         int timeout = (cmd == L"xref" || cmd == L"cmd85" || cmd == L"cmd")
                           ? 120000 : 15000;
-        Options o = ParseOptions(argc, argv, 3);
-        return RunPayloadCommand(cmd.c_str(), argv[2], argc, argv, 3, timeout);
+        Options o = ParseOptions(argc, argv, arg0);
+        return RunPayloadCommand(cmd.c_str(), pidGiven ? L"" : argv[2], argc, argv,
+                                 arg0, timeout);
     }
 
     if (cmd == L"peek" || cmd == L"pe") {
-        if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+        if (argc < arg0) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
 
-        Options o = ParseOptions(argc, argv, 3);
+        Options o = ParseOptions(argc, argv, arg0);
         std::wstring request;
-        int next = 3;
+        int next = arg0;
 
         if (cmd == L"peek") {
-            if (argc < 4) { PrintUsage(); return 1; }
+            if (argc < arg0 + 1) { PrintUsage(); return 1; }
             uintptr_t addr = 0;
-            if (!v8i::ParseNumber(argv[3], &addr)) { wprintf(L"bad address: %ls\n", argv[3]); return 1; }
+            if (!v8i::ParseNumber(argv[arg0], &addr)) {
+                wprintf(L"bad address: %ls\n", argv[arg0]);
+                return 1;
+            }
             int len = 64;
-            if (argc > 4 && argv[4][0] != L'-') { len = _wtoi(argv[4]); next = 5; }
+            if (argc > arg0 + 1 && argv[arg0 + 1][0] != L'-') {
+                len = _wtoi(argv[arg0 + 1]);
+                next = arg0 + 2;
+            }
             wchar_t buf[128] = {};
             _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"peek %llx %d",
                          (unsigned long long)addr, len);
             request = buf;
         } else {
             std::wstring mod;
-            if (argc > 3 && argv[3][0] != L'-') { mod = argv[3]; next = 4; }
+            if (argc > arg0 && argv[arg0][0] != L'-') { mod = argv[arg0]; next = arg0 + 1; }
             request = L"pe";
             if (!mod.empty()) request += L" " + mod;
         }
@@ -519,11 +564,11 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (cmd == L"attach") {
-        if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %ls\n", argv[2]); return 2; }
+        if (argc < arg0) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
 
-        Options o = ParseOptions(argc, argv, 3);
+        Options o = ParseOptions(argc, argv, arg0);
         v8i::Client client;
         if (!client.Open(pid, o.dll, ExeDir(), o.timeoutMs)) {
             PrintOpenFailure(client, o);
@@ -537,9 +582,25 @@ int wmain(int argc, wchar_t** argv) {
         wprintf(L"attached: %ls pid=%lu\n", client.SharedName(), pid);
         fflush(stdout);
 
-        char line[4096];
-        while (fgets(line, sizeof(line), stdin)) {
-            std::wstring req = Utf8ToWide(line);
+        // A94: a line is read whole. The old loop read stdin with fgets into
+        // char[4096]: a longer line came back as two commands -- the tail of
+        // one was executed as the next -- and a console handed out OEM bytes
+        // that were then decoded as UTF-8. The reader takes a console as
+        // UTF-16 (ReadConsoleW) and a pipe as UTF-8, and it refuses a line that
+        // does not fit into the request block instead of splitting it.
+        v8i::LineReader input(GetStdHandle(STD_INPUT_HANDLE));
+        for (;;) {
+            const v8i::ConsoleLine line = input.Next(v8i::kRequestChars - 1);
+            if (line.eof) break;
+            if (line.tooLong) {
+                wprintf(L"{\"status\":\"error\",\"message\":\"the command line is %llu "
+                        L"characters, the request block holds %llu: nothing was sent\"}\n",
+                        (unsigned long long)line.chars,
+                        (unsigned long long)(v8i::kRequestChars - 1));
+                fflush(stdout);
+                continue;
+            }
+            std::wstring req = Utf8ToWide(line.utf8);
             // A piped stream may start with a UTF-8 BOM. Left in place it turns
             // the first command into "\uFEFFhook ...", which matches no command
             // prefix -- the payload answers "scan failed" and the command is
@@ -624,9 +685,9 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (cmd == L"modules") {
-        if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
+        if (argc < arg0) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
         wprintf(L"pid        : %lu\n", pid);
         wprintf(L"target x64 : %s\n", v8i::IsProcess64(pid) ? L"yes" : L"no");
         wprintf(L"host arch  : %s\n", sizeof(void*) == 8 ? L"x64" : L"x86");
@@ -683,11 +744,11 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (cmd == L"inject") {
-        if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
+        if (argc < arg0) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
 
-        Options o = ParseOptions(argc, argv, 3);
+        Options o = ParseOptions(argc, argv, arg0);
         wprintf(L"pid=%lu payload=%s\n", pid, o.dll.c_str());
         if (!v8i::InjectLibrary(pid, o.dll)) {
             wprintf(L"inject failed (arch mismatch or insufficient rights)\n");
@@ -698,11 +759,11 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (cmd == L"probe") {
-        if (argc < 3) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
+        if (argc < arg0) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
 
-        Options o = ParseOptions(argc, argv, 3);
+        Options o = ParseOptions(argc, argv, arg0);
         v8i::LogLine("probe: target pid=%lu payload=%ls timeout=%d",
                      pid, o.dll.c_str(), o.timeoutMs);
 
@@ -723,18 +784,21 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (cmd == L"scan") {
-        if (argc < 4) { PrintUsage(); return 1; }
-        DWORD pid = ResolvePid(argc, argv, argv[2]);
-        if (!pid) { wprintf(L"process not found: %s\n", argv[2]); return 2; }
+        if (argc < arg0 + 1) { PrintUsage(); return 1; }
+        DWORD pid = ResolvePid(pidGiven ? L"" : argv[2]);
+        if (!pid) return 2;
 
         uintptr_t addr = 0;
-        if (!v8i::ParseNumber(argv[3], &addr)) {
-            wprintf(L"bad address: %s\n", argv[3]);
+        if (!v8i::ParseNumber(argv[arg0], &addr)) {
+            wprintf(L"bad address: %ls\n", argv[arg0]);
             return 1;
         }
 
-        Options o = ParseOptions(argc, argv, 4);
-        if (o.module.empty()) o.module = argv[2];
+        Options o = ParseOptions(argc, argv, arg0 + 1);
+        if (o.module.empty()) {
+            // --pid took the <exe> slot, so the module name comes from the pid.
+            o.module = pidGiven ? ImageNameOf(pid) : argv[2];
+        }
         v8i::LogLine("scan: target pid=%lu addr=%llx module=%ls",
                      pid, (unsigned long long)addr, o.module.c_str());
 

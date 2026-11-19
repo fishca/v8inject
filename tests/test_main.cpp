@@ -19,6 +19,31 @@ static int Flood() {
     }
 }
 
+// A child mode of the test binary itself: a window that belongs to ANOTHER
+// process. MenuCmdRefusesAWindowOfAnotherProcess uses it -- the payload has to
+// refuse to post a menu command into a window it does not own (A93).
+static int WindowChild() {
+    const wchar_t kClass[] = L"V8iTestForeignWindow";
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kClass;
+    if (!RegisterClassExW(&wc)) return 2;
+    HWND h = CreateWindowExW(0, kClass, L"v8i foreign window", WS_OVERLAPPEDWINDOW,
+                             0, 0, 200, 120, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!h) return 3;
+    std::printf("%llX\n", (unsigned long long)(uintptr_t)h);
+    std::fflush(stdout);
+
+    // The parent holds the write end of this stdin pipe: EOF there means "go
+    // away", so the helper cannot outlive the test even if it fails.
+    char c = 0;
+    DWORD got = 0;
+    ReadFile(GetStdHandle(STD_INPUT_HANDLE), &c, 1, &got, nullptr);
+    return 0;
+}
+
 // The unit tests have no framework around them: the runner prints the result
 // and returns the number of failed tests as the exit code.
 //
@@ -29,6 +54,7 @@ static int Flood() {
 // name otherwise).
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--flood") return Flood();
+    if (argc > 1 && std::string(argv[1]) == "--window-child") return WindowChild();
 
     wchar_t self[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, self, MAX_PATH);

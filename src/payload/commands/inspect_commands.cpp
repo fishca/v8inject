@@ -753,21 +753,24 @@ std::string XrefToJson(const std::wstring& args) {
     const std::vector<Xref>& hits = xr.hits;
 
     // Report what was actually scanned: a wrong module here silently produces
-    // an empty result that looks like "no references".
+    // an empty result that looks like "no references". Every string goes
+    // through the JSON escaper (A93): the module name is a path from the
+    // target's PEB, not something this code chose.
     const wchar_t* leaf = wcsrchr(m.path.c_str(), L'\\');
+    const std::wstring moduleName = leaf ? std::wstring(leaf + 1) : m.path;
     char buf[320];
-    std::string j = "{\"status\":\"ok\",\"target\":\"" + targetKind + "\"";
+    std::string j = "{\"status\":\"ok\",\"target\":\"" + JsonEscape(targetKind) + "\"";
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                ",\"module\":\"%ls\",\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu"
+                ",\"moduleBase\":\"0x%llX\",\"moduleSize\":%zu"
                 ",\"scannedTo\":\"0x%llX\",\"bytesSeen\":%zu,\"badBytes\":%zu%s"
-                ",\"from\":\"0x%llX\",\"to\":\"0x%llX\",\"stop\":\"%s\",\"csError\":%d",
-                leaf ? leaf + 1 : m.path.c_str(),
+                ",\"from\":\"0x%llX\",\"to\":\"0x%llX\",\"csError\":%d",
                 (unsigned long long)img.base, (size_t)m.size,
                 (unsigned long long)xr.scannedTo, xr.bytesSeen, xr.badBytes,
                 xr.hitLimit ? ",\"hitLimit\":true" : "",
-                (unsigned long long)from, (unsigned long long)to,
-                xr.stopReason ? xr.stopReason : "", xr.csError);
+                (unsigned long long)from, (unsigned long long)to, xr.csError);
     j += buf;
+    j += ",\"module\":\"" + EscapeW(moduleName) + "\"";
+    j += ",\"stop\":\"" + JsonEscape(xr.stopReason ? xr.stopReason : "") + "\"";
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 ",\"targetAddr\":\"0x%llX\",\"scanned\":\"0x%llX-0x%llX\",\"hitCount\":%zu,\"xrefs\":[",
                 (unsigned long long)target, (unsigned long long)from,
@@ -778,10 +781,10 @@ std::string XrefToJson(const std::wstring& args) {
     for (const Xref& x : hits) {
         if (!first) j += ",";
         first = false;
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"from\":\"0x%llX\",\"how\":\"%s\"}",
-                    (unsigned long long)x.from, x.how.c_str());
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "{\"from\":\"0x%llX\",",
+                    (unsigned long long)x.from);
         j += buf;
+        j += "\"how\":\"" + JsonEscape(x.how) + "\"}";
     }
     j += "]}";
     (void)first;
@@ -1095,11 +1098,14 @@ std::string AroundToJson(const std::wstring& args) {
     for (const Insn& i : insns) {
         if (!first) j += ",";
         first = false;
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"addr\":\"0x%llX\",\"text\":\"%s %s\"%s}",
-                    (unsigned long long)i.address, i.mnemonic.c_str(), i.opStr.c_str(),
-                    i.address == a.addr ? ",\"here\":true" : "");
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "{\"addr\":\"0x%llX\"",
+                    (unsigned long long)i.address);
         j += buf;
+        // A93: the disassembled text is escaped like in `disasm` -- a quote or
+        // a backslash in an operand must not end the JSON string.
+        j += ",\"text\":\"" + JsonEscape(i.mnemonic) + " " + JsonEscape(i.opStr) + "\"";
+        if (i.address == a.addr) j += ",\"here\":true";
+        j += "}";
     }
     j += "]}";
     return j;

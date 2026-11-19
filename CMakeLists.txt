@@ -9,13 +9,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # local ANSI code page (1251) and emits broken literals, and the linker has no
 # reason to treat the resulting bytes as UTF-8.
 if(MSVC)
-    add_compile_options(/utf-8)
+    # C++ only: ml.exe knows neither /utf-8 nor /W4, and passing them to MASM
+    # produced A4018 "unknown option" for every thunk (A97). The C language is
+    # named as well: the project has no .c files today, but a future one would
+    # need the switch for the same reason.
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
     # The project used to compile with the default /W3 and never saw its own
     # warnings -- a mismatched int/LONG in std::max reached a release build
     # that way. /W4 and the strict conformance switches make the compiler show
     # what it knows; /WX comes once the code is clean (see the CI job).
-    # C++ only: ml.exe knows neither /W4 nor /permissive-, and the MASM thunks
-    # would silently produce no object file.
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>
                         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
                         $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
@@ -102,11 +104,14 @@ endif()
 target_compile_definitions(v8i_payload PRIVATE V8I_PAYLOAD_EXPORTS)
 # The payload runs inside the Configurator, so the hardening options that
 # abort the process are off limits there: a fortified check turns a detected
-# overflow into abort(), and that would kill 1C along with the panel. The
-# detour targets are allocated with VirtualAlloc and are not registered
-# Control Flow Guard targets, so CFG would refuse the jump into them. (The
-# linker only knows /guard:cf, the "off" form is a compiler switch.)
-target_compile_options(v8i_payload PRIVATE /sdl- /guard:cf-)
+# overflow into abort(), and that would kill 1C along with the panel.
+#
+# Nothing in this build enables Control Flow Guard (no /guard:cf anywhere), so
+# there is nothing to switch off: the detour targets are VirtualAlloc pages
+# that are not registered CFG targets, and CFG would refuse the jump into them.
+# The old "/guard:cf-" here was a no-op that read as if CFG were on (A97); if
+# CFG is ever enabled for the hosts, this payload must stay out of it.
+target_compile_options(v8i_payload PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/sdl->)
 # msimg32: the GitBar draws 1C's own toolbar pictures, which are RGBA -
 # GDI needs AlphaBlend for that.
 target_link_libraries(v8i_payload PRIVATE v8i_common capstone comctl32 msimg32 shell32)
@@ -124,6 +129,8 @@ v8i_set_output(v8i_payload)
 # ---- host + cli: runs OUTSIDE the target process ----
 add_executable(v8inject
     src/cli/main.cpp
+    src/cli/argv_tools.cpp
+    src/cli/console_input.cpp
     src/cli/watch_state.cpp
     src/host/injector.cpp
     src/host/client.cpp
@@ -209,6 +216,12 @@ add_executable(v8i_tests
     # (A75, A91) and the readable-range checks (A84). The engine is compiled
     # into this binary, so the tests install real hooks on their own stubs.
     tests/unit_hook.cpp
+    # The CLI plumbing that a console would otherwise be needed for: the --pid
+    # option is stripped before positions are counted (A95) and the interactive
+    # session reads a line whole instead of splitting it (A94).
+    tests/unit_cli.cpp
+    src/cli/argv_tools.cpp
+    src/cli/console_input.cpp
     src/cli/watch_state.cpp
     src/host/agent_state.cpp
     src/host/autostart.cpp
@@ -261,6 +274,9 @@ v8i_set_output(v8i_tests)
 enable_testing()
 add_test(NAME cli_help COMMAND v8inject --help)
 add_test(NAME unit COMMAND v8i_tests)
+# A hung test used to eat the whole 30-minute CI job: the suite walks the
+# address space, so a scan that never returns is not hypothetical (A87/A97).
+set_tests_properties(unit PROPERTIES TIMEOUT 600)
 
 # End-to-end hook test: injects the payload into v8i_hook_target.exe, hooks a
 # function with known arguments, and checks that the call was recorded and that
