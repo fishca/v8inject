@@ -178,6 +178,10 @@ add_executable(v8i_tests
     tests/unit_diag.cpp
     tests/unit_injector.cpp
     tests/unit_procs.cpp
+    # The marshal slot and the receiver patch of the payload: both are pod
+    # state machines that the payload compiles into this binary as well.
+    tests/unit_pending.cpp
+    tests/unit_menu_patch.cpp
     # The host side of the protocol lives in the host: the test plays the
     # payload, so it needs the real Client. The injector comes with it (the
     # client calls it), but the test never injects anything.

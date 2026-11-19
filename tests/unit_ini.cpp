@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <cstring>
+#include <vector>
 
 using namespace v8i;
 
@@ -142,4 +143,121 @@ V8I_TEST(Ini_MissingFileReadsEmpty) {
     const std::wstring path = TempIni(L"v8i_test_ini_absent.ini");
     Remove(path);
     CHECK(IniGet(path.c_str(), L"git", L"dumpdir").empty());
+}
+
+// --- IniGetManual: reading without the Win32 profile APIs (A53) ------------
+//
+// The payload's native menu reads [git] nativemenu through IniGetManual. The
+// emergency switch was dead: IniSet writes UTF-16 with a BOM, and the old raw
+// byte search for "nativemenu" stopped at the NUL right after the mark.
+
+namespace {
+
+void WriteBytes(const std::wstring& path, const void* data, size_t len) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, data, (DWORD)len, &written, nullptr);
+    CloseHandle(f);
+}
+
+// The bytes IniSet produces: UTF-16LE with a byte order mark.
+std::vector<char> Utf16(const wchar_t* text) {
+    std::vector<char> b;
+    b.push_back('\xFF');
+    b.push_back('\xFE');
+    const size_t n = wcslen(text) * sizeof(wchar_t);
+    const char* p = (const char*)text;
+    b.insert(b.end(), p, p + n);
+    return b;
+}
+
+}  // namespace
+
+V8I_TEST(IniManual_ReadsAUtf16FileWrittenByIniSet) {
+    const std::wstring path = TempIni(L"v8i_test_ini_manual_utf16.ini");
+    Remove(path);
+    Remove(path);
+
+    REQUIRE(IniSet(path.c_str(), L"git", L"nativemenu", L"0"));
+    bool found = false;
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"nativemenu", L"1", &found), L"0");
+    CHECK(found);
+
+    // The same file read as raw bytes would not contain a single byte of the
+    // key name: it is UTF-16, not ASCII.
+    CHECK(IniGetManual(path.c_str(), L"git", L"nosuchkey", L"1", &found) == L"1");
+    CHECK(!found);
+    Remove(path);
+}
+
+V8I_TEST(IniManual_ReadsUtf8AnsiAndUtf16BigEndian) {
+    const std::wstring path = TempIni(L"v8i_test_ini_manual_encodings.ini");
+    Remove(path);
+
+    // UTF-8 with a mark.
+    {
+        const char text[] = "\xEF\xBB\xBF[git]\r\nnativemenu=0\r\n";
+        WriteBytes(path, text, sizeof(text) - 1);
+        bool found = false;
+        CHECK_EQ(IniGetManual(path.c_str(), L"git", L"nativemenu", L"1", &found), L"0");
+        CHECK(found);
+    }
+    // ANSI, no mark at all (a file from an older build).
+    {
+        const char text[] = "[git]\r\nnativemenu = 0\r\n";
+        WriteBytes(path, text, sizeof(text) - 1);
+        CHECK_EQ(IniGetManual(path.c_str(), L"git", L"nativemenu", L"1"), L"0");
+    }
+    // UTF-16 big endian: 0xFE 0xFF, then the text with swapped bytes.
+    {
+        const wchar_t text[] = L"[git]\nnativemenu=0\n";
+        std::vector<char> b;
+        b.push_back('\xFE');
+        b.push_back('\xFF');
+        for (const wchar_t* p = text; *p; ++p) {
+            b.push_back((char)(*p >> 8));
+            b.push_back((char)(*p & 0xFF));
+        }
+        WriteBytes(path, b.data(), b.size());
+        CHECK_EQ(IniGetManual(path.c_str(), L"git", L"nativemenu", L"1"), L"0");
+    }
+    Remove(path);
+}
+
+V8I_TEST(IniManual_SectionCommentsAndCaseAreHandled) {
+    const std::wstring path = TempIni(L"v8i_test_ini_manual_sections.ini");
+    Remove(path);
+    const std::wstring text =
+        L"; a comment line\r\n"
+        L"# another one\r\n"
+        L"global=1\r\n"
+        L"[agent]\r\n"
+        L"nativemenu=1\r\n"
+        L"[git]\r\n"
+        L"  nativemenu = 0 \r\n"
+        L"dumpdir=E:\\dump\r\n";
+    const std::vector<char> b = Utf16(text.c_str());
+    WriteBytes(path, b.data(), b.size());
+
+    bool found = false;
+    // The value of the [git] section, trimmed; the [agent] one must not win.
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"nativemenu", L"1", &found), L"0");
+    CHECK(found);
+    CHECK_EQ(IniGetManual(path.c_str(), L"agent", L"nativemenu", L"1"), L"1");
+    CHECK_EQ(IniGetManual(path.c_str(), L"GIT", L"NATIVEMENU", L"1"), L"0");   // names are case-insensitive
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"dumpdir", L""), L"E:\\dump");
+    // A key before any section belongs to no section: the [git] read misses it.
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"global", L"absent"), L"absent");
+    Remove(path);
+}
+
+V8I_TEST(IniManual_MissingFileAndBadArgumentsUseTheFallback) {
+    bool found = true;
+    CHECK_EQ(IniGetManual(TempIni(L"v8i_test_ini_manual_absent.ini").c_str(), L"git",
+                          L"nativemenu", L"1", &found), L"1");
+    CHECK(!found);
+    CHECK_EQ(IniGetManual(nullptr, L"git", L"nativemenu", L"on"), L"on");
+    CHECK_EQ(IniGetManual(TempIni(L"x.ini").c_str(), L"git", nullptr, L"on"), L"on");
 }

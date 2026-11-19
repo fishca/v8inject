@@ -32,12 +32,14 @@
 
 #include "v8inject/diag.h"
 #include "v8inject/hook.h"
+#include "v8inject/ini.h"
 #include "v8inject/memscan.h"
 #include "v8inject/pe.h"
 #include "v8inject/pe_utils.h"
 #include "v8inject/v8i_export.h"
 
 #include "icons_png.h"   // те же PNG-глифы 1С, что и у панели GitBar
+#include "menu_patch.h"  // транзакционная установка перехватов приёмника
 
 #include <windows.h>
 #include <commctrl.h>
@@ -149,6 +151,32 @@ constexpr size_t kMMEStr = 0x40, kMMEInt1 = 0x58, kMMEInt2 = 0x5C, kMMEByte = 0x
 // на прочих версиях пункт не добавляется и работает fallback-оверлей.
 constexpr uintptr_t kMMWrapperRva = 0xBFCB0;
 
+// Пролог обёртки — проверяется перед установкой хука (A52). На 8.3.27.2342
+// по этим RVA в обоих модулях лежит один и тот же код:
+//   48 83 EC 38                sub  rsp,38h
+//   48 C7 44 24 20 FE FF FF FF mov  qword ptr [rsp+20h],-2
+//   48 85 C9                   test rcx,rcx
+//   74 13                      je   ...
+//   48 8B 01                   mov  rax,[rcx]
+//   48 8D 15 rel32             lea  rdx,[IID_ICommandService]
+//   FF 50 70                   call qword ptr [rax+70h]
+// На 8.3.27.1989 в тех же местах — середина чужих функций (проверено чтением
+// файлов платформы: 1cv8.exe `08 48 3B DD…`, config.dll `62 41 0F 11…`),
+// поэтому хук без этой проверки патчил бы произвольный код.
+constexpr unsigned char kMMWrapperHead[] = {
+    0x48, 0x83, 0xEC, 0x38, 0x48, 0xC7, 0x44, 0x24, 0x20,
+    0xFE, 0xFF, 0xFF, 0xFF, 0x48, 0x85, 0xC9, 0x74, 0x13,
+    0x48, 0x8B, 0x01, 0x48, 0x8D, 0x15};
+constexpr unsigned char kMMWrapperTail[] = {0xFF, 0x50, 0x70};   // call [rax+0x70], смещение rel32 не проверяем
+
+bool MMPrologueOk(uintptr_t addr) {
+    unsigned char b[sizeof(kMMWrapperHead) + 4 + sizeof(kMMWrapperTail)] = {};
+    if (!addr || !IsReadable((void*)addr, sizeof(b))) return false;
+    memcpy(b, (const void*)addr, sizeof(b));
+    if (memcmp(b, kMMWrapperHead, sizeof(kMMWrapperHead)) != 0) return false;
+    return memcmp(b + sizeof(kMMWrapperHead) + 4, kMMWrapperTail, sizeof(kMMWrapperTail)) == 0;
+}
+
 // --- состояние --------------------------------------------------------------
 
 struct MMState {
@@ -182,15 +210,23 @@ MMState g_mm;
 
 // Наблюдатель хука обёртки: 1С сама передаёт сюда SCOM_Process. Захват один
 // раз; POD-правила соблюдены (Interlocked + присвоение).
+// The wrapper is generic and the hook is called with an arbitrary `self` and an
+// IID pointer; both are only read when they are actually readable (A52 — a
+// thunk called this with a non-GUID and the exception escaped the hook).
 void MMObsTakeProc(uintptr_t a0, uintptr_t a1, uintptr_t, uintptr_t) {
-    if (!a0 || !a1) return;
+    if (!a0 || !a1 || !IsReadable((void*)a1, sizeof(GUID))) return;
     // Лог запрашиваемого IID: обёртка generic — платформа просит разные
-    // сервисы; захват процесса имеет смысл только для нашего IID.
-    GUID iid = *(const GUID*)a1;
-    LogLine("mainmenu: wrapper: proc=0x%llX iid={%08X-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X}",
-            (unsigned long long)a0, iid.Data1, iid.Data2, iid.Data3,
-            iid.Data4[0], iid.Data4[1], iid.Data4[2], iid.Data4[3],
-            iid.Data4[4], iid.Data4[5], iid.Data4[6], iid.Data4[7]);
+    // сервисы; захват процесса имеет смысл только для нашего IID. Один раз:
+    // обёртку зовут на каждый getService, журнал не должен расти на старте.
+    static volatile LONG logged = 0;
+    GUID iid = {};
+    memcpy(&iid, (const void*)a1, sizeof(iid));
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        LogLine("mainmenu: wrapper: proc=0x%llX iid={%08X-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X}",
+                (unsigned long long)a0, iid.Data1, iid.Data2, iid.Data3,
+                iid.Data4[0], iid.Data4[1], iid.Data4[2], iid.Data4[3],
+                iid.Data4[4], iid.Data4[5], iid.Data4[6], iid.Data4[7]);
+    }
     g_mm.lastObservedIid = iid;
     if (iid.Data1 == 0x8F885821 && iid.Data2 == 0xD353) {   // ICommandService
         if (InterlockedCompareExchange((volatile LONG*)&g_mm.procTaken, 1, 0) == 0) {
@@ -405,6 +441,11 @@ uintptr_t MMCmdEntry(const GUID& group, unsigned num, const GUID& category,
     return e;
 }
 
+// Описание команды: платформа отдаёт объект, поля которого лежат по
+// откалиброванным смещениям (b = descr - 0x70). Проверка формы объявлена здесь:
+// пишут в описание функции ниже, а MMRead/IsReadable определены дальше.
+bool MMDescrShapeOk(uintptr_t descr);
+
 // Короткий текст в описание команды (платформа читает его до первого
 // updateState); б = описание - 0x70, флаг «строки разрешены» на b+0x68.
 void MMSetCommandText(uintptr_t svc, const GUID& group, unsigned num, const wchar_t* text) {
@@ -418,6 +459,10 @@ void MMSetCommandText(uintptr_t svc, const GUID& group, unsigned num, const wcha
         return;
     }
     uintptr_t b = descr - 0x70;
+    if (!MMDescrShapeOk(descr)) {   // A78: не писать в объект чужой формы
+        LogLine("mainmenu: описание команды %u не похоже на раскладку сборки — текст не задан", num);
+        return;
+    }
     *(uintptr_t*)(b + 0x68) = 1;
     MMSetShort(b + 0x08, text);
     MMSetShort(b + 0x20, text);
@@ -447,6 +492,10 @@ void MMSetCommandTextLong(uintptr_t svc, const GUID& group, unsigned num,
     MMCall2(*(uintptr_t*)(svt + kMMSlotCommandDescription * 8), svc, (uintptr_t)&descr, cid);
     if (!descr) return;
     uintptr_t b = descr - 0x70;
+    if (!MMDescrShapeOk(descr)) {
+        LogLine("mainmenu: описание команды %u не похоже на раскладку сборки — длинный текст не задан", num);
+        return;
+    }
     *(uintptr_t*)(b + 0x68) = 1;
     const uintptr_t slots[4] = { b + 0x08, b + 0x20, b + 0x38, b + 0x50 };
     for (uintptr_t slot : slots)
@@ -480,6 +529,38 @@ bool MMRead(const void* p, void* out, size_t len) {
 template <typename T>
 bool MMRead(const void* p, T& out) {
     return MMRead(p, &out, sizeof(T));
+}
+
+// Описание команды: платформа отдаёт объект, поля которого лежат по
+// откалиброванным смещениям (b = descr - 0x70: четыре коротких v8string, флаг
+// «строки разрешены» на +0x68, URL картинки на +0xB0). Писать в объект чужого
+// класса, освобождённый или от другой сборки — значит портить платформу, поэтому
+// перед записью поля проверяются на форму v8string (A78).
+bool MMDescrShapeOk(uintptr_t descr) {
+    if (!descr) return false;
+    uintptr_t vt = 0;
+    if (!MMRead((const void*)descr, vt) || !IsReadable((void*)vt, 10 * sizeof(void*)))
+        return false;
+    const uintptr_t b = descr - 0x70;
+    if (!IsReadable((void*)(b + 0xB0), 0x40)) return false;   // URL картинки в описании
+    const uintptr_t heapBit = (uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1);
+    for (uintptr_t off : {uintptr_t(0x08), uintptr_t(0x20), uintptr_t(0x38), uintptr_t(0x50)}) {
+        unsigned char s[24] = {};
+        if (!MMRead((const void*)(b + off), s, sizeof(s))) return false;
+        const uintptr_t data = *(const uintptr_t*)s;
+        const uintptr_t cap = *(const uintptr_t*)(s + 16);
+        if (cap & heapBit) {
+            // Кучевая форма: [refCount][UTF-16][0], capacity = длина + 1.
+            const uintptr_t len = cap & ~heapBit;
+            if (len > 0x10000) return false;
+            if (data && !IsReadable((void*)data, (size_t)(len + 1) * 2)) return false;
+            if (!data && len) return false;
+        } else if (*(const unsigned short*)(s + 0x16) > 11) {
+            // SSO: слово на +0x16 — «11 - длина» (так его пишет MMSetShort).
+            return false;
+        }
+    }
+    return true;
 }
 
 // Адрес экспорта модуля по фрагментам декорированного имени: таблица
@@ -623,6 +704,10 @@ bool MMIconsWriteFiles(std::wstring& urlDir) {
 bool MMSetDescrUrl(uintptr_t svc, uintptr_t urlCtor, const GUID& group,
                    unsigned num, const wchar_t* url) {    uintptr_t descr = 0;
     if (!MMDescr(svc, group, num, &descr)) return false;
+    if (!MMDescrShapeOk(descr)) {   // A78: URL пишется в поле чужой формы — отказ
+        LogLine("mainmenu: описание команды %u не похоже на раскладку сборки — URL не задан", num);
+        return false;
+    }
     const uintptr_t b = descr - 0x70;
     if (!IsReadable((void*)(b + 0xB0), 0x40)) return false;   // URL в описании
     unsigned char str[24] = {};
@@ -721,18 +806,9 @@ void MMStepIcons(void* arg) {
 
 // --- перехваты на приёмнике -------------------------------------------------
 
-bool MMPatchSlot(uintptr_t* vt, int slot, void* hookFn, uintptr_t* origOut) {
-    uintptr_t* slotPtr = vt + slot;
-    void* orig = (void*)*slotPtr;
-    DWORD old = 0;
-    if (!VirtualProtect(slotPtr, sizeof(void*), PAGE_EXECUTE_READWRITE, &old))
-        return false;
-    *slotPtr = (uintptr_t)hookFn;
-    FlushInstructionCache(GetCurrentProcess(), slotPtr, sizeof(void*));
-    VirtualProtect(slotPtr, sizeof(void*), old, &old);
-    *origOut = (uintptr_t)orig;
-    return true;
-}
+// Установка/снятие слотов vtable — в menu_patch.h: там же транзакция с откатом
+// (A79: при отказе 2-3-го слота уже пропатченные оставались, и повторный проход
+// записывал нашу ловушку в orig — ловушка звала себя).
 
 size_t __fastcall MMUpdateTrap(size_t self, size_t state) {
     size_t r = MMCall1(g_mm.origUpdate, self, state);
@@ -1024,10 +1100,15 @@ void MMStepTraps(void* arg) {
     m->stepRan = true;
     if (m->trapsSet) { m->built = true; return; }   // повторный патч поймал бы свой хук
     m->stage = "перехваты приёмника";
-    if (m->recv && m->recvVt &&
-        MMPatchSlot(m->recvVt, m->trapUpd, (void*)&MMUpdateTrap, &m->origUpdate) &&
-        MMPatchSlot(m->recvVt, m->trapHas, (void*)&MMHasTrap, &m->origHas) &&
-        MMPatchSlot(m->recvVt, m->trapTx, (void*)&MMTransmitTrap, &m->origTransmit)) {
+    SlotPatch patches[3] = {
+        {m->trapUpd, (void*)&MMUpdateTrap, 0},
+        {m->trapHas, (void*)&MMHasTrap, 0},
+        {m->trapTx, (void*)&MMTransmitTrap, 0},
+    };
+    if (m->recv && m->recvVt && PatchSlotsTransaction(m->recvVt, patches, 3)) {
+        m->origUpdate = patches[0].orig;
+        m->origHas = patches[1].orig;
+        m->origTransmit = patches[2].orig;
         m->groupBytes = MMAlloc(32);
         MMPutGuid(m->groupBytes, MMGuid(kMMGroupStr));
         m->trapsSet = true;
@@ -1050,47 +1131,43 @@ void MMRebuildStep(void* arg) {
 // --- поддержка версий и запуск ---------------------------------------------
 
 // Ветки v8snack: 8.3.27 и 8.5 — одна раскладка (entry 0x68, SSO); прочие — отказ.
-// Семья платформы определяется по пути модуля (…\1cv8\8.3.27.2342\bin\…):
-// профильные API KERNELBASE (GetPrivateProfileStringW, GetFileVersionInfoSizeW)
-// роняли поток на канонизации пути (GetFinalPathNameByHandleA+0x20, live
-// 8.3.27.2342) и здесь не используются вовсе.
+// All the calibrated RVAs below (the getService wrappers, the SCOM_Process and
+// panel-manager vtables) were taken from ONE build of the family — 8.3.27.2342
+// x64. The path carries the exact build ("…\1cv8\8.3.27.2342\bin\…"), and the
+// audit finding A78 is that the family prefix alone let any 8.3.27.x patch in:
+// measured on this machine, 8.3.27.1989 has unrelated mid-function bytes at
+// both wrapper RVAs. Only the exact build is accepted; every other build keeps
+// the overlay menu and gets no hooks.
+const wchar_t kMMBuildPath[] = L"\\8.3.27.2342\\";
 bool MMSupported(bool* is85) {
     ModuleRange m;
     if (FindModule(L"core85.dll", m)) { *is85 = true; return true; }
     *is85 = false;
     if (!FindModule(L"core83.dll", m)) return false;
-    bool family27 = m.path.find(L"\\8.3.27.") != std::wstring::npos;
-    LogLine("mainmenu: core83 — семья 8.3.27 по пути %ls: %s", m.path.c_str(),
-            family27 ? "да" : "нет");
-    return family27;
+    const bool exact = m.path.find(kMMBuildPath) != std::wstring::npos;
+    static volatile LONG logged = 0;   // the worker retries this while loading
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0)
+        LogLine("mainmenu: core83 — сборка %ls по пути %ls: %s", kMMBuildPath,
+                m.path.c_str(), exact ? "да" : "нет (раскладка только на неё)");
+    return exact;
 }
 
-// Ключ [git] nativemenu=0 читается вручную (CreateFileW/ReadFile): профильные
-// API KERNELBASE (GetPrivateProfileStringW) роняли поток на канонизации пути
-// (GetFinalPathNameByHandleA+0x20, live 8.3.27.2342) и здесь не используются.
+// Ключ [git] nativemenu=0 читается без профильных API: они роняли поток на
+// канонизации пути (live 8.3.27.2342). A53: v8i::IniSet пишет файл в UTF-16 с
+// BOM, и прежний поиск подстроки по сырым байтам останавливался на первом NUL
+// после BOM — аварийный выключатель переставал работать после первого же
+// сохранения настроек payload'ом. IniGetManual декодирует файл по BOM.
+bool MMNativeMenuEnabledFor(const wchar_t* iniPath) {
+    bool found = false;
+    const std::wstring v = v8i::IniGetManual(iniPath, L"git", L"nativemenu", L"1", &found);
+    if (!found) return true;   // нет файла или ключа — включён по умолчанию
+    return !(v == L"0" || _wcsicmp(v.c_str(), L"false") == 0);
+}
+
 bool MMNativeMenuEnabled() {
     wchar_t path[MAX_PATH] = {};
     ExpandEnvironmentStringsW(L"%APPDATA%\\v8inject\\gitbar.ini", path, MAX_PATH);
-    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return true;   // нет файла — включён по умолчанию
-    char buf[4096] = {};
-    DWORD got = 0;
-    ReadFile(f, buf, sizeof(buf) - 1, &got, nullptr);
-    CloseHandle(f);
-    buf[got < sizeof(buf) - 1 ? got : sizeof(buf) - 1] = 0;
-    const char* p = strstr(buf, "nativemenu");
-    while (p) {
-        const char* eq = strchr(p, '=');
-        const char* eol = strchr(p, '\n');
-        if (eq && (!eol || eq < eol)) {
-            ++eq;
-            while (*eq == ' ' || *eq == '\t' || *eq == '\r') ++eq;
-            return _strnicmp(eq, "0", 1) != 0;
-        }
-        p = eol ? eol + 1 : nullptr;
-    }
-    return true;
+    return MMNativeMenuEnabledFor(path);
 }
 
 // --- R2: экземпляры SCOM_Process и чтение реестра getService -----------------
@@ -1282,30 +1359,51 @@ void MMScanRegistryGuarded(MMState* m) {
 // запрещён там, где компилятор строит unwind (C2712).
 void MMWorkerInner() {
     LogLine("mainmenu: поток запущен, ждём устояния платформы");
-    // Хуки обёрток ставятся как можно раньше (1С вызывает getService при
-    // загрузке базы; поздняя установка пропускает эти вызовы).
-    ModuleRange exeM;
-    if (FindModule(L"1cv8.exe", exeM)) {
-        std::string hookErr;
-        uint32_t hookId = HookInstallObserved(exeM.base + kMMWrapperRva,
-                "getServiceWrapper", MMObsTakeProc, hookErr);
-        LogLine("mainmenu: хук обёртки getService (1cv8+0xBFCB0): %s",
-                hookId ? "установлен" : hookErr.c_str());
+    // A52: the two getService wrapper hooks used to be installed before any
+    // check at all — before [git] nativemenu=0 and before the build gate — so
+    // on any other build the calibrated RVA patched an unrelated function.
+    // Now: gate first, then hook, and only when the target really starts with
+    // the calibrated prologue.
+    for (int i = 0; i < 60; ++i) {   // up to 3 s: core83/config.dll appear late
+        bool probe85 = false;
+        if (MMSupported(&probe85)) break;
+        Sleep(50);
     }
-
-    Sleep(3000);
     if (!MMNativeMenuEnabled()) {
         LogLine("mainmenu: отключён ([git] nativemenu=0)");
         return;
     }
     bool is85 = false;
-    if (!MMSupported(&is85)) {
-        LogLine("mainmenu: версия платформы не поддержана — пункт не добавлен");
-        return;
-    }
+    const bool supported = MMSupported(&is85);
     if (is85) {
         LogLine("mainmenu: 8.5 — приёмник для перехватов ещё не подключён, пункт не добавлен");
         return;
+    }
+    if (!supported) {
+        LogLine("mainmenu: версия платформы не поддержана — пункт не добавлен");
+        return;
+    }
+
+    // Хуки обёрток ставятся только после гейта: 1С зовёт getService при загрузке
+    // базы, поэтому до проверки они и стояли — теперь проверка идёт на старте,
+    // а не через три секунды (сервис-реестр, основной путь, хука не требует).
+    ModuleRange exeM;
+    if (FindModule(L"1cv8.exe", exeM)) {
+#if defined(_WIN64)
+        const uintptr_t wrapper = exeM.base + kMMWrapperRva;
+        if (!MMPrologueOk(wrapper)) {
+            LogLine("mainmenu: пролог getService (1cv8+0x%llX) не совпал с калибровкой "
+                    "— хук не ставится", (unsigned long long)kMMWrapperRva);
+        } else {
+            std::string hookErr;
+            uint32_t hookId = HookInstallObserved(wrapper, "getServiceWrapper",
+                                                 MMObsTakeProc, hookErr);
+            LogLine("mainmenu: хук обёртки getService (1cv8+0x%llX): %s",
+                    (unsigned long long)kMMWrapperRva, hookId ? "установлен" : hookErr.c_str());
+        }
+#else
+        LogLine("mainmenu: x86 — RVA обёртки откалиброван на x64, хук не ставится");
+#endif
     }
 
     // 0. приёмник и объекты цепочки рамки (рабочий поток, безопасно):
@@ -1341,12 +1439,22 @@ void MMWorkerInner() {
     // хук на обёртку config.dll (загружена к этому моменту)
     ModuleRange cfgM;
     if (FindModule(L"config.dll", cfgM)) {
-        std::string hookErr;
+#if defined(_WIN64)
         constexpr uintptr_t kMMCfgWrapperRva = 0xCF320;   // 8.3.27.2342 x64
-        uint32_t hookId = HookInstallObserved(cfgM.base + kMMCfgWrapperRva,
-                "getServiceWrapperCfg", MMObsTakeProc, hookErr);
-        LogLine("mainmenu: хук обёртки getService (config+0xCF320): %s",
-                hookId ? "установлен" : hookErr.c_str());
+        const uintptr_t wrapper = cfgM.base + kMMCfgWrapperRva;
+        if (!MMPrologueOk(wrapper)) {
+            LogLine("mainmenu: пролог getService (config+0x%llX) не совпал с калибровкой "
+                    "— хук не ставится", (unsigned long long)kMMCfgWrapperRva);
+        } else {
+            std::string hookErr;
+            uint32_t hookId = HookInstallObserved(wrapper, "getServiceWrapperCfg",
+                                                 MMObsTakeProc, hookErr);
+            LogLine("mainmenu: хук обёртки getService (config+0x%llX): %s",
+                    (unsigned long long)kMMCfgWrapperRva, hookId ? "установлен" : hookErr.c_str());
+        }
+#else
+        LogLine("mainmenu: x86 — RVA обёртки config откалиброван на x64, хук не ставится");
+#endif
     }
 
     // 1. R2-путь: скан экземпляров SCOM_Process по vtable и чтение реестра

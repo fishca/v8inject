@@ -1,4 +1,5 @@
 #include "platform_commands.h"
+#include "pending_slot.h"
 
 #include "v8inject/diag.h"
 #include "v8inject/hook.h"
@@ -141,33 +142,19 @@ static const unsigned char kConfigGroup[16] = {
 // ITopLevelFrame (declared here: the marshal bridges below read them).
 static uintptr_t g85_recv = 0;
 static uintptr_t g85_recvVt = 0;
+static uintptr_t g85_recvFrame = 0;   // frame object the receiver was captured from
 static void V8iCaptureCmdRecv(void* obj);   // 8.5 slot-31 walk, defined below
 namespace {
-const UINT kV8iCmdMsg = WM_APP + 0x2F11;
-struct V8iPending {
-    void* recv;
-    void* trFn;
-    // Command buffer, shared by both platform layouts at the same address.
-    // 8.3 transmits V8Cmd (32 bytes); 8.5 expects the RECON-85 layout
-    // (CommandID padded to 24, param at 24, object at 32 — 40 bytes). The
-    // sender zeroes raw first, so either interpretation of the padding reads
-    // param=0 / object=nullptr. hasHandler (CommandID, 20 bytes) is identical
-    // in both layouts.
-    union {
-        V8Cmd cmd;
-        unsigned char raw[48];
-    } u;
-    // mode 3: a functor for the UI thread (the native-menu build steps).
-    void (*fun)(void*);
-    void* funArg;
-    volatile LONG done;
-    int rc;
-    LONG exc;
-    int mode;   // 0 = transmitCommand(recv, &cmd, 0), 1 = hasHandler(recv, &cmd),
-                // 2 = capture the 8.5 receiver from the frame object in recv,
-                // 3 = run fun(funArg) on the UI thread
-};
-V8iPending g_pending = {};
+const UINT kV8iCmdMsg = kPendingMsg;
+// The slot itself (request id, cancelled flag, result id) is in
+// platform/pending_slot.h: the io thread and the native-menu worker share it,
+// and a message that arrives after its timeout must not run the next request
+// (A50, A51). The command bytes are shared by both platform layouts at the same
+// address: 8.3 transmits V8Cmd (32 bytes), 8.5 expects the RECON-85 layout
+// (CommandID padded to 24, param at 24, object at 32 — 40 bytes). The sender
+// zeroes raw first, so either interpretation of the padding reads param=0 /
+// object=nullptr; hasHandler (CommandID, 20 bytes) is identical in both.
+V8iPendingSlot g_pending = {};
 // The pending slot is shared by the io thread (cmd commands) and the
 // native-menu worker (functor steps) — fill+send+wait sections hold it.
 SRWLOCK g_pendingLock = SRWLOCK_INIT;
@@ -188,56 +175,66 @@ V8iDefSubclassProcFn V8iDefSubclassProcFnGet() {
     return defFn;
 }
 
+// The one executor of the pending slot, called on the 1C UI thread by both
+// paths that can own it (the comctl32 subclass and the WndProc replacement):
+// each request runs exactly once, whichever hook the platform tolerated.
+// `s` was already claimed for `msgId` by the caller.
+void V8iExecuteClaimed(V8iPendingSlot* s, UINT_PTR msgId) {
+    // Copy the request out of the shared slot before running it: the sender
+    // starts the next request as soon as it holds the lock again, and reading
+    // the fields afterwards would mix two requests. The id is re-checked after
+    // the copy, so a torn snapshot is dropped instead of executed (A51).
+    void* recv = s->recv;
+    void* trFn = s->trFn;
+    void (*fun)(void*) = s->fun;
+    void* funArg = s->funArg;
+    const int mode = s->mode;
+    unsigned char raw[48];
+    memcpy(raw, s->raw, sizeof(raw));
+    if (!PendingClaim(s, msgId)) return;   // retired while copying: do not run
+
+    int rc = -1;
+    LONG exc = 0;
+    if (mode == 2) {
+        // The slot-31 walk calls into core85, which on 8.5 only answers on the
+        // UI thread — so the capture rides the same marshal bridge.
+        V8iCaptureCmdRecv(recv);
+        rc = g85_recv ? 0 : -1;
+    } else if (mode == 3) {
+        // UI-thread functor (native-menu build steps). An exception here must
+        // not kill 1C: caught and reported through rc.
+        __try {
+            fun(funArg);
+            rc = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            rc = (int)GetExceptionCode();
+        }
+    } else {
+        rc = mode == 1 ? HasGuarded(trFn, recv, raw) : TransmitGuarded(trFn, recv, raw);
+        if (rc < 0) exc = g_cmdLastExc;
+    }
+    PendingPublish(s, msgId, rc, exc);
+}
+
 LRESULT CALLBACK V8iCmdSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                 UINT_PTR id, DWORD_PTR data) {
     (void)id;   // the subclass id is not used: one window, one pending slot
+    (void)l;
     if (m == kV8iCmdMsg) {
-        V8iPending* p = (V8iPending*)data;
-        if (p->mode == 2) {
-            // The slot-31 walk calls into core85, which on 8.5 only answers on
-            // the UI thread — so the capture rides the same marshal bridge.
-            V8iCaptureCmdRecv(p->recv);
-            p->rc = g85_recv ? 0 : -1;
-        } else if (p->mode == 3) {
-            // UI-thread functor (native-menu build steps). An exception here
-            // must not kill 1C: caught and reported through rc.
-            __try {
-                p->fun(p->funArg);
-                p->rc = 0;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                p->rc = (int)GetExceptionCode();
-            }
-        } else {
-            p->rc = p->mode == 1 ? HasGuarded(p->trFn, p->recv, &p->u.cmd)
-                                 : TransmitGuarded(p->trFn, p->recv, &p->u.cmd);
-            if (p->rc < 0) p->exc = g_cmdLastExc;
-        }
-        InterlockedExchange(&p->done, 1);
-        return 0;
+        V8iPendingSlot* p = (V8iPendingSlot*)data;
+        const UINT_PTR msgId = (UINT_PTR)w;
+        if (PendingClaim(p, msgId)) V8iExecuteClaimed(p, msgId);
+        return 0;   // a stale message is dropped: its sender already timed out
     }
     V8iDefSubclassProcFn defFn = V8iDefSubclassProcFnGet();
     return defFn ? defFn(h, m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
 LRESULT CALLBACK V8iCmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    (void)l;
     if (m == kV8iCmdMsg) {
-        if (g_pending.mode == 2) {
-            V8iCaptureCmdRecv(g_pending.recv);
-            g_pending.rc = g85_recv ? 0 : -1;
-        } else if (g_pending.mode == 3) {
-            __try {
-                g_pending.fun(g_pending.funArg);
-                g_pending.rc = 0;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                g_pending.rc = (int)GetExceptionCode();
-            }
-        } else {
-            g_pending.rc = g_pending.mode == 1
-                               ? HasGuarded(g_pending.trFn, g_pending.recv, &g_pending.u.cmd)
-                               : TransmitGuarded(g_pending.trFn, g_pending.recv, &g_pending.u.cmd);
-            if (g_pending.rc < 0) g_pending.exc = g_cmdLastExc;
-        }
-        InterlockedExchange(&g_pending.done, 1);
+        const UINT_PTR msgId = (UINT_PTR)w;
+        if (PendingClaim(&g_pending, msgId)) V8iExecuteClaimed(&g_pending, msgId);
         return 0;
     }
     return CallWindowProcW((WNDPROC)g_cmdOldWndProc, h, m, w, l);
@@ -298,6 +295,77 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
     *outPath = "wndproc";
     return true;
 }
+
+// One request for the marshal bridge: what the 1C UI thread should do.
+struct V8iRequest {
+    int mode = 1;                  // see V8iPendingSlot::mode
+    void* recv = nullptr;
+    void* trFn = nullptr;
+    void (*fun)(void*) = nullptr;
+    void* funArg = nullptr;
+    const void* cmd = nullptr;     // command bytes, copied into the slot
+    size_t cmdSize = 0;
+};
+
+struct V8iMarshalResult {
+    int status;   // 0 answered, -98 no marshal window, -97 not delivered,
+                  // -96 timeout (the request was retired: it will not run)
+    int rc;
+    LONG exc;
+};
+
+// Fills the slot, hands the request to the 1C UI thread and waits for the
+// answer. This is the only writer of the slot: it holds g_pendingLock for the
+// whole fill/send/read, so no two requests can interleave (A50), and it stamps
+// the message with the request id (A51).
+V8iMarshalResult V8iMarshal(const V8iRequest& r, DWORD timeoutMs, bool abortIfHung) {
+    V8iMarshalResult res{-98, 0, 0};
+    HWND cmdHwnd = nullptr;
+    DWORD ensureErr = 0;
+    const char* marshalPath = "";
+    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return res;
+
+    AcquireSRWLockExclusive(&g_pendingLock);
+    g_pending.recv = r.recv;
+    g_pending.trFn = r.trFn;
+    g_pending.fun = r.fun;
+    g_pending.funArg = r.funArg;
+    g_pending.mode = r.mode;
+    memset(g_pending.raw, 0, sizeof(g_pending.raw));
+    if (r.cmd && r.cmdSize) {
+        const size_t n = r.cmdSize > sizeof(g_pending.raw) ? sizeof(g_pending.raw)
+                                                          : r.cmdSize;
+        memcpy(g_pending.raw, r.cmd, n);
+    }
+    const UINT_PTR id = PendingBegin(&g_pending);
+
+    // Synchronous cross-thread dispatch: blocks until the UI thread's WndProc
+    // runs (SMTO_BLOCK) or the target is hung (capped by the timeout).
+    DWORD_PTR smRes = 0;
+    const DWORD flags = abortIfHung ? (SMTO_ABORTIFHUNG | SMTO_BLOCK) : SMTO_BLOCK;
+    const LRESULT sent = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, (WPARAM)id, 0,
+                                            flags, timeoutMs, &smRes);
+    if (!sent) {
+        PendingAbandon(&g_pending, id);
+        res.status = -97;
+    } else if (!PendingAnswered(&g_pending, id)) {
+        // The message is still out there: 1C delivers it after the timeout.
+        // Retire the id so it finds nothing to run instead of executing the
+        // next request (A51).
+        PendingAbandon(&g_pending, id);
+        res.status = -96;
+    } else {
+        res.status = 0;
+        res.rc = g_pending.rc;
+        res.exc = g_pending.exc;
+        // The request is over: retire the id so a duplicate message cannot run
+        // it a second time.
+        PendingRetire(&g_pending, id);
+    }
+    ReleaseSRWLockExclusive(&g_pendingLock);
+    return res;
+}
+
 }  // namespace
 
 // A67: a heap page can be freed between VirtualQuery and the read (1C
@@ -416,32 +484,22 @@ static uintptr_t DiscoverFrameVtblX64(const ModuleRange& cfg) {
             if (*(const unsigned char*)tr == 0xCC) continue;   // int3 padding, not code
 
             // live probe: hasHandler(45), mode 1, SEH on the UI thread
-            HWND probeHwnd = nullptr;
-            DWORD probeErr = 0;
-            const char* probePath = "";
-            if (!EnsureCmdUi(&probeHwnd, &probeErr, &probePath))
-                break;   // no frame window yet — fall back to structural pick
             void* hasTr = (void*)((uintptr_t*)recvVt)[5];
             if (!IsReadable(hasTr, 1)) continue;
-            AcquireSRWLockExclusive(&g_pendingLock);
-            g_pending.recv = (void*)recv;
-            g_pending.trFn = hasTr;
-            g_pending.mode = 1;
-            memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
-            g_pending.u.cmd.cmdNum = 45;
-            g_pending.u.cmd.param = 0;
-            g_pending.u.cmd.object = nullptr;
-            g_pending.rc = -2;
-            g_pending.exc = 0;
-            InterlockedExchange(&g_pending.done, 0);
-            DWORD_PTR probeRes = 0;
-            LRESULT probeSent = SendMessageTimeoutW(probeHwnd, kV8iCmdMsg, 0, 0,
-                                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes);
-            bool probedOk = probeSent != 0 && g_pending.done && g_pending.exc == 0 &&
-                            g_pending.rc >= 0 && g_pending.rc == 0;
-            ReleaseSRWLockExclusive(&g_pendingLock);
-            if (!probeSent) continue;
-            if (g_pending.exc != 0 || g_pending.rc < 0) continue;   // wrong chain
+            V8Cmd probeCmd = {};
+            memcpy(probeCmd.group, kConfigGroup, 16);
+            probeCmd.cmdNum = 45;
+            V8iRequest req;
+            req.mode = 1;
+            req.recv = (void*)recv;
+            req.trFn = hasTr;
+            req.cmd = &probeCmd;
+            req.cmdSize = sizeof(probeCmd);
+            const V8iMarshalResult mr = V8iMarshal(req, 10000, true);
+            if (mr.status == -98) break;   // no frame window yet — structural pick
+            if (mr.status != 0) continue;
+            if (mr.exc != 0 || mr.rc < 0) continue;   // wrong chain
+            bool probedOk = mr.exc == 0 && mr.rc >= 0 && mr.rc == 0;
             if (probedOk && fallbackObj == 0) {
                 fallbackObj = obj; fallbackOff = off;   // alive, no handler yet
                 continue;
@@ -669,6 +727,35 @@ static WNDPROC g85_origWndProc = nullptr;
 
 static void V8iScanFrame85();
 
+// Releases one reference through slot 2 (Release) of a 1C object.
+static void V8iReleaseRef(uintptr_t obj) {
+    if (!obj || !IsReadable((void*)obj, sizeof(void*))) return;
+    __try {
+        void** vt = *(void***)obj;
+        if (vt && IsReadable((void*)vt, 3 * sizeof(void*)) && vt[2])
+            ((void(__stdcall*)(void*))vt[2])((void*)obj);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// The diagnostic QI probes take a reference each. The subscribe chain runs
+// them on every attempt (up to 4000 at 50 ms), and the results used to be kept
+// forever - one leaked reference per probe per attempt, keeping 1C objects
+// alive for the whole session (A66). Every attempt now releases what the
+// previous one took.
+static void V8iReleaseDiagRefs() {
+    V8iReleaseRef(g85_qProcFrame); g85_qProcFrame = 0;
+    V8iReleaseRef(g85_qProcRecv);  g85_qProcRecv = 0;
+    V8iReleaseRef(g85_qCmdFrame);  g85_qCmdFrame = 0;
+    V8iReleaseRef(g85_qCmdRecv);   g85_qCmdRecv = 0;
+    V8iReleaseRef(g85_qEvFrame);   g85_qEvFrame = 0;
+    V8iReleaseRef(g85_qEvRecv);    g85_qEvRecv = 0;
+}
+// How many attempts still run the probes: they only feed the cmdinfo
+// diagnostics, and the first ones already say whether the layout matches.
+static volatile long g85_diagRuns = 0;
+constexpr long kG85DiagRuns = 64;
+
 static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_APP + 0x602) {
         g85_sawMsg = 1;
@@ -723,8 +810,13 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
             g85_svcSlot = svcSlot;
             g85_svc2Slot = svc2Slot;
 
-            // QI the objects we already hold for ITopLevelFrame/ICommandReceiver
-            {
+            // QI the objects we already hold for ITopLevelFrame/ICommandReceiver.
+            // A66: release what the previous attempt took (the pointers stay
+            // empty when the probes are skipped, so cmdinfo never reports a
+            // stale object), and stop running pure diagnostics after the first
+            // attempts — the chain itself keeps retrying below.
+            V8iReleaseDiagRefs();
+            if (InterlockedIncrement(&g85_diagRuns) <= kG85DiagRuns) {
                 static const GUID kIID_TopFrame = {0xDE300901, 0xA120, 0x11d4,
                                                    {0x94, 0x29, 0x00, 0x80, 0x48, 0xDA, 0x11, 0xF9}};
                 static const GUID kIID_CmdRecv = {0x377A2018, 0xC51B, 0x4cf5,
@@ -743,22 +835,22 @@ static LRESULT CALLBACK V8iSubclass85(HWND h, UINT m, WPARAM w, LPARAM l) {
                     if (V8iQIProbe((void*)probes[i].obj, iids[i], &out) == 0 && out)
                         *probes[i].out = (uintptr_t)out;
                 }
-            }
 
-            // QI the window's OLE drop target — it is a real 1C object
-            if (g85_uiWin) {
-                static const GUID kIID_TopFrame = {0xDE300901, 0xA120, 0x11d4,
-                                                   {0x94, 0x29, 0x00, 0x80, 0x48, 0xDA, 0x11, 0xF9}};
-                static const GUID kIID_CmdRecv = {0x377A2018, 0xC51B, 0x4cf5,
-                                                  {0xAC, 0x03, 0xA1, 0x50, 0x92, 0x66, 0xDF, 0x2D}};
-                uintptr_t dt = (uintptr_t)GetPropW((HWND)g85_uiWin, L"OleDropTargetInterface");
-                if (dt && IsReadable((void*)dt, 16)) {
-                    void* o1 = nullptr;
-                    void* o2 = nullptr;
-                    if (V8iQIProbe((void*)dt, &kIID_TopFrame, &o1) == 0 && o1)
-                        g85_qProcFrame = (uintptr_t)o1;
-                    if (V8iQIProbe((void*)dt, &kIID_CmdRecv, &o2) == 0 && o2)
-                        g85_qProcRecv = (uintptr_t)o2;
+                // QI the window's OLE drop target — it is a real 1C object
+                if (g85_uiWin) {
+                    uintptr_t dt = (uintptr_t)GetPropW((HWND)g85_uiWin, L"OleDropTargetInterface");
+                    if (dt && IsReadable((void*)dt, 16)) {
+                        void* o1 = nullptr;
+                        void* o2 = nullptr;
+                        if (V8iQIProbe((void*)dt, &kIID_TopFrame, &o1) == 0 && o1) {
+                            V8iReleaseRef(g85_qProcFrame);   // replace, do not stack refs
+                            g85_qProcFrame = (uintptr_t)o1;
+                        }
+                        if (V8iQIProbe((void*)dt, &kIID_CmdRecv, &o2) == 0 && o2) {
+                            V8iReleaseRef(g85_qProcRecv);
+                            g85_qProcRecv = (uintptr_t)o2;
+                        }
+                    }
                 }
             }
 
@@ -844,6 +936,7 @@ static BOOL CALLBACK V8iFindMainWindow(HWND w, LPARAM lp) {
 static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam);
 static HHOOK g_cbtThreadHook;
 static volatile long g_cbtThreadTid;
+static volatile int g_cbtFired = 0;   // any 1C window creation was seen
 static void V8iResolveCore85Proc(uintptr_t* outBase, uint32_t* outRva);
 
 // Runs the subscribe attempt on the UI thread of the given window: the
@@ -883,8 +976,22 @@ static bool V8iSubscribeOnUiThread(HWND h) {
     return installed;
 }
 
+// The thread-scoped CBT hook has done its job once any 1C window creation was
+// seen (g_cbtFired): it is removed here rather than from inside the hook
+// procedure, so no window creation keeps paying for it (A68).
+static void V8iDropThreadCbt() {
+    HHOOK h = g_cbtThreadHook;
+    if (!h) return;
+    g_cbtThreadHook = nullptr;
+    g_cbtThreadTid = -1;
+    if (!UnhookWindowsHookEx(h))
+        LogLine("cbt: thread hook 0x%llX not removed (err %lu)", (unsigned long long)(uintptr_t)h,
+                GetLastError());
+}
+
 static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
     for (int i = 0; i < 4000 && !g85_subscribed; ++i) {
+        if (g_cbtFired) V8iDropThreadCbt();   // the first window was seen: not needed
         HWND h = nullptr;
         EnumWindows(V8iFindMainWindow, (LPARAM)&h);
         if (h) {
@@ -892,7 +999,7 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
             V8iSubscribeOnUiThread(h);
             // The global CBT hook never fires in 8.5 (cbtCalls stays 0 even for
             // newly opened windows), so try a thread-scoped one on the UI thread.
-            if (!g_cbtThreadHook) {
+            if (!g_cbtThreadHook && !g_cbtFired) {
                 DWORD tid = GetWindowThreadProcessId(h, nullptr);
                 HINSTANCE self = nullptr;
                 GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -906,12 +1013,16 @@ static DWORD WINAPI V8iStartupWatchThread(LPVOID) {
             }
             // The core is not ready the instant the window appears, so keep
             // retrying until the subscribe chain actually succeeds.
-            if (g85_subscribed) return 0;
+            if (g85_subscribed) {
+                V8iDropThreadCbt();
+                return 0;
+            }
             Sleep(50);
             continue;
         }
         Sleep(5);
     }
+    V8iDropThreadCbt();
     return 0;
 }
 
@@ -927,10 +1038,11 @@ static volatile long g_cbtCalls = 0;
 static volatile long g_cbtLastCode = -1;
 static volatile long g_cbtCreateCount = 0;
 static volatile long g_cbtStrCreates = 0;
+static volatile long g_cbtWrites = 0;     // lines already written to cbt.txt
+constexpr long kCbtDumpLines = 8;         // enough to see the class sequence
 static char g_cbtFirstClass[96] = {};
 static char g_cbtLastClass[96] = {};
 static DWORD g_ownerPid = 0;
-static volatile int g_cbtFired = 0;
 
 static DWORD WINAPI V8iEarlySubscribeThread(LPVOID);
 
@@ -978,17 +1090,21 @@ static LRESULT CALLBACK V8iCbtProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_cbtLastClass[k] = 0;
                 if (InterlockedIncrement(&g_cbtStrCreates) == 1 && k)
                     memcpy(g_cbtFirstClass, g_cbtLastClass, sizeof(g_cbtFirstClass));
-                // Dump every string class that reaches the hook, so we can see
-                // whether the main window "V8Window0.xxx" passes through here
-                // at all. The file goes next to the payload log: a hardcoded
+                // Dump the classes that reach the hook, so we can see whether
+                // the main window "V8Window0.xxx" passes through here at all.
+                // Only the first few creations: a hook that fires for every
+                // window in the process must not do file I/O for each one
+                // (A68). The file goes next to the payload log: a hardcoded
                 // path would point into a directory that does not exist on
                 // another machine.
-                wchar_t dumpPath[MAX_PATH] = {};
-                if (LogSideFile(L"cbt.txt", dumpPath, _countof(dumpPath))) {
-                    FILE* cf = nullptr;
-                    if (_wfopen_s(&cf, dumpPath, L"a") == 0 && cf) {
-                        fprintf(cf, "%s\n", g_cbtLastClass);
-                        fclose(cf);
+                if (InterlockedIncrement(&g_cbtWrites) <= kCbtDumpLines) {
+                    wchar_t dumpPath[MAX_PATH] = {};
+                    if (LogSideFile(L"cbt.txt", dumpPath, _countof(dumpPath))) {
+                        FILE* cf = nullptr;
+                        if (_wfopen_s(&cf, dumpPath, L"a") == 0 && cf) {
+                            fprintf(cf, "%s\n", g_cbtLastClass);
+                            fclose(cf);
+                        }
                     }
                 }
             } else {
@@ -1152,38 +1268,68 @@ static ULONG __stdcall V8iRecipRelease(void*) { return 1; }
 // slot 0 compares its arg against IID_IUnknown and writes *out; "has" via
 // slot 2 was a false positive: AddRef just returns 1). Real slots are +3,
 // same as the 8.3 chain (kTransmitSlot=3): transmit=[3], hasHandler=[5].
-static int V8iCmd85Send(unsigned int num, int sub, bool has = false) {
-    if (!g85_recv || !g85_recvVt) return -99;
-    if (!IsReadable((void*)g85_recvVt, 6 * sizeof(void*))) return -99;
+// The 8.5 receiver was captured from one frame object; 1C destroys frames when
+// a window closes, and a stale receiver would be a write into freed memory
+// (A65 — the 8.3 chain re-validates its frame on every use, this path did not).
+// The frame is re-checked against the calibrated ITopLevelFrame vtable and the
+// receiver against the vtable it had when captured; on any failure the capture
+// is dropped so the caller re-runs the slot-31 walk.
+static bool V8iRecv85Alive() {
+    if (!g85_recv || !g85_recvVt || !g85_recvFrame) return false;
+    ModuleRange cfg;
+    if (!FindModule(L"config.dll", cfg)) return false;
+    const uintptr_t frameVtbl = cfg.base + 0x2ED3B0;
+    uintptr_t fvt = 0;
+    if (!ReadPtrSafe(g85_recvFrame, &fvt) || fvt != frameVtbl) return false;
+    uintptr_t rvt = 0;
+    if (!ReadPtrSafe(g85_recv, &rvt) || rvt != g85_recvVt) return false;
+    return IsReadable((void*)g85_recvVt, 6 * sizeof(void*));
+}
+
+// Drops the 8.5 capture: the frame it came from is gone (or was never known).
+static void V8iDropRecv85() {
+    if (g85_recv) LogLine("cmd85: receiver 0x%llX went stale, dropping",
+                          (unsigned long long)g85_recv);
+    g85_recv = 0;
+    g85_recvVt = 0;
+    g85_recvFrame = 0;
+}
+
+// Sends a designer command through g85_recv on the 1C UI thread (kV8iCmdMsg
+// marshal). rc: >=0 transmit result, -99 no receiver/unreadable, -98 no marshal
+// window, -97 UI thread did not answer, -96 timeout. `has` queries
+// ICommandReceiver::hasHandler instead of transmitting.
+// The v8api slot numbering EXCLUDES IUnknown: the live vtable is
+// [0]=QI, [1]=AddRef, [2]=Release (verified by disasm on 8.5.1.1529 —
+// slot 0 compares its arg against IID_IUnknown and writes *out; "has" via
+// slot 2 was a false positive: AddRef just returns 1). Real slots are +3,
+// same as the 8.3 chain (kTransmitSlot=3): transmit=[3], hasHandler=[5].
+static int V8iCmd85Send(unsigned int num, int sub, bool has, LONG* excOut) {
+    if (excOut) *excOut = 0;
+    if (!V8iRecv85Alive()) {
+        V8iDropRecv85();
+        return -99;
+    }
     uintptr_t tr = ((uintptr_t*)g85_recvVt)[has ? 5 : 3];
     if (!tr || !IsReadable((void*)tr, 1)) return -99;
-    HWND cmdHwnd = nullptr;
-    DWORD ensureErr = 0;
-    const char* marshalPath = "";
-    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return -98;
-    AcquireSRWLockExclusive(&g_pendingLock);
-    g_pending.recv = (void*)g85_recv;
-    g_pending.trFn = (void*)tr;
-    g_pending.mode = has ? 1 : 0;
     // 8.5 Command layout (RECON-85 §3.3): CommandID { GUID, num } padded to
-    // 24, param at 24, object at 32 — 40 bytes total. Zeroed tail = nullptr
-    // object; the 8.3 32-byte interpretation of the same buffer would read
+    // 24, param at 24, object at 32 — 40 bytes total. The sender zeroes the
+    // slot first, so the 8.3 32-byte interpretation of the same buffer reads
     // param from the pad (0) and object from the first zeroed qword.
-    memset(g_pending.u.raw, 0, sizeof(g_pending.u.raw));
-    memcpy(g_pending.u.raw, kConfigGroup, 16);
-    *(unsigned int*)(g_pending.u.raw + 16) = num;
-    *(int*)(g_pending.u.raw + 24) = sub;
-    g_pending.rc = -2;
-    g_pending.exc = 0;
-    InterlockedExchange(&g_pending.done, 0);
-    DWORD_PTR smRes = 0;
-    LRESULT sent85 = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                                      SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes);
-    int rc85 = g_pending.done ? g_pending.rc : -96;
-    ReleaseSRWLockExclusive(&g_pendingLock);
-    if (!sent85) return -97;
-    if (!g_pending.done) return -96;
-    return rc85;
+    unsigned char raw[40] = {};
+    memcpy(raw, kConfigGroup, 16);
+    *(unsigned int*)(raw + 16) = num;
+    *(int*)(raw + 24) = sub;
+    V8iRequest req;
+    req.mode = has ? 1 : 0;
+    req.recv = (void*)g85_recv;
+    req.trFn = (void*)tr;
+    req.cmd = raw;
+    req.cmdSize = sizeof(raw);
+    const V8iMarshalResult mr = V8iMarshal(req, 30000, true);
+    if (excOut) *excOut = mr.exc;
+    if (mr.status != 0) return mr.status;
+    return mr.rc;
 }
 
 // Post-start receiver capture for 8.5: the eventCreateFrame path only runs
@@ -1226,20 +1372,16 @@ static bool V8iCaptureRecv85Late() {
                 if (!ReadPtrSafe(fvt + 31 * sizeof(void*), &fn31)) continue;
                 if (!fn31 || !IsReadable((void*)fn31, 1) || !insideCfg(fn31)) continue;
 
-                HWND cmdHwnd = nullptr;
-                DWORD ensureErr = 0;
-                const char* marshalPath = "";
-                if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return false;
-                g_pending.recv = (void*)p;
-                g_pending.trFn = nullptr;
-                g_pending.mode = 2;
-                g_pending.rc = -2;
-                g_pending.exc = 0;
-                InterlockedExchange(&g_pending.done, 0);
-                DWORD_PTR smRes = 0;
-                SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &smRes);
+                // The slot-31 walk needs the UI thread; V8iMarshal reports -98
+                // when there is no marshal window yet.
+                V8iRequest req;
+                req.mode = 2;            // capture the receiver from the frame
+                req.recv = (void*)p;
+                const V8iMarshalResult mr = V8iMarshal(req, 10000, true);
+                if (mr.status == -98) return false;
+                if (mr.status != 0) break;   // UI thread hung: stop scanning
                 if (g85_recv && g85_recvVt) {
+                    g85_recvFrame = p;
                     LogLine("cmd85 late capture: frame=0x%llX recv=0x%llX rvt=0x%llX",
                             (unsigned long long)p, (unsigned long long)g85_recv,
                             (unsigned long long)g85_recvVt);
@@ -1260,7 +1402,8 @@ static std::string Cmd85SendJson(unsigned int num, int sub, bool has) {
     if (!g85_recv && !V8iCaptureRecv85Late())
         return "{\"status\":\"error\",\"message\":\"no 8.5 receiver captured — "
                "needs early subscribe (hookcbt/launch) or a live frame\"}";
-    int rc = V8iCmd85Send(num, sub, has);
+    LONG exc = 0;
+    int rc = V8iCmd85Send(num, sub, has, &exc);
     char nb[256];
     if (rc == -99)
         return "{\"status\":\"error\",\"message\":\"receiver vtbl[0] unreadable\"}";
@@ -1273,7 +1416,7 @@ static std::string Cmd85SendJson(unsigned int num, int sub, bool has) {
     if (rc < 0) {
         _snprintf_s(nb, sizeof(nb), _TRUNCATE,
                     "{\"status\":\"error\",\"message\":\"transmit exception\",\"exc\":\"0x%X\"}",
-                    (unsigned)g_pending.exc);
+                    (unsigned)exc);
         return nb;
     }
     if (has)
@@ -1311,7 +1454,7 @@ static DWORD WINAPI V8iCmd85PollThread(LPVOID) {
             fclose(f);
             if (matched >= 1) {
                 _wremove(reqPath);
-                int rc = V8iCmd85Send(num, sub);
+                int rc = V8iCmd85Send(num, sub, false, nullptr);
                 FILE* rf = nullptr;
                 if (_wfopen_s(&rf, resPath, L"a") == 0 && rf) {
                     fprintf(rf, "num=%u sub=%d rc=%d\n", num, sub, rc);
@@ -1342,6 +1485,7 @@ static void V8iCaptureCmdRecv(void* obj) {
     __try { fn31 = ((uintptr_t*)fvt)[31]; } __except (EXCEPTION_EXECUTE_HANDLER) { fn31 = 0; }
     g85_recv = 0;
     g85_recvVt = 0;
+    g85_recvFrame = 0;
     long exc = 0;
     if (fn31 && IsReadable((void*)fn31, 1)) {
         void* recv = nullptr;
@@ -1353,6 +1497,7 @@ static void V8iCaptureCmdRecv(void* obj) {
         }
         if (recv && IsReadable(recv, 4 * sizeof(void*))) {
             g85_recv = (uintptr_t)recv;
+            g85_recvFrame = (uintptr_t)obj;   // A65: re-validated before every send
             __try { g85_recvVt = *(uintptr_t*)recv; }
             __except (EXCEPTION_EXECUTE_HANDLER) { g85_recvVt = 0; }
             LogLine("cmdrecv85: OK recv=0x%llX rvt=0x%llX",
@@ -2590,32 +2735,26 @@ std::string CmdCommandToJson(const std::wstring& args0) {
             // Live probe on the UI thread: hasHandler(cmd 45) through the same
             // marshal bridge the transmit uses. Exception / timeout = wrong
             // chain, try the next candidate.
-            HWND probeHwnd = nullptr;
-            DWORD probeErr = 0;
-            const char* probePath = "";
-            if (!EnsureCmdUi(&probeHwnd, &probeErr, &probePath)) {
+            void* probeTr = ((void**)recvVt)[5];              // hasHandler
+            if (!IsReadable(probeTr, 1)) continue;
+            V8Cmd probeCmd = {};
+            memcpy(probeCmd.group, kConfigGroup, 16);
+            probeCmd.cmdNum = 45;
+            V8iRequest req;
+            req.mode = 1;
+            req.recv = (void*)candRecv;
+            req.trFn = probeTr;
+            req.cmd = &probeCmd;
+            req.cmdSize = sizeof(probeCmd);
+            const V8iMarshalResult mr = V8iMarshal(req, 10000, true);
+            if (mr.status == -98) {
                 // no marshal window (yet) — keep the structural pick
                 bestFrame = cand; bestRecv = (void*)candRecv; bestTr = candTr;
                 bestVt = recvVt;
                 break;
             }
-            void* probeTr = ((void**)recvVt)[5];              // hasHandler
-            if (!IsReadable(probeTr, 1)) continue;
-            g_pending.recv = (void*)candRecv;
-            g_pending.trFn = probeTr;
-            g_pending.mode = 1;
-            memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
-            g_pending.u.cmd.cmdNum = 45;
-            g_pending.u.cmd.param = 0;
-            g_pending.u.cmd.object = nullptr;
-            g_pending.rc = -2;
-            g_pending.exc = 0;
-            InterlockedExchange(&g_pending.done, 0);
-            DWORD_PTR probeRes = 0;
-            if (!SendMessageTimeoutW(probeHwnd, kV8iCmdMsg, 0, 0,
-                                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes))
-                continue;
-            if (g_pending.exc != 0 || g_pending.rc < 0) continue;   // wrong chain
+            if (mr.status != 0) continue;              // timeout: try the next one
+            if (mr.exc != 0 || mr.rc < 0) continue;    // wrong chain
 
             if (bestFrame == 0) {
                 bestFrame = cand; bestRecv = (void*)candRecv; bestTr = candTr;
@@ -2686,39 +2825,33 @@ std::string CmdCommandToJson(const std::wstring& args0) {
         return j + numBuf + "}";
     }
     j += std::string(",\"marshal\":\"") + marshalPath + "\"";
-
-    AcquireSRWLockExclusive(&g_pendingLock);
-    g_pending.recv = recv;
-    g_pending.trFn = trFn;
-    g_pending.mode = wantHas ? 1 : 0;
-    memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
-    g_pending.u.cmd.cmdNum = num;
-    g_pending.u.cmd.param = sub;
-    g_pending.u.cmd.object = nullptr;
-    g_pending.rc = -2;
-    g_pending.exc = 0;
-    InterlockedExchange(&g_pending.done, 0);
+    (void)cmdHwnd;   // the marshal re-resolves the window itself
 
     // Synchronous cross-thread dispatch: blocks until the UI thread's WndProc
     // runs (SMTO_BLOCK) or the target is hung (capped by the timeout).
-    DWORD_PTR smRes = 0;
-    LRESULT cmdSent = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                                       SMTO_ABORTIFHUNG | SMTO_BLOCK, 30000, &smRes);
-    int cmdRc = g_pending.done ? g_pending.rc : -96;
-    LONG cmdExc = g_pending.exc;
-    ReleaseSRWLockExclusive(&g_pendingLock);
-    if (!cmdSent) {
+    V8Cmd cmd = {};
+    memcpy(cmd.group, kConfigGroup, 16);
+    cmd.cmdNum = num;
+    cmd.param = sub;
+    V8iRequest req;
+    req.mode = wantHas ? 1 : 0;
+    req.recv = recv;
+    req.trFn = trFn;
+    req.cmd = &cmd;
+    req.cmdSize = sizeof(cmd);
+    const V8iMarshalResult mr = V8iMarshal(req, 30000, true);
+    if (mr.status == -97) {
         _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE,
                     ",\"error\":\"UI thread did not answer (0x%X)\"", (unsigned)GetLastError());
         return j + numBuf + "}";
     }
-    if (!g_pending.done)
+    if (mr.status != 0)
         return j + ",\"error\":\"timeout waiting for UI thread\"}";
 
-    int rc = cmdRc;
+    int rc = mr.rc;
     if (rc < 0) {
         _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"error\":\"transmit exception 0x%X\"",
-                    (unsigned)cmdExc);
+                    (unsigned)mr.exc);
         return j + numBuf + "}";
     }
     if (wantHas) {
@@ -2774,27 +2907,17 @@ bool V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
     // Live probe: the same hasHandler(45) the cmd chain uses to tell the main
     // frame's receiver from its siblings (8.3.27.2342 live: three config
     // vtable objects pass the static checks, only the main frame answers).
-    HWND cmdHwnd = nullptr;
-    DWORD ensureErr = 0;
-    const char* marshalPath = "";
-    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return false;
-    AcquireSRWLockExclusive(&g_pendingLock);
-    g_pending.recv = recv;
-    g_pending.trFn = hasTr;
-    g_pending.mode = 1;
-    memcpy(g_pending.u.cmd.group, kConfigGroup, 16);
-    g_pending.u.cmd.cmdNum = 45;
-    g_pending.u.cmd.param = 0;
-    g_pending.u.cmd.object = nullptr;
-    g_pending.rc = -2;
-    g_pending.exc = 0;
-    InterlockedExchange(&g_pending.done, 0);
-    DWORD_PTR probeRes = 0;
-    LRESULT sent = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 10000, &probeRes);
-    bool probed = sent != 0 && g_pending.done && g_pending.exc == 0 && g_pending.rc >= 0;
-    ReleaseSRWLockExclusive(&g_pendingLock);
-    if (!probed) return false;
+    V8Cmd probeCmd = {};
+    memcpy(probeCmd.group, kConfigGroup, 16);
+    probeCmd.cmdNum = 45;
+    V8iRequest req;
+    req.mode = 1;
+    req.recv = recv;
+    req.trFn = hasTr;
+    req.cmd = &probeCmd;
+    req.cmdSize = sizeof(probeCmd);
+    const V8iMarshalResult mr = V8iMarshal(req, 10000, true);
+    if (mr.status != 0 || mr.exc != 0 || mr.rc < 0) return false;
 
     *recvOut = recv;
     *recvVtOut = (uintptr_t*)vt;
@@ -2811,30 +2934,18 @@ bool V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
 // chain uses, with its WndProc re-assertion and fallbacks, instead of a
 // private subclass that duplicates them.
 bool V8iRunOnUi(void (*fn)(void*), void* arg, int timeoutMs) {
-    HWND cmdHwnd = nullptr;
-    DWORD ensureErr = 0;
-    const char* marshalPath = "";
-    if (!EnsureCmdUi(&cmdHwnd, &ensureErr, &marshalPath)) return false;
-    AcquireSRWLockExclusive(&g_pendingLock);
-    g_pending.recv = nullptr;
-    g_pending.trFn = nullptr;
-    g_pending.mode = 3;
-    g_pending.fun = fn;
-    g_pending.funArg = arg;
-    g_pending.rc = -2;
-    g_pending.exc = 0;
-    InterlockedExchange(&g_pending.done, 0);
-    DWORD_PTR res = 0;
-    // 30 s, no SMTO_ABORTIFHUNG: while the base loads, the UI thread does not
-    // pump for tens of seconds — that is business, not a hang.
-    LRESULT sent = SendMessageTimeoutW(cmdHwnd, kV8iCmdMsg, 0, 0,
-                                    SMTO_BLOCK, (UINT)timeoutMs, &res);
-    bool ok = sent != 0 && g_pending.done && g_pending.rc == 0;
-    int crashed = g_pending.rc;
-    ReleaseSRWLockExclusive(&g_pendingLock);
-    if (sent && g_pending.done && crashed != 0 && crashed != -2)
-        LogLine("mainmenu/UI: шаг упал (0x%08X)", (unsigned)crashed);
-    return ok;
+    V8iRequest req;
+    req.mode = 3;
+    req.fun = fn;
+    req.funArg = arg;
+    // No SMTO_ABORTIFHUNG: while the base loads, the UI thread does not pump
+    // for tens of seconds — that is business, not a hang.
+    const V8iMarshalResult mr = V8iMarshal(req, (DWORD)timeoutMs, false);
+    if (mr.status == -98) return false;   // no marshal window yet
+    if (mr.status != 0) return false;     // timed out: the request was retired
+    if (mr.rc != 0)
+        LogLine("mainmenu/UI: шаг упал (0x%08X)", (unsigned)mr.rc);
+    return mr.rc == 0;
 }
 
 }  // namespace v8i

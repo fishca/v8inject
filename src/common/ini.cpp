@@ -99,4 +99,118 @@ bool IniSet(const wchar_t* path, const wchar_t* section, const wchar_t* key,
     return WritePrivateProfileStringW(section, key, value ? value : L"", path) != FALSE;
 }
 
+namespace {
+
+// Whole file into memory. An ini file of the project is a few hundred bytes;
+// the cap keeps a wrong path (a directory, a huge log) from being slurped.
+bool ReadFileBytes(const wchar_t* path, std::string& out) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(f, &size) || size.QuadPart <= 0 ||
+        size.QuadPart > 4 * 1024 * 1024) {
+        CloseHandle(f);
+        return false;
+    }
+    out.resize((size_t)size.QuadPart);
+    DWORD got = 0;
+    const bool ok = ReadFile(f, &out[0], (DWORD)out.size(), &got, nullptr) != FALSE &&
+                    got == out.size();
+    CloseHandle(f);
+    if (!ok) out.clear();
+    return ok;
+}
+
+// UTF-8 → wide; empty on invalid input, so the caller can fall back.
+std::wstring FromUtf8(const char* p, size_t n) {
+    const int need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p, (int)n,
+                                         nullptr, 0);
+    if (need <= 0) return std::wstring();
+    std::wstring w((size_t)need, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p, (int)n, &w[0], need);
+    return w;
+}
+
+std::wstring FromAnsi(const char* p, size_t n) {
+    const int need = MultiByteToWideChar(CP_ACP, 0, p, (int)n, nullptr, 0);
+    if (need <= 0) return std::wstring();
+    std::wstring w((size_t)need, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, p, (int)n, &w[0], need);
+    return w;
+}
+
+// Decodes the file by its byte order mark. IniSet writes UTF-16LE with 0xFF
+// 0xFE; an ANSI file from an older build has no mark at all.
+std::wstring DecodeBytes(const std::string& b) {
+    const unsigned char* u = (const unsigned char*)b.data();
+    if (b.size() >= 2 && u[0] == 0xFF && u[1] == 0xFE) {
+        const size_t n = (b.size() - 2) / sizeof(wchar_t);
+        std::wstring w((const wchar_t*)(u + 2), n);
+        return w;
+    }
+    if (b.size() >= 2 && u[0] == 0xFE && u[1] == 0xFF) {
+        std::wstring w;
+        w.reserve((b.size() - 2) / 2);
+        for (size_t i = 2; i + 1 < b.size(); i += 2)
+            w.push_back((wchar_t)((u[i] << 8) | u[i + 1]));
+        return w;
+    }
+    if (b.size() >= 3 && u[0] == 0xEF && u[1] == 0xBB && u[2] == 0xBF)
+        return FromUtf8(b.data() + 3, b.size() - 3);
+    // No mark: a UTF-8 file from another tool is still valid UTF-8, and an ANSI
+    // file is all that is left.
+    std::wstring w = FromUtf8(b.data(), b.size());
+    return w.empty() ? FromAnsi(b.data(), b.size()) : w;
+}
+
+bool IsSpace(wchar_t c) { return c == L' ' || c == L'\t' || c == L'\r'; }
+
+std::wstring Trim(const std::wstring& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && IsSpace(s[b])) ++b;
+    while (e > b && IsSpace(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+}  // namespace
+
+std::wstring IniGetManual(const wchar_t* path, const wchar_t* section,
+                          const wchar_t* key, const wchar_t* fallback, bool* found) {
+    if (found) *found = false;
+    const std::wstring missing = fallback ? fallback : L"";
+    if (!path || !key) return missing;
+    std::string bytes;
+    if (!ReadFileBytes(path, bytes)) return missing;
+    const std::wstring text = DecodeBytes(bytes);
+
+    std::wstring current;   // current [section]; empty = before the first one
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t eol = text.find(L'\n', pos);
+        if (eol == std::wstring::npos) eol = text.size();
+        const std::wstring line = Trim(text.substr(pos, eol - pos));
+        pos = eol + 1;
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        if (line[0] == L'[') {
+            const size_t close = line.find(L']');
+            current = close == std::wstring::npos ? std::wstring()
+                                                  : Trim(line.substr(1, close - 1));
+            continue;
+        }
+        const size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        // Windows ini semantics: a section name in brackets, keys before any
+        // section belong to the empty section.
+        if (!current.empty() && (!section || _wcsicmp(current.c_str(), section) != 0))
+            continue;
+        if (current.empty() && section && *section) continue;
+        const std::wstring k = Trim(line.substr(0, eq));
+        if (_wcsicmp(k.c_str(), key) != 0) continue;
+        if (found) *found = true;
+        return Trim(line.substr(eq + 1));
+    }
+    return missing;
+}
+
 }  // namespace v8i
