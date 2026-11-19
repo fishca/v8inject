@@ -934,3 +934,49 @@ A43/A44 вживую на 1С не прогонялись (стенда нет):
 устранён единственный путь, на котором `g85_origWndProc` мог стать нашим же
 proc; отказ от подкласса при `old == V8iSubclass85` и защита в
 `V8iSubclass85` оставляют окно рабочим в любом исходе гонки.
+
+#### Пакет 2 — жизненный цикл сессии: закрыт
+
+| # | Что сделано | Коммит |
+|---|---|---|
+| A45 | `Client::Call` после таймаута даёт grace-догон (равный таймауту, но не больше 5 с), затем забирает слово состояния `Request → Idle`: сессия остаётся рабочей, следующий `Call` не упирается в BUSY. Payload пишет `respSeq` и публикует ответ только через CAS `Request → Response` при совпадении `seq` — поздний ответ отбрасывается, а не ложится поверх следующего запроса; поверх `kStateExit` ответ не публикуется вовсе. `Client::Close` возвращает `bool`: дожидается Idle, при занятом payload честно сообщает, что exit поставлен в очередь за командой, и подтверждает уход по завершению внедрённого потока. Payload-сторож видит смерть процесса-хоста (`hostPid` в блоке) и уходит сам, освобождая блок; `Open` после «упавшего» хоста ждёт исчезновения блока (до 3 с) вместо `ALREADY_EXISTS` | `529a331` |
+| A96 | Протокол версионирован: `kProtocolAbi = 2`, поля `abiVersion/structSize/hostPid/payloadAbi/respSeq` дописаны **после** блока ABI 1 (смещения зафиксированы `static_assert`), поэтому старый payload отличим от «не запустился» по нулевому `payloadAbi`; payload проверяет штамп хоста и при несовпадении пишет `diag = kDiagAbiMismatch`. Все ранние отказы `OpenBlock/Open/Call/Close` заполняют `LastError()` (DACL, `CreateFileMapping`, `ALREADY_EXISTS` с видом владельца, `MapViewOfFile`, handshake, BUSY, потеря payload) | `529a331` |
+
+Приёмка пакета: сборка x64 и x86 `/W4 /WX` без предупреждений C++; `ctest`
+4/4 на обеих разрядностях (в изоляции); новые и переписанные тесты
+`unit_protocol` (60 тестов / 856 проверок на x64, 59 / 827 на x86):
+
+- `Protocol_TimeoutLeavesTheSessionUsable` — молчащий payload, таймаут,
+  слово состояния вернулось в Idle, следующий `Call` получает свежий ответ
+  (на старом коде — BUSY до перезапуска 1С);
+- `Protocol_LateReplyIsDroppedAfterTimeout` — поздний ответ отбрасывается,
+  состояние и буфер не тронуты, следующий ответ читается корректно;
+- `Protocol_ReplyIsNotPublishedOverExit` / `Protocol_ReplyOfAnotherRequestIsDropped`
+  — прямой тест `V8iPublishReply`: поверх Exit и поверх чужого `seq` ответ
+  не публикуется, CAS выставляет `respSeq` только для текущего запроса;
+- `Protocol_UnconsumedReplyBlocksTheNextCall` — непрочитанный ответ не
+  затирается следующим запросом, отказ с текстом;
+- `Protocol_CloseWhileBusyReportsFailure` — занятый payload: `Close(300)`
+  возвращает `false` с причиной, а не «успех» с освобождёнными хэндлами;
+- `Protocol_ExitStopsThePayload` — `Close()` возвращает `true` только когда
+  payload действительно ушёл;
+- `Protocol_SecondHostOnTheSamePidIsRefused` — отказ называет pid владельца
+  блока (A96);
+- `Protocol_StaleBlockOfACrashedHostIsReused` — блок от «упавшего» хоста
+  переиспользуется после того, как payload отпустил последний mapping;
+- `Protocol_PayloadLeavesWhenItsHostIsGone` — реальный `V8iRunCommandLoop`
+  с мёртвым `hostPid` завершается сам и оставляет `kStateExit`;
+- `Protocol_HandshakeRejectsAPayloadOfAnotherBuild` — `payloadAbi == 0`
+  (сборка прошлого поколения) и чужой `structSize` отклоняются.
+
+Живая проверка A45 (стенд без 1С, на `v8i_hook_target`): `v8inject watch`
+подключён, процесс-хост убит `Stop-Process -Force`; в логе payload —
+`host process is gone: asking the command loop to leave`, затем
+`payload exit: 1 hook(s) restored`; новый `v8inject probe` через 0.8 с
+подключился без `ALREADY_EXISTS`.
+
+Остаточное: payload, занятый командой, невозможно прервать извне — он уходит
+сразу после возврата из команды (это и сообщает `Close`); загруженную DLL
+другой сборки нельзя заменить на месте, поэтому при несовпадении протокола
+хост требует перезапуска цели — пересборка DLL при живом процессе это A42
+(пакет 3).
