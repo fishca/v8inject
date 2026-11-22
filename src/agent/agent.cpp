@@ -51,6 +51,9 @@ enum MenuId {
 HWND g_hwnd = nullptr;
 HINSTANCE g_hinst = nullptr;
 NOTIFYICONDATAW g_nid{};
+// A158: the message the shell broadcasts when the taskbar (re)created -- the
+// tray icon has to be re-added after an explorer restart.
+UINT g_taskbarCreatedMsg = 0;
 // Which processes were already injected into and which ones are being retried.
 // The two sets this replaces were only ever added to, so a transient failure
 // disabled the auto-injection for that window forever and a reused pid was
@@ -329,6 +332,16 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    default:
+        // A158: explorer rebuilds the taskbar when it restarts, and the tray
+        // icon dies with its window -- the agent kept polling with no way to
+        // reach it (no menu, no settings, no exit). The shell broadcasts the
+        // registered TaskbarCreated message in that moment; re-add the icon.
+        if (g_taskbarCreatedMsg && msg == g_taskbarCreatedMsg) {
+            Shell_NotifyIconW(NIM_ADD, &g_nid);
+            return 0;
+        }
+        break;
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
@@ -385,6 +398,7 @@ HICON MakeTrayIcon() {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     g_hinst = hInst;
+    g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");   // A158
     CreateMutexW(nullptr, TRUE, L"V8iAgentMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 

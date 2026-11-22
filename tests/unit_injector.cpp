@@ -352,3 +352,27 @@ V8I_TEST(Injector_WalksARealExportTable) {
     CHECK_EQ(std::string(r.error), std::string("the image does not export v8i_probe"));
     CHECK(r.sizeOfImage > 0);
 }
+
+// A143: a crashed remote thread exits with an NTSTATUS (an exception inside
+// DllMain or its dependencies), and the old table read any nonzero code as
+// "a module handle" -- `inject` printed "injected ok" over a dead 1C. The
+// handle is recognized only when it looks like one: 64 KiB aligned, above the
+// first 64 KiB, below the user/kernel boundary.
+V8I_TEST(Injector_AnNtstatusExitCodeIsNotAModuleHandle) {
+    const DWORD codes[] = { 0xC0000005u, 0xC0000135u, 0x80000003u, 0xC0000409u };
+    for (const DWORD ec : codes) {
+        const RemoteLoadDecision d = EvaluateRemoteLoad(WAIT_OBJECT_0, ec, false);
+        CHECK(!d.ok);
+        CHECK(d.freeBuffer);
+        CHECK(std::string(d.reason).find("died") != std::string::npos);
+    }
+
+    // A genuine handle value still passes the table.
+    CHECK(EvaluateRemoteLoad(WAIT_OBJECT_0, 0x78000000, false).ok);
+    // The user/kernel boundary of the check only binds on x86 (the exit code
+    // is a DWORD and can never reach the x64 boundary), so the x86 build gets
+    // the boundary case here: aligned, but above the 32-bit user space.
+#if !defined(_WIN64)
+    CHECK(!EvaluateRemoteLoad(WAIT_OBJECT_0, 0x80000000u, false).ok);
+#endif
+}

@@ -304,8 +304,21 @@ bool RemoteLoadLibrary(HANDLE hProc, const std::wstring& dllPath, HMODULE* baseO
 // under a still-running remote thread.
 RemoteLoadDecision EvaluateRemoteLoad(DWORD wait, DWORD exitCode, bool modulePresent) {
     if (wait == WAIT_OBJECT_0) {
-        if (exitCode != 0 && exitCode != STILL_ACTIVE)
+        // A143: the code only counts as "a module handle" when it looks like
+        // one. Load addresses are 64 KiB aligned and stay below the user/kernel
+        // boundary; a crashed remote thread exits with an NTSTATUS instead
+        // (0xC0000005, 0xC0000135, 0x80000003) -- the old table read any
+        // nonzero code as success, and `inject` printed "injected ok" over a
+        // dead 1C. The code itself is in the log line the caller writes.
+        const uintptr_t kMaxBase =
+            sizeof(void*) == 8 ? 0x0000800000000000ull : 0x80000000ull;
+        const bool looksLikeHandle =
+            exitCode != 0 && exitCode != STILL_ACTIVE && (exitCode & 0xFFFF) == 0 &&
+            exitCode >= 0x10000 && exitCode < kMaxBase;
+        if (looksLikeHandle)
             return { true, true, "the remote thread finished and returned a module handle" };
+        if (exitCode != 0 && exitCode != STILL_ACTIVE)
+            return { false, true, "the remote thread died with an NTSTATUS, not a module handle" };
         if (exitCode == 0)
             return { false, true, "LoadLibraryW returned NULL" };
         // A finished thread that reports STILL_ACTIVE is indistinguishable

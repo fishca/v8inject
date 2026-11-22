@@ -632,7 +632,15 @@ JobOutcome RunJobCalls(uint32_t pid, const std::wstring& dll, const wchar_t* com
     }
     r.openOk = true;
     if (command) {
-        r.callOk = g_client.Call(command, r.reply, 20000);
+        // A157: cmd/cmd85/xref legitimately hold the 1C UI thread (cmd 45
+        // keeps it inside its own modal dump dialog; the payload marshal
+        // answers after its own ~30 s timeout). The flat 20 s here reported
+        // "(нет ответа)" while the dialog was actually working in 1C -- the
+        // CLI runs these same commands with 120 s for exactly this reason.
+        const bool slow = wcsncmp(command, L"cmd ", 4) == 0 ||
+                          wcsncmp(command, L"cmd85", 5) == 0 ||
+                          wcsncmp(command, L"xref ", 5) == 0;
+        r.callOk = g_client.Call(command, r.reply, slow ? 120000 : 20000);
         if (!r.callOk && r.error.empty()) r.error = g_client.LastError();
     }
     return r;

@@ -51,10 +51,14 @@ void WriteLineLocked(const wchar_t* path, const char* line, int n) {
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        // Fallback chain: temp dir, then next to the module.
+        // Fallback chain: temp dir, then next to the module. A144: GetTempPathW
+        // may fill the buffer to the last character (up to 259 characters for
+        // redirected profiles), and lstrcatW has no bounds -- the append then
+        // wrote past the stack buffer on the 1C thread. The room for the file
+        // name is part of the check now.
         wchar_t tmp[MAX_PATH] = {};
         DWORD tmpLen = GetTempPathW(MAX_PATH, tmp);
-        if (tmpLen > 0 && tmpLen < MAX_PATH) {
+        if (tmpLen > 0 && tmpLen + 20 < MAX_PATH) {
             lstrcatW(tmp, L"v8inject_payload.log");
             h = CreateFileW(tmp, FILE_APPEND_DATA,
                             FILE_SHARE_READ | FILE_SHARE_WRITE,
