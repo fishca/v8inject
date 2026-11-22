@@ -243,3 +243,58 @@ V8I_TEST(Pending_MarshalRunsOnTheWindowThreadAndIgnoresStaleMessages) {
 
     DestroyWindow(hwnd);
 }
+
+// A120: after a failed transmit only the frame the marshal addressed is
+// brought back -- the old sweep re-enabled every disabled V8 frame of the
+// process, including the owner of a parallel command's legitimate modal state.
+namespace v8i {
+namespace platform {
+void RestoreFramesAfterFailedTransmit(HWND marshalTo);   // src/payload/platform/platform_commands.cpp
+}
+}
+
+V8I_TEST(Pending_FailedTransmitRestoresOnlyTheMarshalFrame) {
+    // The frame class is registered by the marshal test above; a second
+    // registration attempt fails with ERROR_CLASS_EXISTS and is fine.
+    WNDCLASSEXW fc = {};
+    fc.cbSize = sizeof(fc);
+    fc.lpfnWndProc = PlainProc;
+    fc.hInstance = GetModuleHandleW(nullptr);
+    fc.lpszClassName = L"V8TopLevelFrame";
+    RegisterClassExW(&fc);
+    HWND frame = CreateWindowExW(0, L"V8TopLevelFrame", L"v8i restore test",
+                                 0, 0, 0, 100, 100, nullptr, nullptr,
+                                 GetModuleHandleW(nullptr), nullptr);
+    REQUIRE(frame != nullptr);
+    WNDCLASSEXW other = {};
+    other.cbSize = sizeof(other);
+    other.lpfnWndProc = PlainProc;
+    other.hInstance = GetModuleHandleW(nullptr);
+    other.lpszClassName = L"v8i_restore_other";
+    RegisterClassExW(&other);   // may already exist on a rerun -- fine
+    HWND foreign = CreateWindowExW(0, L"v8i_restore_other", L"v8i restore other",
+                                   0, 0, 0, 100, 100, nullptr, nullptr,
+                                   GetModuleHandleW(nullptr), nullptr);
+    REQUIRE(foreign != nullptr);
+
+    EnableWindow(frame, FALSE);
+    EnableWindow(foreign, FALSE);
+
+    // The marshal's frame comes back...
+    v8i::platform::RestoreFramesAfterFailedTransmit(frame);
+    CHECK(IsWindowEnabled(frame));
+    // ...the foreign-class window does not: it is not the frame the marshal
+    // addressed, so a modal state that belongs to someone else stays as is.
+    CHECK(!IsWindowEnabled(foreign));
+    v8i::platform::RestoreFramesAfterFailedTransmit(foreign);
+    CHECK(!IsWindowEnabled(foreign));
+
+    // No crash and no change on null, garbage and an enabled window.
+    v8i::platform::RestoreFramesAfterFailedTransmit(nullptr);
+    v8i::platform::RestoreFramesAfterFailedTransmit((HWND)(uintptr_t)0xDEADBEEF);
+    v8i::platform::RestoreFramesAfterFailedTransmit(foreign);
+    CHECK(!IsWindowEnabled(foreign));
+
+    DestroyWindow(frame);
+    DestroyWindow(foreign);
+}

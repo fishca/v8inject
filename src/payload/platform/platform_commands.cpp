@@ -61,8 +61,9 @@ bool TempFile(const wchar_t* name, wchar_t* out, size_t cch) {
 // PostMessage (see EnsureCmdUi); 1C UI code must not be called cross-thread.
 // The frame is located by scanning committed writable memory for the vtable
 // pointer; the result is cached and re-validated for subsequent calls.
+// (A118: the separate g_cmdFrameCache slot was never written -- the discovered
+// frame objects below are the only cache, revalidated per use.)
 namespace {
-uintptr_t g_cmdFrameCache = 0;
 #if !defined(_WIN64)
 uintptr_t g_x86FrameObj = 0;   // discovered frame object (x86 runtime calibration)
 #else
@@ -246,18 +247,36 @@ bool EnsureCmdUi(HWND* outHwnd, DWORD* outErr, const char** outPath) {
     // replaced WndProc; re-verify and re-install on every call unless the
     // comctl32 subclass chain is our installation.
     if (g_cmdSubclassed && g_cmdHwnd && IsWindow(g_cmdHwnd)) {
-        if (!g_cmdViaSubclass) {
-            // Re-assert our WndProc right before every send: 1C re-creates its
-            // toolbar/UI and re-sets the frame WndProc while a config opens.
-            LONG_PTR old = SetWindowLongPtrW(g_cmdHwnd, GWLP_WNDPROC, (LONG_PTR)V8iCmdWndProc);
-            if (!old) return false;
-            if (old != (LONG_PTR)V8iCmdWndProc) g_cmdOldWndProc = old;
-            *outPath = "wndproc";
+        // A121: a recreated 1C window can get the same HWND back for a window
+        // of another class. Marshal into it and the message goes nowhere while
+        // SendMessageTimeout reports success -- "did not answer" forever, with
+        // the re-enumeration below never reached. The class is the identity
+        // check: no longer a 1C frame here means reset and re-discover.
+        wchar_t cls[64] = {};
+        const bool ourFrame = GetClassNameW(g_cmdHwnd, cls, 64) > 0 &&
+                              (wcscmp(cls, L"V8TopLevelFrame") == 0 ||
+                               wcsncmp(cls, L"V8Window0", 9) == 0);
+        if (!ourFrame) {
+            LogLine("cmd: hwnd 0x%llX is now class %ls, not a 1C frame -- re-discovering",
+                    (unsigned long long)(uintptr_t)g_cmdHwnd, cls);
+            g_cmdSubclassed = false;
+            g_cmdViaSubclass = false;
+            g_cmdHwnd = nullptr;
+            g_cmdOldWndProc = 0;
         } else {
-            *outPath = "subclass";
+            if (!g_cmdViaSubclass) {
+                // Re-assert our WndProc right before every send: 1C re-creates its
+                // toolbar/UI and re-sets the frame WndProc while a config opens.
+                LONG_PTR old = SetWindowLongPtrW(g_cmdHwnd, GWLP_WNDPROC, (LONG_PTR)V8iCmdWndProc);
+                if (!old) return false;
+                if (old != (LONG_PTR)V8iCmdWndProc) g_cmdOldWndProc = old;
+                *outPath = "wndproc";
+            } else {
+                *outPath = "subclass";
+            }
+            *outHwnd = g_cmdHwnd;
+            return true;
         }
-        *outHwnd = g_cmdHwnd;
-        return true;
     }
     std::vector<WindowEntry> wins = EnumProcessWindows();
     HWND frame = nullptr;
@@ -1467,12 +1486,38 @@ static DWORD WINAPI V8iCmd85PollThread(LPVOID) {
     return 0;
 }
 
+// The config.dll range through POD out-parameters: the __try frames of the
+// capture cannot hold a ModuleRange local (it carries a std::wstring, C2712).
+static bool Config85Range(uintptr_t* base, size_t* size) {
+    ModuleRange cfg;
+    if (!FindModule(L"config.dll", cfg)) return false;
+    if (base) *base = cfg.base;
+    if (size) *size = cfg.size;
+    return true;
+}
+
 static void V8iCaptureCmdRecv(void* obj) {
     if (!obj) return;
     uintptr_t fvt = 0;
     __try { fvt = *(uintptr_t*)obj; } __except (EXCEPTION_EXECUTE_HANDLER) { fvt = 0; }
     if (!fvt) {
         LogLine("cmdrecv: frame has no vtable");
+        return;
+    }
+    // A119: slot 31 runs platform code on the UI thread, so the object is
+    // gated before any state change and before the call -- the same gate the
+    // late capture and V8iRecv85Alive apply. 1C destroys transient frames, and
+    // an event may arrive for a freed-and-reused object: its "vtable" is
+    // garbage, and calling a garbage slot executes arbitrary code. A foreign
+    // object also must not reset an existing, still-alive capture (sends
+    // re-validate it via V8iRecv85Alive). The module range comes through POD
+    // out-parameters: this frame owns __try, and ModuleRange carries a
+    // std::wstring -- C2712.
+    uintptr_t cfgBase = 0, cfgSize = 0;
+    if (!Config85Range(&cfgBase, &cfgSize) || fvt != cfgBase + 0x2ED3B0) {
+        LogLine("cmdrecv85: obj 0x%llX vt 0x%llX is not the calibrated ITopLevelFrame "
+                "(config.dll+0x2ED3B0), capture skipped",
+                (unsigned long long)(uintptr_t)obj, (unsigned long long)fvt);
         return;
     }
     // Live-calibrated on 8.5.1.1529: the event's obj IS the ITopLevelFrame
@@ -1488,7 +1533,8 @@ static void V8iCaptureCmdRecv(void* obj) {
     g85_recvVt = 0;
     g85_recvFrame = 0;
     long exc = 0;
-    if (fn31 && IsReadable((void*)fn31, 1)) {
+    if (fn31 && IsReadable((void*)fn31, 1) &&
+        fn31 >= cfgBase && fn31 < cfgBase + cfgSize) {
         void* recv = nullptr;
         __try {
             ((void(__cdecl*)(void*, void**))fn31)(obj, &recv);
@@ -2566,14 +2612,21 @@ std::string CmdInfoToJson(const std::wstring&) { return CmdInfoToJsonA(); }
 // clicking the bar does nothing because a disabled parent swallows the input).
 // The failure is ours to clean up, and the frame is the same window class on
 // 8.3 and 8.5.
-static void RestoreFramesAfterFailedTransmit() {
-    for (const WindowEntry& w : EnumProcessWindows()) {
-        if (!w.hwnd || IsWindowEnabled(w.hwnd)) continue;
-        if (w.cls != L"V8TopLevelFrame" && w.cls.rfind(L"V8Window0", 0) != 0) continue;
-        EnableWindow(w.hwnd, TRUE);
-        LogLine("cmd: re-enabled frame 0x%llX that the platform disabled before the fault",
-                (unsigned long long)(uintptr_t)w.hwnd);
-    }
+//
+// A120: the restore used to sweep every disabled V8 frame of the process --
+// a parallel command's legitimately modal state (the platform disables the
+// owner for the duration of its own dialog) was broken by a foreign failure.
+// The marshal knows the frame it addressed: only that window is brought back,
+// and only when it is a 1C frame class.
+void RestoreFramesAfterFailedTransmit(HWND marshalTo) {
+    if (!marshalTo || !IsWindow(marshalTo) || IsWindowEnabled(marshalTo)) return;
+    wchar_t cls[64] = {};
+    if (!GetClassNameW(marshalTo, cls, 64) ||
+        (wcscmp(cls, L"V8TopLevelFrame") != 0 && wcsncmp(cls, L"V8Window0", 9) != 0))
+        return;
+    EnableWindow(marshalTo, TRUE);
+    LogLine("cmd: re-enabled frame 0x%llX that the platform disabled before the fault",
+            (unsigned long long)(uintptr_t)marshalTo);
 }
 
 std::string CmdCommandToJson(const std::wstring& args0) {
@@ -2658,15 +2711,22 @@ std::string CmdCommandToJson(const std::wstring& args0) {
                 num, sub, (unsigned long long)vtblPtr);
     j += numBuf;
 
-    uintptr_t frame = g_cmdFrameCache;
+    uintptr_t frame = 0;
     bool cached = false;
     std::vector<uintptr_t> candidates;
-#if !defined(_WIN64)
+    // A118: the discovery pass already validated the frame object (on x64 it
+    // was revalidated above) and the exact receiver offset; use it directly
+    // instead of re-scanning the address space on every command -- the x86
+    // path has done so all along, while the x64 one kept re-walking gigabytes
+    // per call because the cache slot it read (g_cmdFrameCache) was never
+    // written.
+#if defined(_WIN64)
+    if (g_x64FrameObj) {
+        frame = g_x64FrameObj;
+        cached = true;
+    }
+#else
     if (g_x86FrameObj) {
-        // x86: the discovery pass already validated the object and the exact
-        // receiver offset; use it directly instead of re-scanning by vtable
-        // (several sibling classes share the vtable, so a vtable-only scan
-        // would pick objects with a different receiver layout).
         frame = g_x86FrameObj;
         cached = true;
     }
@@ -2889,8 +2949,9 @@ std::string CmdCommandToJson(const std::wstring& args0) {
     if (rc < 0) {
         // The fault stopped the platform between "disable the owner" and "show
         // the dialog": put the frame back before reporting, or the Configurator
-        // stays dead until someone re-enables it from outside.
-        RestoreFramesAfterFailedTransmit();
+        // stays dead until someone re-enables it from outside. A120: only the
+        // frame this command was marshaled to.
+        RestoreFramesAfterFailedTransmit(g_cmdHwnd);
         _snprintf_s(numBuf, sizeof(numBuf), _TRUNCATE, ",\"error\":\"transmit exception 0x%X\"",
                     (unsigned)mr.exc);
         return j + numBuf + "}";
@@ -2928,7 +2989,11 @@ bool V8iGetCommandReceiver(void** recvOut, uintptr_t** recvVtOut,
 #if defined(_WIN64)
     if (!g_x64FrameObj) g_x64FrameObj = DiscoverFrameVtblX64(cfg);
     frame = g_x64FrameObj;
-    recvBack = 0x20;
+    // A117: the discovery found the frame AND the receiver offset it works
+    // with -- the cmd chain uses it (g_x64RecvOffset, 0x20 on the calibration
+    // build), and this receiver must match: a hard 0x20 built a receiver for
+    // the wrong offset on any build the discovery calibrated differently.
+    recvBack = g_x64RecvOffset;
 #else
     if (!g_x86FrameObj) g_x86FrameObj = DiscoverFrameVtblX86(cfg);
     frame = g_x86FrameObj;
