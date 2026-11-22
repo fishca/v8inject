@@ -181,6 +181,22 @@ struct LockGuard {
     LockGuard& operator=(const LockGuard&) = delete;
 };
 
+// A100: install and remove both suspend EVERY thread of the process inside
+// their window, and three payload threads can start them (the command loop,
+// the native-menu worker, the early-subscribe worker). Run in parallel, two
+// windows suspend each other mid-cycle and deadlock with the frozen 1C threads
+// behind them. The window itself is serialized: the second operation waits in
+// kernel space and proceeds right after the first one has resumed everything.
+// Never held together with g_lock from the other side (the registry lock is
+// taken inside this one, never before it).
+SRWLOCK g_patchLock = SRWLOCK_INIT;
+struct PatchWindowGuard {
+    PatchWindowGuard() { AcquireSRWLockExclusive(&g_patchLock); }
+    ~PatchWindowGuard() { ReleaseSRWLockExclusive(&g_patchLock); }
+    PatchWindowGuard(const PatchWindowGuard&) = delete;
+    PatchWindowGuard& operator=(const PatchWindowGuard&) = delete;
+};
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -610,7 +626,10 @@ extern "C" void V8iHookEnter(void* ctx, void* retAddr, uintptr_t entryEb,
     // crash there leaves the in-memory ring unreadable), so persist the first
     // few hits with their arguments and caller frames. Uncapped logging inside
     // a hot hook (e.g. CreateWindowExW) floods the log and stalls the payload.
-    if (InterlockedIncrement(&c->logged) > 3) return;
+    // A101: the counter is signed and incremented on every call -- after 2^31
+    // hits of a hot function it wrapped negative and the cap stopped working,
+    // every call logging two lines again until the next wrap. Compare unsigned.
+    if ((unsigned)InterlockedIncrement(&c->logged) > 3u) return;
     LogLine("hit id=%u target=%p ret=%p a0=%p a1=%p a2=%p a3=%p",
             (unsigned)c->id, (void*)c->target, (void*)retAddr,
             (void*)a0, (void*)a1, (void*)a2, (void*)a3);
@@ -978,6 +997,7 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
     InterlockedExchange(&ctx->active, 1);
 
     {
+        PatchWindowGuard pw;   // A100: one install/remove window at a time
         Suspender sus;
         const Suspender::Result sr = sus.Suspend(target, target + stolen);
         if (sr != Suspender::Result::ok) {
@@ -1075,6 +1095,7 @@ bool HookRemove(uint32_t id) {
     InterlockedExchange(&ctx->active, 0);
 
     {
+        PatchWindowGuard pw;   // A100: one install/remove window at a time
         Suspender sus;
         const Suspender::Result sr = sus.Suspend(ctx->target, ctx->target + ctx->stolen);
         if (sr != Suspender::Result::ok) {
@@ -1356,7 +1377,9 @@ std::string HooksCommandToJson(const std::wstring&) {
         j += ",\"name\":\"" + JsonEscape(std::string(c->name)) + "\"";
         j += ",\"target\":\"" + HexStr(c->target) + "\"";
         j += ",\"stolen\":" + std::to_string(c->stolen);
-        j += ",\"calls\":" + std::to_string((long)c->calls);
+        // A101: unsigned -- a hot hook past 2^31 calls used to print a
+        // negative number here.
+        j += ",\"calls\":" + std::to_string((unsigned)c->calls);
         j += "}";
     }
     j += "]";
