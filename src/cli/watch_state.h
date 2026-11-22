@@ -67,4 +67,23 @@ private:
     uint64_t clock_ = 0;
 };
 
+// One record header of a `trace` reply, as far as `watch` needs it: the record
+// number, the hook id and the first argument kept as text (a "0x..." hex
+// literal the caller decodes itself).
+struct TraceRecordHead {
+    uint64_t seq = 0;
+    uint64_t hook = 0;
+    std::string arg0;
+};
+
+// Parses the record that starts at `pos` (which must point at `"seq":`) and
+// puts `next` past the first argument's closing quote. The header between
+// "hook" and "args" is skipped structurally, bounded by the next record: its
+// width grew past the old fixed 60-character window (`"tid"`, `"tick"`, `"ret"`
+// take 63-67 characters with real-world values), so `watch` discarded every
+// record and never fired (A156). False on malformed input -- the caller stops,
+// exactly like the old parser did.
+bool ParseTraceRecordHead(const std::string& resp, size_t pos, TraceRecordHead& out,
+                          size_t* next);
+
 }  // namespace v8i

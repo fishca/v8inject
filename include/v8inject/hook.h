@@ -31,7 +31,9 @@ using HookObserver = void (*)(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_
 uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver obs,
                              std::string& error);
 
-// Restores the original bytes of one hook, or of every hook when id == 0.
+// Restores the original bytes of every installed hook. Removal of a single
+// hook: HookRemove(id). Every refusal (a thread in the prologue, foreign
+// bytes, an unreadable target) keeps the hook registered.
 size_t HookRemoveAll();
 bool   HookRemove(uint32_t id);
 

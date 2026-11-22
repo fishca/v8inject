@@ -24,6 +24,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <thread>
 
 using namespace v8i;
@@ -340,6 +341,30 @@ V8I_TEST(Protocol_ReplyOfAnotherRequestIsDropped) {
     CHECK_EQ((int)block.io()->ready, (int)kStateResponse);
     CHECK_EQ((int)block.io()->respSeq, 7);
     CHECK(std::string(block.io()->response) == "{\"status\":\"ok\"}");
+}
+
+// A106: a reply larger than the block is refused, not silently truncated into
+// an invalid document. The old code cut the reply at kResponseBytes-1 and
+// published the cut half -- this test is red on that code (the publish
+// "succeeded") and green on the refusal.
+V8I_TEST(Protocol_OversizedReplyIsRefusedNotTruncated) {
+    const uint32_t pid = TestPid();
+    Client client;
+    REQUIRE(client.OpenBlock(pid, TempLogDir()));
+    RawBlock block;
+    REQUIRE(block.Attach(client.SharedName()));
+
+    InterlockedExchange((volatile LONG*)&block.io()->ready, kStateRequest);
+    InterlockedExchange((volatile LONG*)&block.io()->seq, 9);
+
+    std::vector<char> big(kResponseBytes + 64, 'x');
+    CHECK(!V8iPublishReply(block.io(), 9, big.data(), big.size()));
+    CHECK_EQ((int)block.io()->ready, (int)kStateRequest);
+    CHECK(block.io()->response[0] == 0);
+
+    // The block survived the refusal: a fitting reply still goes through.
+    CHECK(V8iPublishReply(block.io(), 9, kOkReply, sizeof(kOkReply) - 1));
+    CHECK_EQ((int)block.io()->respSeq, 9);
 }
 
 V8I_TEST(Protocol_UnconsumedReplyBlocksTheNextCall) {

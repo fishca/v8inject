@@ -585,3 +585,35 @@ V8I_TEST(Hook_TraceClearMovesTheStartMarker) {
     v8i::HookRemoveAll();
     VirtualFree(mem, 0, MEM_RELEASE);
 }
+
+// A99: a module with a hook in it can be unloaded before `unhook` runs. The
+// removal used to read the prologue under suspended threads with no guard at
+// all: a fault there killed the Suspender frame and left the whole process
+// frozen behind it. Now the window is guarded and the refusal keeps the hook
+// registered -- the test makes the page unreadable and expects a refusal while
+// the engine (and this process) stay alive.
+V8I_TEST(Hook_RefusesToRemoveAHookInMemoryThatWentUnreadable) {
+    v8i::HookRemoveAll();
+    uint8_t* mem = MakeStub(7);
+    REQUIRE(mem != nullptr);
+
+    std::string err;
+    const uint32_t id = v8i::HookInstall((uintptr_t)mem, "A99.unreadable", err);
+    REQUIRE(id != 0);
+
+    DWORD oldProtect = 0;
+    REQUIRE(VirtualProtect(mem, 4096, PAGE_NOACCESS, &oldProtect));
+
+    // Refused, not crashed: on the old code this test died inside the memcpy.
+    CHECK(!v8i::HookRemove(id));
+
+    REQUIRE(VirtualProtect(mem, 4096, oldProtect, &oldProtect));
+
+    // The hook is still live and still works, and a second attempt removes it
+    // now that the bytes are readable again.
+    StubFn fn = (StubFn)mem;
+    CHECK_EQ(fn(), 7u);
+    CHECK(v8i::HookRemove(id));
+    CHECK_EQ(fn(), 7u);
+    VirtualFree(mem, 0, MEM_RELEASE);
+}

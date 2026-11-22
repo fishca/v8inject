@@ -472,11 +472,17 @@ void MMSetCommandText(uintptr_t svc, const GUID& group, unsigned num, const wcha
 
 // Длинная v8string 8.3.20+: data указывает на [refCount][UTF-16][0],
 // старший бит capacity отличает кучевое хранилище от SSO (v8api/string.v).
-void MMSetLong(uintptr_t dst, const wchar_t* text) {
+//
+// refCount обязан быть 2 (A116): блок выделяет CRT payload'а, а платформа
+// освобождает такие строки своим аллокатором — единица при Release описания
+// команды вернула бы нашу память в чужую кучу, порча кучи 1С. Двойной счётчик
+// переживает Release платформы, блок остаётся висеть до выхода из процесса
+// (24+ байта на строку — та же цена, что у URL-пути ниже).
+void MMSetLong(uintptr_t dst, const wchar_t* text, unsigned refCount) {
     const size_t len = wcslen(text);
     unsigned char* data = (unsigned char*)malloc(len * 2 + 6);
     if (!data) return;
-    *(unsigned*)data = 1;
+    *(unsigned*)data = refCount;
     memcpy(data + 4, text, (len + 1) * 2);
     memset((void*)dst, 0, 24);
     *(unsigned char**)dst = data;
@@ -499,7 +505,7 @@ void MMSetCommandTextLong(uintptr_t svc, const GUID& group, unsigned num,
     *(uintptr_t*)(b + 0x68) = 1;
     const uintptr_t slots[4] = { b + 0x08, b + 0x20, b + 0x38, b + 0x50 };
     for (uintptr_t slot : slots)
-        MMSetLong(slot, text);
+        MMSetLong(slot, text, 2);
 }
 
 // --- картинки нативных пунктов ---------------------------------------------
@@ -711,12 +717,11 @@ bool MMSetDescrUrl(uintptr_t svc, uintptr_t urlCtor, const GUID& group,
     const uintptr_t b = descr - 0x70;
     if (!IsReadable((void*)(b + 0xB0), 0x40)) return false;   // URL в описании
     unsigned char str[24] = {};
-    MMSetLong((uintptr_t)str, url);
-    // Конструктор копирует строку; refCount=2 не даёт платформе освободить
-    // наш блок своим аллокатором (у payload и 1С разные CRT) — блок остаётся
-    // висеть до выхода из процесса (24 байта на пункт).
-    const uintptr_t data = *(uintptr_t*)str;
-    if (data && IsReadable((void*)data, 4)) *(unsigned*)data = 2;
+    // Конструктор копирует строку; refCount=2 задаёт сам MMSetLong (A116) —
+    // платформа освобождает такие блоки своим аллокатором, и refCount=1 при
+    // Release вернул бы нашу память в чужую кучу. Блок остаётся висеть до
+    // выхода из процесса (24 байта на пункт).
+    MMSetLong((uintptr_t)str, url, 2);
     bool ok = true;
     __try {
         MMCall2(urlCtor, b + 0xB0, (uintptr_t)str, 0);

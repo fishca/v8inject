@@ -1009,6 +1009,53 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
     return ctx->id;
 }
 
+// Why the guarded verify-and-restore of `unhook` refused. Every refusal keeps
+// the hook registered (a hook that is still patched must stay visible to
+// `hooks`) and the caller reports the reason.
+enum PrologueRestore {
+    kRestoreOk = 0,
+    kRestoreUnreadable,    // the target is no longer readable: the module with
+                           // the hook in it was unloaded (A99)
+    kRestoreForeignBytes,  // the prologue is no longer our patch (A71)
+    kRestorePatchFailed,   // VirtualProtect/memcpy back refused
+    kRestoreFaulted,       // SEH caught a fault inside the window (A99)
+};
+
+// POD-only frame of the verify-and-restore window (C2712: no C++ object that
+// needs unwinding may live where __try does). The bytes are read while every
+// other thread of the process is suspended, and a module with a hook in it may
+// have been unloaded since the hook was installed -- so the read is guarded and
+// the SEH frame sits BELOW the Suspender frame: whatever faults here, control
+// comes back and the caller resumes the threads instead of leaving the whole
+// process frozen behind a dead frame (A99).
+struct PrologueRestoreCall {
+    uintptr_t target;
+    const uint8_t* patch;
+    const uint8_t* original;
+    size_t stolen;
+    uint8_t nowBytes[kMaxStolen];
+    PrologueRestore status;
+};
+
+static void RestorePrologueUnderSeh(PrologueRestoreCall* call) {
+    __try {
+        const void* p = (const void*)call->target;
+        if (!IsReadable(p, call->stolen)) {
+            call->status = kRestoreUnreadable;
+            return;
+        }
+        memcpy(call->nowBytes, p, call->stolen);
+        if (memcmp(call->nowBytes, call->patch, kPatchLen) != 0) {
+            call->status = kRestoreForeignBytes;
+            return;
+        }
+        call->status = PatchBytes(call->target, call->original, call->stolen)
+                           ? kRestoreOk : kRestorePatchFailed;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        call->status = kRestoreFaulted;
+    }
+}
+
 bool HookRemove(uint32_t id) {
     HookCtx* ctx = nullptr;
     {
@@ -1043,22 +1090,36 @@ bool HookRemove(uint32_t id) {
         // A71: restore only bytes that are still ours. Something else -- another
         // packer, a manual patch, a hooker that ignored our rejection -- may
         // have rewritten the prologue since; copying our saved bytes over it
-        // would destroy whatever is there now.
-        uint8_t now[kMaxStolen] = {};
-        memcpy(now, (const void*)ctx->target, ctx->stolen);
-        if (memcmp(now, ctx->patch, kPatchLen) != 0) {
+        // would destroy whatever is there now. A99: the whole window is
+        // guarded -- an unreadable or faulting read refuses the removal
+        // instead of killing the frame that owes the resume.
+        PrologueRestoreCall rc{};
+        rc.target = ctx->target;
+        rc.patch = ctx->patch;
+        rc.original = ctx->original;
+        rc.stolen = ctx->stolen;
+        RestorePrologueUnderSeh(&rc);
+        if (rc.status != kRestoreOk) {
             sus.ResumeAll();
             InterlockedExchange(&ctx->active, 1);
-            LogLine("hook %u not removed: the bytes at %p are no longer the patch "
-                    "(now %02X %02X %02X %02X %02X)",
-                    id, (void*)ctx->target, now[0], now[1], now[2], now[3], now[4]);
-            return false;
-        }
-
-        if (!PatchBytes(ctx->target, ctx->original, ctx->stolen)) {
-            sus.ResumeAll();
-            InterlockedExchange(&ctx->active, 1);
-            LogLine("hook %u not removed: cannot restore the original bytes", id);
+            switch (rc.status) {
+            case kRestoreUnreadable:
+                LogLine("hook %u not removed: the target %p is no longer readable "
+                        "(module unloaded?)", id, (void*)ctx->target);
+                break;
+            case kRestoreForeignBytes:
+                LogLine("hook %u not removed: the bytes at %p are no longer the patch "
+                        "(now %02X %02X %02X %02X %02X)",
+                        id, (void*)ctx->target, rc.nowBytes[0], rc.nowBytes[1],
+                        rc.nowBytes[2], rc.nowBytes[3], rc.nowBytes[4]);
+                break;
+            case kRestorePatchFailed:
+                LogLine("hook %u not removed: cannot restore the original bytes", id);
+                break;
+            default:
+                LogLine("hook %u not removed: fault while restoring the prologue", id);
+                break;
+            }
             return false;
         }
         sus.ResumeAll();

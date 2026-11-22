@@ -174,6 +174,29 @@ static ScanStatus RunScan(const wchar_t* cmd, TypeInfoReport& rep) {
     return st;
 }
 
+// A106: the answer of `scan` goes through the same Guarded/FitReply machinery
+// as every other command. It used to be the one branch outside `Guarded`: a
+// reply larger than the block was silently truncated into an invalid document,
+// and a bad_alloc from the string building escaped to std::terminate, killing
+// the whole target process.
+static std::string ScanCommandToJson(const std::wstring& args) {
+    TypeInfoReport rep;
+    const ScanStatus st = RunScan(args.c_str(), rep);
+    if (st != ScanStatus::ok) {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "{\"status\":\"error\",\"command\":\"scan\",\"message\":\"%ls\"}",
+                    ScanStatusText(st));
+        LogLine("scan rejected: %ls", ScanStatusText(st));
+        return buf;
+    }
+    // The report is compact on purpose: the pretty layout alone can take the
+    // reply over the block size on a large COM object.
+    std::string reply = ToJson(rep, /*pretty=*/false);
+    LogLine("response sent, %zu bytes", rep.funcs.size());
+    return reply;
+}
+
 // MSVC C2712: __try cannot live in a function that needs C++ unwinding, so the
 // guarded body takes only POD pointers. The command text is copied into a
 // stack buffer before the call; the result is written into an out-parameter.
@@ -317,10 +340,17 @@ bool v8i::V8iPublishReply(SharedIo* io, LONG requestSeq, const char* data, size_
         return false;
     }
 
-    const size_t n = len > kResponseBytes - 1 ? kResponseBytes - 1 : len;
-    memcpy(io->response, data, n);
-    io->response[n] = 0;
-    InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)n);
+    if (len > kResponseBytes - 1) {
+        // A106: an oversized reply is refused, not silently truncated into an
+        // invalid document. Every command goes through FitReply now, so this
+        // branch is a defensive guard, not a path.
+        LogLine("reply of %zu bytes does not fit the block (%d): refused",
+                len, (int)(kResponseBytes - 1));
+        return false;
+    }
+    memcpy(io->response, data, len);
+    io->response[len] = 0;
+    InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)len);
     InterlockedExchange((volatile LONG*)&io->respSeq, requestSeq);
 
     // Request -> Response, not a blind store: when the host reset the word (or
@@ -675,19 +705,9 @@ int v8i::V8iRunCommandLoop(SharedIo* io) {
             continue;
         }
 
-        TypeInfoReport rep;
-        const ScanStatus st = RunScan(g_io->request, rep);
-        if (st != ScanStatus::ok) {
-            char buf[256] = {};
-            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                        "{\"status\":\"error\",\"command\":\"scan\",\"message\":\"%ls\"}",
-                        ScanStatusText(st));
-            PutResponse(buf);
-            LogLine("scan rejected: %ls", ScanStatusText(st));
-            continue;
-        }
-        PutResponse(ToJson(rep));
-        LogLine("response sent, %zu bytes", rep.funcs.size());
+        // A106: the fallback branch is `scan` -- under the same Guarded frame
+        // as every other command (FitReply, bad_alloc, SEH of the reply build).
+        PutResponse(Guarded(L"scan", ScanCommandToJson, std::wstring(g_io->request)));
     }
 
     // Stop the host watch before the caller unmaps the block: the watchdog

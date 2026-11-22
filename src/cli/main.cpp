@@ -197,9 +197,10 @@ int RunWatch(int argc, wchar_t** argv) {
     // Parse the allocated hook id: it is 1 after unhook all, but read it
     // instead of assuming.
     size_t idPos = resp.find("\"id\":");
-    LONG cfwId = (idPos != std::string::npos)
-                     ? _wtol(Utf8ToWide(resp.substr(idPos + 5, 8)).c_str())
-                     : 1;
+    uint64_t cfwId = (idPos != std::string::npos)
+                         ? _wcstoui64(Utf8ToWide(resp.substr(idPos + 5, 12)).c_str(),
+                                      nullptr, 10)
+                         : 1;
     client.Call(L"trace --clear", resp, 10000);
 
     std::wstring needle = NormalizePath(dumpDir);
@@ -212,7 +213,7 @@ int RunWatch(int argc, wchar_t** argv) {
     // without a limit (A56).
     v8i::WatchGate gate;
     v8i::WatchPathCache cache;
-    LONG lastSeq = 0;
+    uint64_t lastSeq = 0;   // 64-bit: the trace ring counts in uint64 (A90)
     ULONGLONG startTick = GetTickCount64();
 
     auto decodePath = [&](uint64_t addr, uint64_t now) -> const std::wstring* {
@@ -245,34 +246,31 @@ int RunWatch(int argc, wchar_t** argv) {
         }
 
         wchar_t req[96];
-        _snwprintf_s(req, _countof(req), _TRUNCATE, L"trace --since %ld", (long)lastSeq);
+        _snwprintf_s(req, _countof(req), _TRUNCATE, L"trace --since %llu",
+                     (unsigned long long)lastSeq);
         if (!client.Call(req, resp, 10000)) {
             Sleep(250);
             continue;
         }
 
-        // Walk the trace records: {"seq":N,"hook":H,...,"args":["0x..",...]}
-        LONG maxSeq = lastSeq;
+        // Walk the trace records: {"seq":N,"hook":H,"tid":T,"tick":K,
+        // "ret":"0x..","args":["0x..",...]}. The header between "hook" and
+        // "args" is parsed structurally now (watch_state.h): the old fixed
+        // 60-character window was narrower than the real header, so not a
+        // single record survived it and `watch` never fired (A156).
+        uint64_t maxSeq = lastSeq;
         bool any = false;
         size_t pos = 0;
         while ((pos = resp.find("\"seq\":", pos)) != std::string::npos) {
-            pos += 6;
-            LONG seq = _wtol(Utf8ToWide(resp.substr(pos, 16)).c_str());
-            size_t h = resp.find("\"hook\":", pos);
-            if (h == std::string::npos || h > pos + 40) break;
-            LONG hook = _wtol(Utf8ToWide(resp.substr(h + 7, 8)).c_str());
-            size_t a = resp.find("\"args\":[", h);
-            if (a == std::string::npos || a > h + 60) break;
-            size_t q1 = resp.find('"', a + 7);   // opening quote of args[0]
-            if (q1 == std::string::npos) break;
-            size_t q2 = resp.find('"', q1 + 1);  // closing quote of args[0]
-            if (q2 == std::string::npos) break;
-            std::string arg0 = resp.substr(q1 + 1, q2 - q1 - 1);
-            if (seq > maxSeq) maxSeq = seq;
+            v8i::TraceRecordHead rec;
+            size_t next = pos;
+            if (!v8i::ParseTraceRecordHead(resp, pos, rec, &next)) break;
+            pos = next;
+            if (rec.seq > maxSeq) maxSeq = rec.seq;
             any = true;
 
-            if (hook == cfwId) {  // cfw: args[0] = path pointer
-                uint64_t addr = _wcstoui64(Utf8ToWide(arg0).c_str(), nullptr, 16);
+            if (rec.hook == cfwId) {  // cfw: args[0] = path pointer
+                uint64_t addr = _wcstoui64(Utf8ToWide(rec.arg0).c_str(), nullptr, 16);
                 const std::wstring* p = decodePath(addr, now);
                 if (p && !p->empty()) {
                     std::wstring np = NormalizePath(*p);
@@ -282,7 +280,6 @@ int RunWatch(int argc, wchar_t** argv) {
                     }
                 }
             }
-            pos = q2;
         }
         if (any) lastSeq = maxSeq;
 

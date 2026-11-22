@@ -15,7 +15,9 @@
 #include "../src/payload/menu_patch.h"
 
 #include <windows.h>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
 
 using namespace v8i;
 
@@ -23,6 +25,9 @@ namespace v8i {
 bool MMDescrShapeOk(uintptr_t descr);        // src/payload/mainmenu.cpp
 bool MMNativeMenuEnabledFor(const wchar_t* iniPath);   // the [git] nativemenu switch
 bool MMPrologueOk(uintptr_t addr);          // src/payload/mainmenu.cpp
+// The long v8string writer of the native menu (A116): the test checks the
+// block layout the platform will later Release through its own allocator.
+void MMSetLong(uintptr_t dst, const wchar_t* text, unsigned refCount);
 }
 
 namespace {
@@ -310,4 +315,41 @@ V8I_TEST(MenuPrologue_AcceptsTheCalibratedBuildAndRejectsAnotherOne) {
     CHECK(CheckBuild(L"8.3.27.2342", 0xCF320, L"config.dll", true));
     CHECK(CheckBuild(L"8.3.27.1989", 0xBFCB0, L"1cv8.exe", false));
     CHECK(CheckBuild(L"8.3.27.1989", 0xCF320, L"config.dll", false));
+}
+
+// A116: the long v8string the menu writes into platform-owned slots carries
+// refCount=2. The block is malloc'ed by the payload's CRT, and the platform
+// releases such strings with its own allocator: with the old refCount=1 the
+// first Release of a command description returned our memory to the 1C heap.
+// The refCount is a parameter now, and both callers (the command texts and the
+// URL) pass 2 -- this test pins the layout and the counter the platform sees.
+V8I_TEST(MenuPatch_MMSetLongWritesTheRefCountThePlatformExpects) {
+    unsigned char slot[24] = {};
+    const wchar_t* text = L"Выгрузить конфигурацию в файлы";
+    const size_t len = wcslen(text);
+
+    MMSetLong((uintptr_t)slot, text, 2);
+
+    const unsigned char* data = *(const unsigned char**)slot;
+    REQUIRE(data != nullptr);
+
+    unsigned rc = 0;
+    memcpy(&rc, data, sizeof(rc));
+    CHECK(rc == 2);
+
+    uintptr_t storedLen = 0;
+    memcpy(&storedLen, slot + 8, sizeof(storedLen));
+    CHECK(storedLen == len);
+
+    CHECK(wmemcmp((const wchar_t*)(data + 4), text, len) == 0);
+    CHECK(*(const wchar_t*)(data + 4 + len * 2) == 0);
+
+    // The capacity word keeps the length with the top bit set: heap storage,
+    // not SSO -- the platform reads this string as a real heap one.
+    uintptr_t cap = 0;
+    memcpy(&cap, slot + 16, sizeof(cap));
+    CHECK((cap >> (sizeof(uintptr_t) * 8 - 1)) != 0);
+    CHECK((cap & ~(uintptr_t)((uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1))) == len);
+
+    free((void*)data);   // the test owns the block; the payload lets it live
 }

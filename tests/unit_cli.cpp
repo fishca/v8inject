@@ -11,6 +11,7 @@
 
 #include "cli/argv_tools.h"
 #include "cli/console_input.h"
+#include "cli/watch_state.h"
 
 #include "v8inject/text.h"
 
@@ -204,4 +205,72 @@ V8I_TEST(Cli_LineReaderCountsCharactersNotBytes) {
     CHECK(!line.tooLong);
     CHECK_EQ(line.chars, (size_t)3000);
     CHECK_EQ(line.utf8, utf8);
+}
+
+// A156: the header of a trace record between "hook" and "args" is wider than
+// the old fixed 60-character window -- with real-world values ("tid":12345,
+// "tick":9876543210, a 16-hex "ret") it takes 66 characters, so `watch`
+// discarded every record on the first check and never fired. The parser skips
+// the header structurally now, bounded by the next record.
+namespace {
+
+// A record as hook.cpp actually serializes it: wide tid/tick, full 16-hex ret.
+const char kWideRecord[] =
+    "{\"seq\":41,\"hook\":1,\"tid\":12345,\"tick\":9876543210,"
+    "\"ret\":\"0x00007FF600001234\",\"args\":[\"0x000000AABBCCDD11\",\"0x2\",\"0x3\",\"0x4\"],"
+    "\"stack\":[\"0x00007FF600002000\"]}";
+
+}  // namespace
+
+V8I_TEST(Cli_TraceRecordParserSurvivesTheRealRecordHeader) {
+    const std::string resp = kWideRecord;
+    v8i::TraceRecordHead rec;
+    size_t next = 0;
+    // `pos` points at `"seq":` itself, the way RunWatch finds it in the reply.
+    const size_t start = resp.find("\"seq\":");
+    REQUIRE(start != std::string::npos);
+    REQUIRE(v8i::ParseTraceRecordHead(resp, start, rec, &next));
+    CHECK_EQ(rec.seq, (unsigned long long)41);
+    CHECK_EQ(rec.hook, (unsigned long long)1);
+    CHECK(rec.arg0 == "0x000000AABBCCDD11");
+    // `next` points at the closing quote of args[0]; from there the reply
+    // holds no further record.
+    CHECK(resp[next] == '"');
+    CHECK(resp.find("\"seq\":", next) == std::string::npos);
+}
+
+V8I_TEST(Cli_TraceRecordParserKeepsTwoRecordsApart) {
+    const std::string second =
+        ",{\"seq\":42,\"hook\":1,\"tid\":6,\"tick\":7,"
+        "\"ret\":\"0x0000000000000001\",\"args\":[\"0x2\",\"0x0\",\"0x0\",\"0x0\"],\"stack\":[]}";
+    const std::string resp = std::string(kWideRecord) + second;
+
+    v8i::TraceRecordHead rec;
+    size_t next = 0;
+    const size_t firstStart = resp.find("\"seq\":");
+    REQUIRE(firstStart != std::string::npos);
+    REQUIRE(v8i::ParseTraceRecordHead(resp, firstStart, rec, &next));
+    CHECK_EQ(rec.seq, (unsigned long long)41);
+
+    const size_t secondStart = resp.find("\"seq\":", next);
+    REQUIRE(secondStart != std::string::npos);
+    REQUIRE(v8i::ParseTraceRecordHead(resp, secondStart, rec, &next));
+    CHECK_EQ(rec.seq, (unsigned long long)42);
+    CHECK_EQ(rec.hook, (unsigned long long)1);
+    CHECK(rec.arg0 == "0x2");
+}
+
+V8I_TEST(Cli_TraceRecordParserRefusesMalformedRecords) {
+    v8i::TraceRecordHead rec;
+    size_t next = 0;
+
+    CHECK(!v8i::ParseTraceRecordHead("\"seqx\":1", 0, rec, &next));
+    CHECK(!v8i::ParseTraceRecordHead("\"seq\":", 0, rec, &next));
+    CHECK(!v8i::ParseTraceRecordHead("\"seq\":41", 0, rec, &next));
+    CHECK(!v8i::ParseTraceRecordHead("\"seq\":41,\"hook\":", 0, rec, &next));
+    // A record without "args" before the next one starts: refused, not
+    // misread into the following record.
+    CHECK(!v8i::ParseTraceRecordHead(
+        "\"seq\":41,\"hook\":1,\"tid\":5,\"next\":{\"seq\":42,\"args\":[\"0x1\"]}", 0, rec,
+        &next));
 }

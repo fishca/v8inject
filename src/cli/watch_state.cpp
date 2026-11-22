@@ -82,4 +82,46 @@ void WatchPathCache::Clear() {
     clock_ = 0;
 }
 
+bool ParseTraceRecordHead(const std::string& resp, size_t pos, TraceRecordHead& out,
+                          size_t* next) {
+    static const char kSeq[] = "\"seq\":";
+    static const char kHook[] = ",\"hook\":";
+    static const char kArgs[] = "\"args\":[";
+    if (next) *next = pos;
+    if (resp.compare(pos, 6, kSeq) != 0) return false;
+    size_t p = pos + 6;
+
+    auto digits = [&resp](size_t& p, uint64_t& value) {
+        size_t n = 0;
+        value = 0;
+        while (p < resp.size() && resp[p] >= '0' && resp[p] <= '9') {
+            value = value * 10 + (uint64_t)(resp[p] - '0');
+            ++p;
+            ++n;
+        }
+        return n > 0;
+    };
+
+    if (!digits(p, out.seq)) return false;
+    if (resp.compare(p, 8, kHook) != 0) return false;
+    p += 8;
+    if (!digits(p, out.hook)) return false;
+
+    // `"ret":"0x…","args":[` -- searched forward but bounded by the next
+    // record: none of the fields between can hold `"args":[`, and a later
+    // record starts with `{"seq":`.
+    size_t bound = resp.find("{\"seq\":", p);
+    if (bound == std::string::npos) bound = resp.size();
+    size_t a = resp.find(kArgs, p);
+    if (a == std::string::npos || a > bound) return false;
+    size_t q1 = resp.find('"', a + 8);    // opening quote of args[0]
+    if (q1 == std::string::npos) return false;
+    size_t q2 = resp.find('"', q1 + 1);   // closing quote of args[0]
+    if (q2 == std::string::npos) return false;
+
+    out.arg0 = resp.substr(q1 + 1, q2 - q1 - 1);
+    if (next) *next = q2;
+    return true;
+}
+
 }  // namespace v8i
