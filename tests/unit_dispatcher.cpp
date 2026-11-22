@@ -918,3 +918,32 @@ V8I_TEST(Dispatcher_ReadsACyrillicCommandLine) {
     CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
     CHECK(reply.find(WideToUtf8(L"ЖЖЖ")) != std::string::npos);
 }
+// A110: ParseReArgs used to preset count=64, which turned every per-command
+// default into dead code -- `heapobjects` without --count collected 64 objects
+// instead of the documented 20000. The default lives in the command now: a
+// plain call on this process must see far more than the old preset, and
+// --count 0 is an error instead of a silent 64.
+V8I_TEST(Dispatcher_HeapObjectsDefaultCapIsPerCommand) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    std::string reply;
+    REQUIRE(d.Ask(L"heapobjects", reply, 60000));
+    ExpectJson("heapobjects", reply);
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(reply.find("\"count\":64") == std::string::npos);   // no preset ceiling
+
+    // --count 0 is refused, not silently replaced.
+    REQUIRE(d.Ask(L"heapobjects --count 0", reply));
+    ExpectJson("heapobjects", reply);
+    CHECK(reply.find("--count must be a positive number") != std::string::npos);
+    REQUIRE(d.Ask(L"memmap --count 0", reply));
+    CHECK(reply.find("--count must be a positive number") != std::string::npos);
+    REQUIRE(d.Ask(L"findvalue 0x41414141 --count 0", reply));
+    CHECK(reply.find("--count must be a positive number") != std::string::npos);
+    REQUIRE(d.Ask(L"byhwnd 0 --count 0", reply));
+    CHECK(reply.find("--count must be a positive number") != std::string::npos);
+
+    REQUIRE(d.Ask(L"version", reply));
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+}

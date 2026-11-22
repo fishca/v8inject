@@ -99,3 +99,20 @@ V8I_TEST(Memory_ReadabilityProbe) {
     // A zero length is not readable by definition.
     CHECK(!IsReadable(&local, 0));
 }
+
+// A109: an address near the top of the address space wrapped cur + len around,
+// the walk never ran and the guard answered "readable" for memory that is not
+// there -- the caller then read it and faulted inside 1C. The guard now
+// compares by subtraction and refuses before any walk.
+V8I_TEST(PeUtils_IsReadableRefusesTheTopOfTheAddressSpace) {
+    static int local = 0;
+    CHECK(IsReadable(&local, sizeof(local)));   // normal memory still passes
+
+    // The wrap case, on both architectures: on x86 the address is 0xFFFFFFF0,
+    // on x64 0xFFFFFFFFFFFFFFF0 -- cur + len wraps either way.
+    CHECK(!IsReadable((const void*)(UINTPTR_MAX - 0xF), 4096));
+    CHECK(!IsReadable((const void*)(UINTPTR_MAX - 3), 8));
+    // A range that fits under the ceiling still goes through the walk (and
+    // refuses: nothing is mapped that high).
+    CHECK(!IsReadable((const void*)(UINTPTR_MAX - 8192), 4096));
+}

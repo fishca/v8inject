@@ -299,9 +299,11 @@ struct ReArgs {
     uintptr_t    addr = 0;
     uintptr_t    from = 0;
     uintptr_t    to = 0;
-    size_t       count = 64;
+    size_t       count = 0;                  // per-command default when !haveCount
     std::vector<std::wstring> positional;   // module name, then a filter
     bool         haveAddr = false;
+    bool         haveCount = false;          // A110: the preset 64 made every
+                                             // per-command default dead
     size_t       offset = 0;                 // --offset, for byhwnd
     bool         haveOffset = false;
     bool         haveFrom = false;
@@ -383,8 +385,13 @@ ReArgs ParseReArgs(const std::wstring& args, size_t maxCount) {
                     a.error = "{\"status\":\"error\",\"message\":\"--count is limited to " +
                               std::to_string(maxCount) + "\"}";
                 }
+            } else if (v == 0) {
+                // A110: zero used to be silently replaced with the preset 64.
+                if (a.error.empty())
+                    a.error = "{\"status\":\"error\",\"message\":\"--count must be a positive number\"}";
             } else {
                 a.count = v;
+                a.haveCount = true;
             }
         } else if (tok == L"--offset") {
             size_t v = 0;
@@ -400,7 +407,6 @@ ReArgs ParseReArgs(const std::wstring& args, size_t maxCount) {
             a.positional.push_back(tok);
         }
     }
-    if (a.count == 0) a.count = 64;
     return a;
 }
 
@@ -474,7 +480,8 @@ std::string DisasmToJson(const std::wstring& args) {
     }
 
     uintptr_t stopped = start;
-    std::vector<Insn> insns = Disassemble(start, a.count * 8, a.count, &stopped, sizeof(void*) == 8);
+    const size_t maxShown = a.haveCount ? a.count : 64;   // A110
+    std::vector<Insn> insns = Disassemble(start, maxShown * 8, maxShown, &stopped, sizeof(void*) == 8);
 
     char buf[256];
     std::string j = "{\"status\":\"ok\",\"arch\":\"" + img.MachineName() + "\"";
@@ -543,6 +550,9 @@ std::string ImportsToJson(const std::wstring& args) {
 
     bool first = true;
     size_t shown = 0;
+    // A110: the per-command default lives here now -- ParseReArgs no longer
+    // presets count, which turned every `: N` default into dead code.
+    const size_t maxShown = a.haveCount ? a.count : 64;
     for (const PeImport& im : img.imports) {
         if (!want.empty()) {
             std::string hayA = im.name;
@@ -561,15 +571,18 @@ std::string ImportsToJson(const std::wstring& args) {
             if (!byDll && hayA.find(wantA) == std::string::npos)
                 continue;
         }
-        if (shown >= a.count) break;
+        if (shown >= maxShown) break;
         if (!first) j += ",";
         ++shown;
         first = false;
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"dll\":\"%s\",\"name\":\"%s\",\"ordinal\":%u,\"iat\":\"0x%llX\"}",
-                    JsonEscape(im.dll).c_str(), JsonEscape(im.name).c_str(), im.ordinal,
+        // A111: the element is a std::string like in `pe` (A46) -- a mangled
+        // name does not fit 512 bytes and _TRUNCATE cut it inside the JSON
+        // string, invalidating the whole document.
+        char at[32];
+        _snprintf_s(at, sizeof(at), _TRUNCATE, "0x%llX",
                     (unsigned long long)(img.base + im.iatRva));
-        j += buf;
+        j += "{\"dll\":\"" + JsonEscape(im.dll) + "\",\"name\":\"" + JsonEscape(im.name) +
+             "\",\"ordinal\":" + std::to_string(im.ordinal) + ",\"iat\":\"" + at + "\"}";
     }
     j += "]}";
     return j;
@@ -615,21 +628,27 @@ std::string ExportsToJson(const std::wstring& args) {
 
     bool first = true;
     size_t shown = 0;
+    // A110: the per-command default lives here now.
+    const size_t maxShown = a.haveCount ? a.count : 64;
     for (const PeExport& ex : img.exports) {
         if (!want.empty()) {
             std::string hay = ex.name;
             for (auto& c : hay) c = (char)tolower((unsigned char)c);
             if (hay.find(NarrowAscii(want)) == std::string::npos) continue;
         }
-        if (shown >= a.count) break;
+        if (shown >= maxShown) break;
         if (!first) j += ",";
         ++shown;
         first = false;
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "{\"name\":\"%s\",\"rva\":\"0x%X\",\"addr\":\"0x%llX\",\"ordinal\":%u",
-                    JsonEscape(ex.name).c_str(), ex.rva, (unsigned long long)(img.base + ex.rva),
-                    ex.ordinal);
-        j += buf;
+        // A111: the element is a std::string like in `pe` (A46) -- the fixed
+        // buffer cut a long mangled name inside the JSON string.
+        char at[32];
+        _snprintf_s(at, sizeof(at), _TRUNCATE, "0x%llX",
+                    (unsigned long long)(img.base + ex.rva));
+        char ord[32];
+        _snprintf_s(ord, sizeof(ord), _TRUNCATE, "0x%X", ex.rva);
+        j += "{\"name\":\"" + JsonEscape(ex.name) + "\",\"rva\":\"" + ord +
+             "\",\"addr\":\"" + at + "\",\"ordinal\":" + std::to_string(ex.ordinal);
         if (ex.forwarded) {
             j += ",\"forwarded\":true,\"forwarder\":\"";
             j += ex.forwarder;
@@ -674,6 +693,7 @@ std::string ModsToJson(const std::wstring& args) {
 
     bool first = true;
     size_t shown = 0;
+    const size_t maxShown = a.haveCount ? a.count : 64;   // A110
     for (const ModuleRange& m : all) {
         if (!want.empty()) {
             const wchar_t* leaf = wcsrchr(m.path.c_str(), L'\\');
@@ -682,7 +702,7 @@ std::string ModsToJson(const std::wstring& args) {
             for (auto& c : hay) c = (wchar_t)towlower(c);
             if (hay.find(want) == std::wstring::npos) continue;
         }
-        if (shown >= a.count) break;
+        if (shown >= maxShown) break;
         if (!first) j += ",";
         ++shown;
         first = false;
@@ -749,7 +769,8 @@ std::string XrefToJson(const std::wstring& args) {
     }
     if (!to) to = SectionEnd(img, CodeSection(img));
 
-    XrefResult xr = FindXrefsVerbose(from, to, target, sizeof(void*) == 8, a.count);
+    XrefResult xr = FindXrefsVerbose(from, to, target, sizeof(void*) == 8,
+                                     a.haveCount ? a.count : 64);   // A110
     const std::vector<Xref>& hits = xr.hits;
 
     // Report what was actually scanned: a wrong module here silently produces
@@ -803,7 +824,7 @@ std::string XrefToJson(const std::wstring& args) {
 std::string MemMapToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args, kMaxMemMapRows);
     if (!a.error.empty()) return a.error;
-    size_t cap = a.count ? a.count : 60;
+    size_t cap = a.haveCount ? a.count : 60;   // A110: the preset made this dead
 
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
@@ -897,7 +918,7 @@ std::string HeapObjectsToJson(const std::wstring& args) {
         return "{\"status\":\"error\",\"message\":\"module not found\"}";
 
     size_t scanned = 0, regions = 0, committed = 0;
-    size_t cap = a.count ? a.count : 20000;
+    size_t cap = a.haveCount ? a.count : 20000;   // A110: the real default is live again
     std::vector<HeapObject> objs = FindHeapObjects(m.base, m.size, cap, &scanned, &regions,
                                                    &committed);
 
@@ -970,7 +991,7 @@ std::string FindValueToJson(const std::wstring& args) {
     if (!have) return "{\"status\":\"error\",\"message\":\"value required\"}";
 
     size_t scanned = 0;
-    std::vector<DwordHit> hits = FindDword(value, a.count ? a.count : 32, &scanned);
+    std::vector<DwordHit> hits = FindDword(value, a.haveCount ? a.count : 32, &scanned);   // A110
 
     char buf[512];
     std::string j = "{\"status\":\"ok\",\"value\":\"0x";
@@ -1026,8 +1047,8 @@ std::string ByHwndToJson(const std::wstring& args) {
 
     size_t scanned = 0, regions = 0;
     std::vector<HwndOwner> found =
-        FindObjectsByHwnd((HWND)hwndVal, base, size, off, a.count ? a.count : 16,
-                          &scanned, &regions);
+        FindObjectsByHwnd((HWND)hwndVal, base, size, off, a.haveCount ? a.count : 16,
+                          &scanned, &regions);   // A110
 
     char buf[512];
     std::string j = "{\"status\":\"ok\",\"hwnd\":\"0x";
@@ -1085,8 +1106,11 @@ std::string AroundToJson(const std::wstring& args) {
     // Walk back a little so the caller sees the setup before the call.
     uintptr_t start = a.addr >= 48 ? a.addr - 48 : a.addr;
     uintptr_t stopped = start;
-    std::vector<Insn> insns = Disassemble(start, 256, a.count ? a.count : 16, &stopped,
+    std::vector<Insn> insns = Disassemble(start, 256, a.haveCount ? a.count : 64, &stopped,
                                           sizeof(void*) == 8);
+    // A110: the `: 16` branch here was dead (ParseReArgs preset 64), and the
+    // effective default -- which the "here" marker of this command depends on
+    // -- was 64. Made explicit instead of silently changing it to 16.
 
     char buf[320];
     std::string j = "{\"status\":\"ok\",\"around\":\"0x";

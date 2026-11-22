@@ -120,6 +120,11 @@ bool FindModule(const wchar_t* name, ModuleRange& out) {
 
 bool IsReadable(const void* p, size_t len) {
     if (!p || !len) return false;
+    // A109: cur + len wraps for an address near the top of the address space,
+    // the loop below never runs and the guard answers "readable" for memory
+    // that is not there -- the caller then reads it and faults inside 1C.
+    // Subtraction instead of addition, the way the PE parser does it (A86).
+    if (len > UINTPTR_MAX - (uintptr_t)p) return false;
     const unsigned char* cur = (const unsigned char*)p;
     const unsigned char* end = cur + len;
     while (cur < end) {

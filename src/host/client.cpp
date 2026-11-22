@@ -382,6 +382,14 @@ bool Client::Open(uint32_t pid, const std::wstring& payloadDll,
                          L"loading)");
         }
         LogLine("handshake failed: %ls", lastError_);
+        // A108: the payload may still be starting (a slow AV scan of the DLL
+        // copy can outlast the timeout). Leaving the block as it is means the
+        // late handshake reply puts the payload to sleep with the block busy
+        // forever -- every further Open to this target is refused until 1C is
+        // restarted. Park the word in Exit: the late payload publishes nothing
+        // (PublishHandshakeReply refuses non-Idle states) and leaves on its
+        // first loop iteration, so the block becomes reusable.
+        InterlockedExchange((volatile LONG*)&io_->ready, kStateExit);
         ReleaseHandles();
         return false;
     }

@@ -57,8 +57,12 @@ void InitPayloadLog(const wchar_t* dirFromBlock) {
 }
 
 // The "loaded" reply of the handshake is not an answer to a request -- nothing
-// has been posted yet -- so it is published unconditionally. The sequence stamp
-// plays no part in it: the host takes the reply and puts the word back to idle.
+// has been posted yet -- so the sequence stamp plays no part in it. It is
+// published only from Idle (A108): a host that timed out waiting parks the
+// word in Exit, and a blind store here would overwrite that exit -- the late
+// payload would go to sleep with the block busy forever instead of leaving and
+// letting the next host reuse the block. The buffer is written before the CAS:
+// the host wakes on Response and reads the reply whole.
 void PublishHandshakeReply(SharedIo* io, const std::string& json) {
     if (!io) return;
     size_t n = json.size();
@@ -66,7 +70,12 @@ void PublishHandshakeReply(SharedIo* io, const std::string& json) {
     memcpy(io->response, json.data(), n);
     io->response[n] = 0;
     InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)n);
-    InterlockedExchange((volatile LONG*)&io->ready, kStateResponse);
+    if (InterlockedCompareExchange((volatile LONG*)&io->ready, kStateResponse, kStateIdle) !=
+        kStateIdle) {
+        LogLine("handshake reply dropped: the host is not waiting (state %ld)",
+                (long)InterlockedCompareExchange((volatile LONG*)&io->ready, 0, 0));
+        return;
+    }
 }
 
 bool PutResponse(const std::string& json) {
@@ -352,6 +361,18 @@ bool v8i::V8iPublishReply(SharedIo* io, LONG requestSeq, const char* data, size_
     io->response[len] = 0;
     InterlockedExchange((volatile LONG*)&io->responseLen, (LONG)len);
     InterlockedExchange((volatile LONG*)&io->respSeq, requestSeq);
+
+    // A107: the copy above takes hundreds of microseconds for a large reply.
+    // In that window the host can take the word back (timeout + grace) and
+    // post the next request: the CAS below would then succeed and put this
+    // stale reply on top of a fresh one, leaving that request unexecuted. The
+    // re-read narrows the window to the CAS pair itself; whatever residue is
+    // left is what respSeq exists for.
+    if (InterlockedCompareExchange((volatile LONG*)&io->seq, 0, 0) != requestSeq) {
+        LogLine("reply for seq %ld dropped: the host moved on while the reply was copied",
+                (long)requestSeq);
+        return false;
+    }
 
     // Request -> Response, not a blind store: when the host reset the word (or
     // the host-gone watchdog did) between the check and here, the reply is
