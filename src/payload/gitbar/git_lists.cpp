@@ -164,7 +164,25 @@ static void ListDlgAct(ListDlg* d, int btn) {
         }
         break;
     case 1:  // branches
-        if (btn == 0) r = RunGitEx({ L"-C", d->dir, L"checkout", sel });
+        if (btn == 0) {
+            // A134: `branch -a` lists remotes/origin/... too; checking one out
+            // "succeeds" (exit code 0) into a detached HEAD and the panel said
+            // nothing -- the next commit landed outside any branch and looked
+            // lost. A remote ref is refused with the local way to get there.
+            if (sel.rfind(L"remotes/", 0) == 0) {
+                MessageBoxW(d->h,
+                            (L"«" + sel + L"» — ветка удалённого репозитория, переключиться на неё напрямую нельзя (detached HEAD).\n"
+                             L"Создайте локальную ветку от неё: git checkout -b <имя> " + sel).c_str(),
+                            L"Git", MB_ICONINFORMATION);
+                return;
+            }
+            r = RunGitEx({ L"-C", d->dir, L"checkout", sel });
+            // A134: the checkout's own words (Switched to branch / Already on)
+            // belong to the user -- silence read as "did nothing".
+            const std::wstring said = TrimWs(r.out);
+            if (r.Finished() && !said.empty())
+                MessageBoxW(d->h, said.c_str(), L"Git", MB_ICONINFORMATION);
+        }
         else if (btn == 1) {
             if (!ConfirmDestructive(d->h, L"Удалить ветку:", sel)) return;
             r = RunGitEx({ L"-C", d->dir, L"branch", L"-d", sel });
@@ -199,14 +217,22 @@ static void ListDlgDrawItem(const DRAWITEMSTRUCT* dis, HFONT font) {
     DeleteObject(b);
     if (dis->itemID == (UINT)-1) return;   // just the empty tail of the list
 
-    wchar_t text[1024] = {};
-    SendMessageW(dis->hwndItem, LB_GETTEXT, dis->itemID, (LPARAM)text);
+    // A131: the listbox contract gives no terminator guarantee when the buffer
+    // is smaller than the item -- ask for the length and draw from a buffer
+    // that certainly holds it. Paths of a deep dump, stash subjects and
+    // annotated tags go past 1023 characters; DrawTextW(-1) then walked off
+    // the stack buffer.
+    const int textLen = (int)SendMessageW(dis->hwndItem, LB_GETTEXTLEN, dis->itemID, 0);
+    if (textLen < 0) return;
+    std::wstring text((size_t)textLen + 1, L'\0');
+    SendMessageW(dis->hwndItem, LB_GETTEXT, dis->itemID, (LPARAM)&text[0]);
+    text.resize((size_t)textLen);
     RECT row = dis->rcItem;
     row.left += 4;
     HGDIOBJ oldFont = SelectObject(dis->hDC, font);
     int oldMode = SetBkMode(dis->hDC, TRANSPARENT);
     SetTextColor(dis->hDC, kDlgText);
-    DrawTextW(dis->hDC, text, -1, &row,
+    DrawTextW(dis->hDC, text.c_str(), -1, &row,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     SetBkMode(dis->hDC, oldMode);
     SelectObject(dis->hDC, oldFont);

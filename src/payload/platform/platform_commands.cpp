@@ -1418,6 +1418,8 @@ static bool V8iCaptureRecv85Late() {
 // Shared JSON front for the 8.5 send path: `cmd85 ...` and `cmd ...` on 8.5
 // both land here. Captures the receiver post-start when it is missing, so a
 // plain post-start GitBar dump button works without hookcbt/launch.
+void RestoreFramesAfterFailedTransmit(HWND marshalTo);   // 8.3 chain below (A133)
+
 static std::string Cmd85SendJson(unsigned int num, int sub, bool has) {
     if (!g85_recv && !V8iCaptureRecv85Late())
         return "{\"status\":\"error\",\"message\":\"no 8.5 receiver captured — "
@@ -1434,6 +1436,11 @@ static std::string Cmd85SendJson(unsigned int num, int sub, bool has) {
     if (rc == -96)
         return "{\"status\":\"error\",\"message\":\"timeout waiting for UI thread\"}";
     if (rc < 0) {
+        // A133: the 8.3 path brings the frame back after a transmit fault
+        // (the platform disables it before the command's dialog appears); the
+        // 8.5 path used to return without it, leaving the Configurator deaf
+        // even though the same window classes are in play here.
+        RestoreFramesAfterFailedTransmit(g_cmdHwnd);
         _snprintf_s(nb, sizeof(nb), _TRUNCATE,
                     "{\"status\":\"error\",\"message\":\"transmit exception\",\"exc\":\"0x%X\"}",
                     (unsigned)exc);

@@ -123,6 +123,12 @@ GitBar g_bar;
 // True on 8.5+: the designer paints its client through DWM, so a child window
 // never shows; the bar is a top-level owned window there instead.
 bool g_topLevelDwm = false;
+// A132: an action the native menu asked for while the panel was not on screen.
+// The UI thread inside transmitCommand cannot wait for the bar (the old show
+// joined a previous thread for up to 5 s and polled the window for 0.5 s), so
+// the request rides this slot: the bar thread delivers it once its window is
+// up. Values: 2 = settings dialog, 11..24 = list actions (kWinId + 10).
+volatile LONG g_nativePending = 0;
 
 int CellX(int id) { return 2 + (id - 1) * kCell; }
 
@@ -1242,6 +1248,16 @@ DWORD WINAPI BarThread(LPVOID) {
     SetTimer(g_bar.hwnd, 1, 500, nullptr);
     Reposition(true);
 
+    // A132: deliver the action the native menu parked here while the window
+    // did not exist yet (it could not wait on the UI thread).
+    const LONG pending = InterlockedExchange(&g_nativePending, 0);
+    if (g_bar.hwnd) {
+        if (pending == 2)
+            PostMessageW(g_bar.hwnd, WM_APP + 0x2F14, 0, 0);
+        else if (pending >= 11 && pending <= 24)
+            PostMessageW(g_bar.hwnd, WM_APP + 0x2F15, (WPARAM)(pending - 10), 0);
+    }
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
@@ -1353,25 +1369,48 @@ const wchar_t* V8iGitBarIniPath() {
     return GitIniPath();
 }
 
-// Команды нашей группы из transmit-перехвата (UI-поток). Диалог настроек
-// открывается отложенно — обычным сообщением бару, не внутри transmitCommand,
-// где платформа разбирает своё меню. «Скрыть» — WM_CLOSE напрямую (без
-// ожидания потока панели: UI-поток в transmit не должен блокироваться).
+// A132: показ панели без единого ожидания. CreateThread возвращается сразу,
+// окно бар строит сам; прежний поток, который ещё не завершился, не трогаем —
+// дождаться его здесь значило бы заморозить transmit-путь ровно так же, как
+// это делал GitBarCommandToJson (до 5 с join + до 0.5 с опроса окна). Застрявший
+// поток окно уже не перестроит, поэтому запаркованный запрос при отмене показа
+// снимается — иначе он сработал бы на какой-то дальнейший показ.
+static void GitBarShowFromUiThread() {
+    if (BarWindowAlive()) return;
+    if (g_bar.thread) {
+        InterlockedExchange(&g_nativePending, 0);
+        return;
+    }
+    g_bar.thread = CreateThread(nullptr, 0, BarThread, nullptr, 0, &g_bar.threadId);
+    if (!g_bar.thread) InterlockedExchange(&g_nativePending, 0);
+}
+
+// Команды нашей группы из transmit-перехвата (UI-поток). Ничего здесь не
+// ждёт: диалог настроек и действия исполняются отложенным сообщением бару
+// (внутри transmitCommand платформа разбирает своё меню, модальные диалоги
+// там нельзя), а показ панели не блокирует UI-поток (A132) — когда окна нет,
+// запрос уезжает в g_nativePending, и поток бара доставит его сам.
 void V8iGitBarMenuAction(unsigned num) {
-    if (num == 2) {
-        if (!BarWindowAlive() || !IsWindowVisible(g_bar.hwnd)) GitBarCommandToJson(L"");
-        if (BarWindowAlive()) PostMessageW(g_bar.hwnd, WM_APP + 0x2F14, 0, 0);
-    } else if (num == 3) {
+    if (num == 3) {
+        // «Скрыть» — WM_CLOSE напрямую: окно получает его в своём же цикле,
+        // поток завершается через WM_QUIT, который вернёт вложенный цикл.
         if (BarWindowAlive() && IsWindowVisible(g_bar.hwnd))
             PostMessageW(g_bar.hwnd, WM_CLOSE, 0, 0);
-        else
-            GitBarCommandToJson(L"");
-    } else if (num >= 11 && num <= 24) {
-        // Действия нативного меню (mainmenu.cpp, номер = kWinId + 10):
-        // исполняются в цикле бара (DoAction) отложенным сообщением —
-        // модальные диалоги нельзя открывать внутри transmitCommand.
-        if (!BarWindowAlive()) GitBarCommandToJson(L"");
-        if (BarWindowAlive()) PostMessageW(g_bar.hwnd, WM_APP + 0x2F15, num - 10, 0);
+        return;
+    }
+    if (BarWindowAlive() && IsWindowVisible(g_bar.hwnd)) {
+        if (num == 2)
+            PostMessageW(g_bar.hwnd, WM_APP + 0x2F14, 0, 0);
+        else if (num >= 11 && num <= 24)
+            PostMessageW(g_bar.hwnd, WM_APP + 0x2F15, (WPARAM)(num - 10), 0);
+        return;
+    }
+    // Панели на экране нет: запоминаем, что именно попросили, и показываем
+    // панель без ожиданий — поток бара откроет диалог/список, как только
+    // построит окно.
+    if (num == 2 || (num >= 11 && num <= 24)) {
+        InterlockedExchange(&g_nativePending, (LONG)num);
+        GitBarShowFromUiThread();
     }
 }
 
