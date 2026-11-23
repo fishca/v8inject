@@ -8,7 +8,9 @@
 [GitBar](docs/GITBAR.md),
 [ревизия проекта](docs/AUDIT.md),
 [инвентарь 8.5](docs/RECON-85.md),
-[план исследования 8.5](docs/plan_inj_ext.md).
+[план исследования 8.5](docs/plan_inj_ext.md),
+[живая проверка](docs/VERIFY.md),
+[план MCP-сервера](docs/plan_mcp.md).
 
 ## Что делает
 
@@ -58,7 +60,7 @@ v8inject hook 1cv8.exe core83.dll!findMethod --pid 12345
 
 # запуск 1С с немедленным внедрением payload (до создания главного окна —
 # так payload успевает подписаться на события 8.5):
-v8inject launch 'C:\Program Files\1cv8\8.5.1.1529\bin\1cv8.exe' DESIGNER /F E:\bases\test
+v8inject launch "C:\Program Files\1cv8\8.5.1.1529\bin\1cv8.exe" DESIGNER /F E:\bases\test
 
 # диалог с загруженным payload — команды идут вторым аргументом после exe:
 v8inject probe   1cv8.exe                  # версия payload, проверка связи
