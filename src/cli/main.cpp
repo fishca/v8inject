@@ -285,8 +285,11 @@ int RunWatch(int argc, wchar_t** argv) {
 
         if (gate.Due(now, debounceMs)) {
             gate.Fired();
-            wprintf(L"{\"status\":\"%s\",\"matches\":%d,\"command\":\"%ls\"}\n",
-                    dryRun ? L"would-fire" : L"firing", gate.matchCount, runCmd.c_str());
+            // A165: a --run with quotes in it broke the JSON line for the
+            // pipeline consumer; the command is escaped like any JSON value.
+            wprintf(L"{\"status\":\"%s\",\"matches\":%d,\"command\":\"%s\"}\n",
+                    dryRun ? L"would-fire" : L"firing", gate.matchCount,
+                    Utf8ToWide(v8i::JsonEscapeWide(runCmd)).c_str());
             fflush(stdout);
             if (!dryRun) {
                 std::wstring cmdline = L"cmd.exe /S /C \"" + runCmd + L"\"";
@@ -702,7 +705,8 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring cmdline = L"\"" + exe + L"\"";
         for (int i = 3; i < argc; ++i) {
             std::wstring a = argv[i];
-            if (a == L"--dll") { ++i; continue; }
+            // A169: --timeout is a CLI option like --dll, not a 1C argument.
+            if (a == L"--dll" || a == L"--timeout") { ++i; continue; }
             cmdline += L" ";
             cmdline += a;
         }

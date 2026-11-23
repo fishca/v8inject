@@ -264,7 +264,14 @@ std::string FindToJson(const std::wstring& args) {
     if (opt.maxHits == 0) opt.maxHits = 64;
 
     size_t scanned = 0;
-    std::vector<MemoryHit> hits = FindInMemory(opt, &scanned);
+    bool moduleMissing = false;
+    std::vector<MemoryHit> hits = FindInMemory(opt, &scanned, &moduleMissing);
+    // A113: a typo in --module is an error, not an empty "ok" indistinguishable
+    // from "the pattern is not there".
+    if (moduleMissing) {
+        return "{\"status\":\"error\",\"message\":\"module not found: " +
+               EscapeW(opt.module) + "\"}";
+    }
 
     char buf[256];
     std::string j = "{\"status\":\"ok\",\"pattern\":\"" + EscapeW(opt.pattern) + "\"";
@@ -941,7 +948,8 @@ std::string HeapObjectsToJson(const std::wstring& args) {
               });
 
     char buf[512];
-    std::string j = "{\"status\":\"ok\",\"module\":\"";
+    // A112: this field holds the architecture, not a module name.
+    std::string j = "{\"status\":\"ok\",\"machine\":\"";
     j += img.MachineName();
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "\",\"moduleBase\":\"0x%llX\",\"objects\":%zu,\"classes\":%zu,"
@@ -966,9 +974,9 @@ std::string HeapObjectsToJson(const std::wstring& args) {
 }
 
 
-// findvalue <hex> [--count n] [--module m] — every 4-byte occurrence of the value
-// in memory, annotated with the module/offset when it lands inside a module and
-// with the distance to the nearest object header candidate.
+// findvalue <hex> [--count n] [--module m] — every 4-byte occurrence of the
+// value in readable committed memory; --module restricts the scan to that
+// module's image (A173). Each hit carries its address and page offset.
 std::string FindValueToJson(const std::wstring& args) {
     ReArgs a = ParseReArgs(args, kMaxCount);
     if (!a.error.empty()) return a.error;
@@ -990,8 +998,21 @@ std::string FindValueToJson(const std::wstring& args) {
     if (!a.error.empty()) return a.error;
     if (!have) return "{\"status\":\"error\",\"message\":\"value required\"}";
 
+    uintptr_t rangeBase = 0;
+    size_t rangeSize = 0;
+    if (!a.module.empty()) {
+        ModuleRange m;
+        PeImage img;
+        if (!ResolveModule(a.module, m, img))
+            return "{\"status\":\"error\",\"message\":\"module not found: " +
+                   EscapeW(a.module) + "\"}";
+        rangeBase = m.base;
+        rangeSize = m.size;
+    }
+
     size_t scanned = 0;
-    std::vector<DwordHit> hits = FindDword(value, a.haveCount ? a.count : 32, &scanned);   // A110
+    std::vector<DwordHit> hits =
+        FindDword(value, a.haveCount ? a.count : 32, &scanned, rangeBase, rangeSize);   // A110, A173
 
     char buf[512];
     std::string j = "{\"status\":\"ok\",\"value\":\"0x";

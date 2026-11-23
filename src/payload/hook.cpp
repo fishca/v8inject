@@ -688,7 +688,16 @@ LONG CALLBACK FaultLogger(EXCEPTION_POINTERS* ep) {
     static volatile LONG own = 0;
     const bool ours = InOwnedBlock(at) || InOwnedBlock(av);
     if (ours) {
-        if (InterlockedIncrement(&own) > kMaxOwnFaults) return EXCEPTION_CONTINUE_SEARCH;
+        const LONG n = InterlockedIncrement(&own);
+        if (n > kMaxOwnFaults) {
+            // A103: mirror the foreign branch — a series of faults in hook code
+            // must not look like "it healed itself" after the 16th entry.
+            if (n == kMaxOwnFaults + 1) {
+                LogLine("fault logging: %ld more hook-code faults suppressed",
+                        kMaxOwnFaults);
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
     } else {
         const LONG n = InterlockedIncrement(&foreign);
         if (n > kMaxForeignFaults) {
@@ -758,6 +767,53 @@ void RecordBlockRange(void* block) {
 }
 
 }  // namespace
+
+// Why the guarded verify-and-restore of `unhook` refused. Every refusal keeps
+// the hook registered (a hook that is still patched must stay visible to
+// `hooks`) and the caller reports the reason.
+enum PrologueRestore {
+    kRestoreOk = 0,
+    kRestoreUnreadable,    // the target is no longer readable: the module with
+                           // the hook in it was unloaded (A99)
+    kRestoreForeignBytes,  // the prologue is no longer our patch (A71)
+    kRestorePatchFailed,   // VirtualProtect/memcpy back refused
+    kRestoreFaulted,       // SEH caught a fault inside the window (A99)
+};
+
+// POD-only frame of the verify-and-restore window (C2712: no C++ object that
+// needs unwinding may live where __try does). The bytes are read while every
+// other thread of the process is suspended, and a module with a hook in it may
+// have been unloaded since the hook was installed -- so the read is guarded and
+// the SEH frame sits BELOW the Suspender frame: whatever faults here, control
+// comes back and the caller resumes the threads instead of leaving the whole
+// process frozen behind a dead frame (A99).
+struct PrologueRestoreCall {
+    uintptr_t target;
+    const uint8_t* patch;
+    const uint8_t* original;
+    size_t stolen;
+    uint8_t nowBytes[kMaxStolen];
+    PrologueRestore status;
+};
+
+static void RestorePrologueUnderSeh(PrologueRestoreCall* call) {
+    __try {
+        const void* p = (const void*)call->target;
+        if (!IsReadable(p, call->stolen)) {
+            call->status = kRestoreUnreadable;
+            return;
+        }
+        memcpy(call->nowBytes, p, call->stolen);
+        if (memcmp(call->nowBytes, call->patch, kPatchLen) != 0) {
+            call->status = kRestoreForeignBytes;
+            return;
+        }
+        call->status = PatchBytes(call->target, call->original, call->stolen)
+                           ? kRestoreOk : kRestorePatchFailed;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        call->status = kRestoreFaulted;
+    }
+}
 
 uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver obs,
                              std::string& error) {
@@ -1018,62 +1074,47 @@ uint32_t HookInstallObserved(uintptr_t target, const char* name, HookObserver ob
         sus.ResumeAll();
     }
 
+    bool limitReached = false;
     {
         LockGuard guard;
-        g_hooks[g_hookCount++] = ctx;
+        // A102: the entry check is lock-free, so two installs racing at the
+        // limit must not both write the registry. The loser rolls its patch
+        // back below instead of writing g_hooks[kMaxHooks].
+        if (g_hookCount >= kMaxHooks) limitReached = true;
+        else g_hooks[g_hookCount++] = ctx;
+    }
+    if (limitReached) {
+        InterlockedExchange(&ctx->active, 0);
+        {
+            PatchWindowGuard pw;
+            Suspender sus;
+            if (sus.Suspend(target, target + stolen) == Suspender::Result::ok) {
+                PrologueRestoreCall rc{};
+                rc.target = target;
+                rc.patch = ctx->patch;
+                rc.original = ctx->original;
+                rc.stolen = stolen;
+                RestorePrologueUnderSeh(&rc);
+                sus.ResumeAll();
+                if (rc.status != kRestoreOk) {
+                    LogLine("hook limit rollback: prologue at %p not restored (status %d)",
+                            (void*)target, (int)rc.status);
+                }
+            }
+        }
+        // The block and ctx stay mapped: a call may already be inside the
+        // trampoline, exactly as for a removed hook (A74).
+        RecordBlockRange(block);
+        InterlockedIncrement(&g_retiredBlocks);
+        InterlockedExchangeAdd64(&g_retiredBytes, (LONG64)kBlockSize + sizeof(HookCtx));
+        error = "hook limit reached";
+        return 0;
     }
     RecordBlockRange(block);
 
     LogLine("hook %u installed: %p -> stub %p trampoline %p stolen %zu",
             ctx->id, (void*)target, (void*)ctx->stub, ctx->trampoline, stolen);
     return ctx->id;
-}
-
-// Why the guarded verify-and-restore of `unhook` refused. Every refusal keeps
-// the hook registered (a hook that is still patched must stay visible to
-// `hooks`) and the caller reports the reason.
-enum PrologueRestore {
-    kRestoreOk = 0,
-    kRestoreUnreadable,    // the target is no longer readable: the module with
-                           // the hook in it was unloaded (A99)
-    kRestoreForeignBytes,  // the prologue is no longer our patch (A71)
-    kRestorePatchFailed,   // VirtualProtect/memcpy back refused
-    kRestoreFaulted,       // SEH caught a fault inside the window (A99)
-};
-
-// POD-only frame of the verify-and-restore window (C2712: no C++ object that
-// needs unwinding may live where __try does). The bytes are read while every
-// other thread of the process is suspended, and a module with a hook in it may
-// have been unloaded since the hook was installed -- so the read is guarded and
-// the SEH frame sits BELOW the Suspender frame: whatever faults here, control
-// comes back and the caller resumes the threads instead of leaving the whole
-// process frozen behind a dead frame (A99).
-struct PrologueRestoreCall {
-    uintptr_t target;
-    const uint8_t* patch;
-    const uint8_t* original;
-    size_t stolen;
-    uint8_t nowBytes[kMaxStolen];
-    PrologueRestore status;
-};
-
-static void RestorePrologueUnderSeh(PrologueRestoreCall* call) {
-    __try {
-        const void* p = (const void*)call->target;
-        if (!IsReadable(p, call->stolen)) {
-            call->status = kRestoreUnreadable;
-            return;
-        }
-        memcpy(call->nowBytes, p, call->stolen);
-        if (memcmp(call->nowBytes, call->patch, kPatchLen) != 0) {
-            call->status = kRestoreForeignBytes;
-            return;
-        }
-        call->status = PatchBytes(call->target, call->original, call->stolen)
-                           ? kRestoreOk : kRestorePatchFailed;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        call->status = kRestoreFaulted;
-    }
 }
 
 bool HookRemove(uint32_t id) {

@@ -520,8 +520,10 @@ int v8i::V8iRunCommandLoop(SharedIo* io) {
         // current one: the host may have given up on it and posted another
         // request meanwhile (A45).
         g_curSeq = (LONG)InterlockedCompareExchange((volatile LONG*)&g_io->seq, 0, 0);
-        LogLine("command received: %ls (ready=%ld seq=%ld)", g_io->request, (long)state,
-                (long)g_curSeq);
+        // A174: %ls narrows through the ANSI code page and lost every non-ANSI
+        // command text; the log carries UTF-8 like the replies do.
+        LogLine("command received: %s (ready=%ld seq=%ld)",
+                WideToUtf8(g_io->request).c_str(), (long)state, (long)g_curSeq);
         if (wcscmp(g_io->request, L"exit") == 0) break;
 
         if (wcscmp(g_io->request, L"version") == 0) {

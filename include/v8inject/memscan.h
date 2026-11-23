@@ -24,7 +24,10 @@ struct FindOptions {
 
 // Scans readable, committed memory of the current process for `pattern`.
 // Read-only: nothing is written and no code in the process is executed.
-std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes);
+// `moduleNotFound` reports that opt.module names no loaded module, so the
+// caller can tell a typo apart from "not found" (A113).
+std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes,
+                                    bool* moduleNotFound = nullptr);
 
 // Describes the module that owns `addr`, if any.
 bool ModuleOfAddress(uintptr_t addr, std::wstring* name, uintptr_t* moduleRva);
@@ -66,14 +69,16 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
                                        size_t* regions = nullptr,
                                        size_t* committedBytes = nullptr);
 
-// Finds every 4-byte occurrence of `value` in writable committed memory.
+// Finds every 4-byte occurrence of `value` in readable committed memory.
 // Used to locate the field that stores an HWND inside an object: the offset is
-// then foundAddress - nearestObjectStart.
+// then foundAddress - nearestObjectStart. `moduleBase` != 0 restricts the scan
+// to that module's image (A173); 0 scans the whole process.
 struct DwordHit {
     uintptr_t address = 0;
 };
 
 std::vector<DwordHit> FindDword(uint32_t value, size_t maxHits,
-                               size_t* scannedBytes = nullptr);
+                               size_t* scannedBytes = nullptr,
+                               uintptr_t moduleBase = 0, size_t moduleSize = 0);
 
 }  // namespace v8i

@@ -773,6 +773,11 @@ V8I_TEST(Dispatcher_HeapObjectsFindsObjectsOnThisBuild) {
     // 32-bit read of a 64-bit vtable pointer could never fall inside the image.
     CHECK(reply.find("\"objects\":0") == std::string::npos);
     CHECK(reply.find("\"classes\":0") == std::string::npos);
+
+    // A112: the field holds the architecture, so it is named "machine";
+    // "module" used to suggest a module name that was never there.
+    CHECK(reply.find("\"machine\":\"") != std::string::npos);
+    CHECK(reply.find("\"module\":") == std::string::npos);
 }
 
 V8I_TEST(Dispatcher_ByHwndFindsTheOwnerOnThisBuild) {
@@ -944,6 +949,28 @@ V8I_TEST(Dispatcher_HeapObjectsDefaultCapIsPerCommand) {
     REQUIRE(d.Ask(L"byhwnd 0 --count 0", reply));
     CHECK(reply.find("--count must be a positive number") != std::string::npos);
 
+    REQUIRE(d.Ask(L"version", reply));
+    CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+}
+
+// A113: a typo in --module is an error naming the module, not an empty "ok"
+// indistinguishable from "the pattern is not there".
+V8I_TEST(Dispatcher_FindReportsAMissingModule) {
+    Dispatcher d;
+    REQUIRE(d.Start());
+
+    std::string reply;
+    REQUIRE(d.Ask(L"find QZXJKNOSUCHPATTERN --module v8i_no_such.dll", reply, 30000));
+    ExpectJson("find --module missing", reply);
+    REQUIRE(reply.find("\"status\":\"error\"") != std::string::npos);
+    CHECK(reply.find("module not found: v8i_no_such.dll") != std::string::npos);
+
+    REQUIRE(d.Ask(L"findvalue 0x41424344 --module v8i_no_such.dll", reply, 30000));
+    ExpectJson("findvalue --module missing", reply);
+    REQUIRE(reply.find("\"status\":\"error\"") != std::string::npos);
+    CHECK(reply.find("module not found: v8i_no_such.dll") != std::string::npos);
+
+    // The command loop survives both.
     REQUIRE(d.Ask(L"version", reply));
     CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
 }

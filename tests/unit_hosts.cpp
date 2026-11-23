@@ -392,6 +392,27 @@ V8I_TEST(Agent_ReusedPidIsANewProcess) {
     CHECK(!tr.WasInjected(pid, second));
 }
 
+// A152: an entry born without a creation time (the process was still starting)
+// adopts the first valid one, so a reused pid does not inherit the exhausted
+// failure count of its predecessor.
+V8I_TEST(Agent_FailedEntryAdoptsTheFirstCreationTime) {
+    AgentTracker tr;
+    const uint32_t pid = 555;
+    const uint64_t created = 9000000;
+
+    for (int i = 0; i < AgentTracker::kMaxFailures; ++i) tr.Failed(pid, 0, 1000);
+    CHECK(tr.Decide(pid, 0, 60000) == AgentDecision::Skip);   // gave up on the unknown
+
+    tr.Failed(pid, created, 60000);   // the creation time is readable at last
+    const AgentEntry* e = tr.Find(pid);
+    REQUIRE(e != nullptr);
+    CHECK_EQ((unsigned long long)e->created, (unsigned long long)created);
+
+    // A different creation time on the same pid is a new process, not the
+    // predecessor that exhausted its retries.
+    CHECK(tr.Decide(pid, created + 1, 60000) == AgentDecision::Inject);
+}
+
 V8I_TEST(Agent_ATransientFailureIsRetriedWithABackoff) {
     AgentTracker tr;
     const uint32_t pid = 777;

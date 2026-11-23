@@ -69,9 +69,11 @@ bool ModuleOfAddress(uintptr_t addr, std::wstring* name, uintptr_t* moduleRva) {
     return ModuleOfAddressIn(EnumModules(), addr, name, moduleRva);
 }
 
-std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes) {
+std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes,
+                                    bool* moduleNotFound) {
     std::vector<MemoryHit> hits;
     if (scannedBytes) *scannedBytes = 0;
+    if (moduleNotFound) *moduleNotFound = false;
     if (opt.pattern.empty()) return hits;
 
     const std::string needle = BuildNeedle(opt.pattern, opt.wide);
@@ -83,7 +85,10 @@ std::vector<MemoryHit> FindInMemory(const FindOptions& opt, size_t* scannedBytes
     uintptr_t rangeEnd = UINTPTR_MAX;
     if (!opt.module.empty()) {
         ModuleRange m;
-        if (!FindModule(opt.module.c_str(), m)) return hits;
+        if (!FindModule(opt.module.c_str(), m)) {
+            if (moduleNotFound) *moduleNotFound = true;
+            return hits;
+        }
         rangeBase = m.base;
         rangeEnd = m.base + m.size;
     }
@@ -232,6 +237,7 @@ std::vector<HwndOwner> FindObjectsByHwnd(HWND hwnd, uintptr_t moduleBase, size_t
             // bytes above this handle" works across versions without the caller
             // guessing the exact field offset.
             for (size_t off = 0; off + 4 <= got; off += 4) {
+                if (out.size() >= maxHits) break;   // A114: the cap holds inside a chunk too
                 if (*(const uint32_t*)(buf.data() + off) != want) continue;
                 const uintptr_t hitAddr = cur + off;
                 // The candidate object start must not slide into the first page.
@@ -369,6 +375,7 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
             // (docs/AUDIT.md A49).
             const size_t kPtr = sizeof(void*);
             for (size_t off = 0; off + kPtr <= got; off += kPtr) {
+                if (out.size() >= maxHits) break;   // A114: the cap holds inside a chunk too
                 uintptr_t vt = 0;
                 memcpy(&vt, buf.data() + off, kPtr);
                 if (vt <= lo || vt >= hi) continue;
@@ -399,14 +406,18 @@ std::vector<HeapObject> FindHeapObjects(uintptr_t moduleBase, size_t moduleSize,
     return out;
 }
 
-std::vector<DwordHit> FindDword(uint32_t value, size_t maxHits, size_t* scannedBytes) {
+std::vector<DwordHit> FindDword(uint32_t value, size_t maxHits, size_t* scannedBytes,
+                                uintptr_t moduleBase, size_t moduleSize) {
     std::vector<DwordHit> hits;
     size_t totalScanned = 0;
 
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
-    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
-    const uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
+    // A173: with a module the scan stays inside its image instead of walking
+    // the whole address space.
+    uintptr_t addr = moduleBase ? moduleBase : (uintptr_t)si.lpMinimumApplicationAddress;
+    const uintptr_t maxAddr = moduleBase ? moduleBase + moduleSize
+                                         : (uintptr_t)si.lpMaximumApplicationAddress;
 
     const size_t kChunk = 1u << 20;
     std::vector<unsigned char> buf(kChunk);

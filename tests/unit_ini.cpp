@@ -226,6 +226,30 @@ V8I_TEST(IniManual_ReadsUtf8AnsiAndUtf16BigEndian) {
     Remove(path);
 }
 
+// A145: GetPrivateProfileStringW strips one pair of surrounding quotes, and a
+// hand-written nativemenu="0" must work like nativemenu=0.
+V8I_TEST(IniManual_StripsOnePairOfQuotes) {
+    const std::wstring path = TempIni(L"v8i_test_ini_manual_quotes.ini");
+    Remove(path);
+
+    const char text[] =
+        "[git]\r\n"
+        "nativemenu=\"0\"\r\n"
+        "double=\"\"0\"\"\r\n"
+        "plain=1\r\n"
+        "empty=\"\"\r\n";
+    WriteBytes(path, text, sizeof(text) - 1);
+
+    bool found = false;
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"nativemenu", L"1", &found), L"0");
+    CHECK(found);
+    // Exactly one pair: the inner quotes are part of the value.
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"double", L"x"), L"\"0\"");
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"plain", L"x"), L"1");
+    CHECK_EQ(IniGetManual(path.c_str(), L"git", L"empty", L"x"), L"");
+    Remove(path);
+}
+
 V8I_TEST(IniManual_SectionCommentsAndCaseAreHandled) {
     const std::wstring path = TempIni(L"v8i_test_ini_manual_sections.ini");
     Remove(path);

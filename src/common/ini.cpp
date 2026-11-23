@@ -221,7 +221,12 @@ std::wstring IniGetManual(const wchar_t* path, const wchar_t* section,
         const std::wstring k = Trim(line.substr(0, eq));
         if (_wcsicmp(k.c_str(), key) != 0) continue;
         if (found) *found = true;
-        return Trim(line.substr(eq + 1));
+        std::wstring v = Trim(line.substr(eq + 1));
+        // GetPrivateProfileStringW strips one pair of surrounding quotes; a
+        // hand-written nativemenu="0" must work like nativemenu=0 (A145).
+        if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"')
+            v = v.substr(1, v.size() - 2);
+        return v;
     }
     return missing;
 }

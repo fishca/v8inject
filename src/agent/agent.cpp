@@ -195,7 +195,8 @@ void InjectOne(DWORD pid, uint64_t created, bool is64) {
 }
 
 // The payload leaves its command loop when the session closes; the GitBar window
-// it installed (and the hooks) survive that, exactly like one-shot CLI runs.
+// it installed survives that, exactly like one-shot CLI runs. Hooks do not:
+// the payload restores them all on exit (A167).
 
 void Poll() {
     const auto procs = v8i::ListProcesses();
@@ -267,6 +268,9 @@ void ShowTrayMenu() {
     GetCursorPos(&pt);
     SetForegroundWindow(g_hwnd);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_hwnd, nullptr);
+    // KB135788: without a posted message the menu may stay up after a click
+    // outside it (A170).
+    PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     switch (cmd) {
     case kMExit:

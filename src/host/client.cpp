@@ -201,7 +201,8 @@ bool Client::OpenBlock(uint32_t pid, const std::wstring& logDir) {
     MakeSharedName(sharedName_, _countof(sharedName_), pid);
     LogLine("Client::OpenBlock pid=%u name=%ls logDir=%ls", pid, sharedName_, logDir.c_str());
 
-    // 2 GB block is virtual; only touched pages become resident.
+    // The block is sizeof(SharedIo) (533040 bytes, see protocol.h); only
+    // touched pages become resident.
     // No fallback to a default DACL: without the expected rights the block is
     // not created (fail closed) -- a stranger answering it would be worse than
     // a refused session.

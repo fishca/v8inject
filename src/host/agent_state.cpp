@@ -65,6 +65,9 @@ void AgentTracker::Failed(uint32_t pid, uint64_t created, uint64_t now) {
         return;
     }
     AgentEntry& e = it->second;
+    // A152: an entry born without a creation time adopts the first valid one,
+    // so a reused pid does not inherit the predecessor's failure count.
+    if (!e.created && created) e.created = created;
     if (e.injected) e.injected = false;    // a failed re-inject reopens the window
     ++e.failures;
     e.retryAt = now + BackoffMs(e.failures);
